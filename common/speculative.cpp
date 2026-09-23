@@ -1363,6 +1363,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_SPEC_PROFILE=1: wall time of each phase, synchronized, printed every 64 draft calls
+    bool    prof = getenv("LLAMA_SPEC_PROFILE") != nullptr;
+    int64_t prof_catchup_us = 0, prof_step_us = 0, prof_n_catchup = 0, prof_n_step = 0, prof_n_draft = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1561,7 +1565,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const int64_t t0 = prof ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                if (prof) {
+                    llama_synchronize(ctx_dft);
+                    prof_catchup_us += ggml_time_us() - t0;
+                    prof_n_catchup++;
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1650,6 +1660,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t t_step = prof ? ggml_time_us() : 0;
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
@@ -1727,11 +1738,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 i_last[seq_id] = batch.n_tokens - 1;
             }
 
+            if (prof) {
+                prof_step_us += ggml_time_us() - t_step;
+                prof_n_step++;
+            }
+
             if (batch.n_tokens == 0) {
                 break;
             }
 
             ++i;
+        }
+        if (prof && ++prof_n_draft % 64 == 0) {
+            SPC_INF("profile: catch-up %.2f ms x %.2f/draft, draft step %.2f ms x %.2f/draft\n",
+                    prof_catchup_us/1e3/std::max<int64_t>(1, prof_n_catchup), (double) prof_n_catchup/prof_n_draft,
+                    prof_step_us/1e3/std::max<int64_t>(1, prof_n_step), (double) prof_n_step/prof_n_draft);
         }
 
         if (chain_heads) {

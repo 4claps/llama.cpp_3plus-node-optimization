@@ -1388,7 +1388,21 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_UBATCH_PROFILE=1: host-side time per ubatch phase (graph build+alloc, set inputs, compute
+// enqueue, and the wait for the previous ubatch), printed every 16 ubatches with n_tokens > 1
+struct llama_ubatch_prof {
+    bool on = getenv("LLAMA_UBATCH_PROFILE") != nullptr;
+    int64_t n = 0, build = 0, inputs = 0, compute = 0, sync = 0, wall0 = 0;
+};
+static llama_ubatch_prof g_ubatch_prof;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t tp0 = g_ubatch_prof.on ? ggml_time_us() : 0;
+    if (g_ubatch_prof.on && ubatch.n_tokens > 1) {
+        ggml_backend_sched_synchronize(sched.get()); // separate the previous ubatch's GPU time
+        g_ubatch_prof.sync += ggml_time_us() - tp0;
+    }
+    const int64_t tp1 = g_ubatch_prof.on ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1440,6 +1454,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf_res_prev_active = res;
     }
+    const int64_t tp2 = g_ubatch_prof.on ? ggml_time_us() : 0;
 
     // set the input data for the input tensors
     {
@@ -1451,11 +1466,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t tp3 = g_ubatch_prof.on ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    if (g_ubatch_prof.on && ubatch.n_tokens > 1) {
+        const int64_t tp4 = ggml_time_us();
+        auto & P = g_ubatch_prof;
+        P.build += tp2 - tp1; P.inputs += tp3 - tp2; P.compute += tp4 - tp3;
+        if (++P.n % 16 == 0) {
+            fprintf(stderr, "ubatch profile (%lld ubatches, n_tokens %u, n_kv ~%d): build+alloc %.1f ms, set_inputs %.1f ms, compute enqueue %.1f ms, prev-ubatch GPU wait %.1f ms (per ubatch)\n",
+                (long long) P.n, ubatch.n_tokens, (int) (mctx ? 0 : 0),
+                P.build/1e3/P.n, P.inputs/1e3/P.n, P.compute/1e3/P.n, P.sync/1e3/P.n);
+            P = llama_ubatch_prof();
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;

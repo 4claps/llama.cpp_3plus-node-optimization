@@ -4400,6 +4400,102 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_OP_PROFILE=N: time every node (and fused group) with CUDA events, per device, and
+// print the per-op totals every N graphs. Diagnostic only: it synchronizes once per graph.
+struct ggml_cuda_op_prof {
+    int every = 0;
+    int n_graphs = 0;
+    double graph_ms = 0.0;
+    std::vector<std::pair<std::string, std::pair<cudaEvent_t, cudaEvent_t>>> pending;
+    std::vector<cudaEvent_t> pool;
+    size_t pool_used = 0;
+    cudaEvent_t g0 = nullptr, g1 = nullptr;
+    std::map<std::string, std::pair<double, int64_t>> acc;
+
+    cudaEvent_t ev() {
+        if (pool_used == pool.size()) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreate(&e));
+            pool.push_back(e);
+        }
+        return pool[pool_used++];
+    }
+};
+
+static void ggml_cuda_op_prof_report();
+
+static ggml_cuda_op_prof * ggml_cuda_op_prof_get(int device) {
+    static const int every = [] {
+        const char * s = getenv("GGML_CUDA_OP_PROFILE");
+        return s ? atoi(s) : 0;
+    }();
+    if (every <= 0) {
+        return nullptr;
+    }
+    static ggml_cuda_op_prof profs[GGML_CUDA_MAX_DEVICES];
+    static const bool registered = [] { atexit(ggml_cuda_op_prof_report); return true; }();
+    GGML_UNUSED(registered);
+    profs[device].every = every;
+    return &profs[device];
+}
+
+static std::string ggml_cuda_op_prof_key(const ggml_tensor * node, const char * prefix) {
+    std::string k = prefix;
+    k += ggml_op_desc(node);
+    char buf[96];
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        snprintf(buf, sizeof(buf), " %s %lldx%lld n=%lld", ggml_type_name(node->src[0]->type),
+            (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1], (long long) node->src[1]->ne[1]);
+    } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        snprintf(buf, sizeof(buf), " nb=%lld kv=%lld", (long long) node->src[0]->ne[1], (long long) node->src[1]->ne[1]);
+    } else {
+        snprintf(buf, sizeof(buf), " n=%lld", (long long) node->ne[1]);
+    }
+    return k + buf;
+}
+
+static void ggml_cuda_op_prof_flush(ggml_cuda_op_prof * P, int device, cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(P->g1, stream));
+    CUDA_CHECK(cudaEventSynchronize(P->g1));
+    float gms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&gms, P->g0, P->g1));
+    P->graph_ms += gms;
+    for (auto & it : P->pending) {
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, it.second.first, it.second.second));
+        auto & a = P->acc[it.first];
+        a.first += ms;
+        a.second++;
+    }
+    P->pending.clear();
+    P->pool_used = 0;
+    P->n_graphs++;
+}
+
+// cumulative totals, printed at exit: divide by the tokens processed to get per-token cost
+static void ggml_cuda_op_prof_report() {
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        ggml_cuda_op_prof * P = ggml_cuda_op_prof_get(device);
+        if (!P || P->n_graphs == 0) {
+            continue;
+        }
+        std::vector<std::pair<double, std::string>> v;
+        double tot = 0.0;
+        for (auto & it : P->acc) {
+            v.push_back({it.second.first, it.first});
+            tot += it.second.first;
+        }
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "op profile, device %d: %d graphs, %.1f ms graph wall, %.1f ms in ops\n",
+            device, P->n_graphs, P->graph_ms, tot);
+        for (size_t i = 0; i < v.size() && i < 45; ++i) {
+            const auto & a = P->acc[v[i].second];
+            fprintf(stderr, "  %9.1f ms %5.1f%%  x%-8lld %s\n", v[i].first, 100.0*v[i].first/tot,
+                (long long) a.second, v[i].second.c_str());
+        }
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4498,6 +4594,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            if (ggml_cuda_op_prof * P = ggml_cuda_op_prof_get(cuda_ctx->device)) {
+                if (!P->g0) {
+                    CUDA_CHECK(cudaEventCreate(&P->g0));
+                    CUDA_CHECK(cudaEventCreate(&P->g1));
+                }
+                CUDA_CHECK(cudaEventRecord(P->g0, cuda_ctx->stream()));
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4540,7 +4643,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_op_prof * prof = ggml_cuda_op_prof_get(cuda_ctx->device);
+                cudaEvent_t prof_e0 = nullptr;
+                if (prof) {
+                    prof_e0 = prof->ev();
+                    CUDA_CHECK(cudaEventRecord(prof_e0, cuda_ctx->stream()));
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (prof && nodes_to_skip != 0) {
+                    cudaEvent_t e1 = prof->ev();
+                    CUDA_CHECK(cudaEventRecord(e1, cuda_ctx->stream()));
+                    prof->pending.push_back({ggml_cuda_op_prof_key(node, "fused:"), {prof_e0, e1}});
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4575,9 +4691,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                if (prof) {
+                    cudaEvent_t e1 = prof->ev();
+                    CUDA_CHECK(cudaEventRecord(e1, cuda_ctx->stream()));
+                    prof->pending.push_back({ggml_cuda_op_prof_key(node, ""), {prof_e0, e1}});
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+        }
+
+        if (ggml_cuda_op_prof * P = ggml_cuda_op_prof_get(cuda_ctx->device)) {
+            if (!use_cuda_graph) {
+                ggml_cuda_op_prof_flush(P, cuda_ctx->device, cuda_ctx->stream());
             }
         }
 
