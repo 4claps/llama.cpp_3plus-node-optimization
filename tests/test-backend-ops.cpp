@@ -10846,6 +10846,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
 
+    // q6_K matvec at the model's shapes and the speculative-verify widths. The m=16 cases elsewhere
+    // take the small-rows path on Pascal and never reach the multi-column kernel. 4360 rows leaves a
+    // partial block, 17408 is the down projection's K.
+    for (int n : {1, 2, 3, 4, 5, 6, 7}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4360, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, n, 17408, {1, 1}, {1, 1}));
+    }
+
     // Prefill-shaped correctness at the same operating shape. The sweep above is nb=1, which
     // never reaches the cuBLAS-GEMM attention path: that path fires only at Q->ne[1] >= 128 and
     // K->ne[1] >= 4096, i.e. on essentially every long-context prefill ubatch, and it is ON by
@@ -11376,6 +11385,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : {2048, 4096, 8192, 16384}) {
         for (int nb : {5, 4, 3, 2, 1}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
+    // The q6_K matvecs of one decode/verify pass on each GPU under -sm tensor (m rows x k), by width.
+    for (auto mk : std::vector<std::pair<int, int>>{{8704, 5120}, {5120, 8704}, {5120, 5120}, {3072, 5120}, {5120, 3072}, {6144, 5120}}) {
+        for (int n : {1, 2, 3, 4, 5, 6}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
         }
     }
     // Same shapes with an f16 cache. The tile kernel is launched with need_f16_K/V, so a
