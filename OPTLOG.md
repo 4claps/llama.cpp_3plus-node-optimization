@@ -7529,3 +7529,11 @@ little. GPU0 low point ~40 MiB lower with graphs. Reverted.
 Same run on n_max: 3 vs 4 is -3% t/s at 2k, -8% at 64k, +17% at 260k (24.1 vs 20.6). The n_max 4
 cycle at 260k is 153 ms here against 173 ms in attempt 183's run on the same build: run-to-run
 spread is ~10%, so only compare configurations interleaved in one run.
+
+## Attempt 187 — I2F-free exact int->float in the q6_K mmvq dot product: no gain, reverted
+
+The 5-column kernel issues 48 I2F per call (quarter rate on sm_60). A magic-number conversion
+(IADD into the mantissa of 1.5*2^23, FADD back) is bit-identical for |x| < 2^22. The I2Fs left the
+SASS, but timing didn't move: 103.5 / 140.0 / 160.0 / 183.3 / 205.3 us for n=1..5 against 102.6 /
+140.9 / 158.2 / 181.2 / 202.1. The conversion pipe runs alongside the XMADs and was never the
+limiter. This kernel is at its practical floor for exact arithmetic.
