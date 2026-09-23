@@ -102,6 +102,7 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--n-max", default="", help="comma list of per-request speculative.n_max values (restore mode)")
     ap.add_argument("--server-n-max", type=int, default=0, help="override --spec-draft-n-max on the server")
+    ap.add_argument("--graphs", default="0", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 0)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--fill", metavar="DIR")
     g.add_argument("--restore", metavar="DIR")
@@ -116,7 +117,7 @@ def main():
     if slot_dir:
         os.makedirs(slot_dir, exist_ok=True)
         args += ["--slot-save-path", slot_dir.rstrip("/") + "/"]
-    env = dict(os.environ, LD_LIBRARY_PATH=a.bindir, GGML_CUDA_P2P="1", GGML_CUDA_GRAPHS_PRE_VOLTA="0")
+    env = dict(os.environ, LD_LIBRARY_PATH=a.bindir, GGML_CUDA_P2P="1", GGML_CUDA_GRAPHS_PRE_VOLTA=a.graphs)
     log = open(a.out + ".server.log", "w")
     srv = subprocess.Popen([os.path.join(a.bindir, "llama-server")] + args, env=env,
                            stdout=log, stderr=subprocess.STDOUT)
