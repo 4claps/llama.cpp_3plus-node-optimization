@@ -7750,3 +7750,27 @@ Not changed tonight. A narrower-tile GEMM for 9-127 columns would be the lever, 
 cuBLAS choice (ALGO6, attempt 153) was made for accuracy, and any replacement needs the same
 accuracy measurement first. The mmvq multi-column kernel scales worse than this past ~8 columns
 (5 columns already cost 2x of 1).
+
+## Attempt 196 — speculative sampling for the MTP draft (min(1, p/q) accept): no gain, reverted
+
+Goal set 2026-09-23: 55 t/s MTP decode at 2k and 31 t/s at 260k, math byte-identical or
+rounding less. At 2k the depth-bench workload runs ~3.2 tokens per 75 ms cycle, and the
+5-token verify alone is ~57 ms of GPU time, so the target needs more tokens per cycle, not
+only a faster cycle.
+
+Lossless speculative sampling was tried: the MTP draft samples each token from its top-10 at
+temperature T and records the distribution q; the server accepts draft[i] with probability
+min(1, p/q), with p the target sampler chain's distribution, and on rejection draws from
+max(p - q, 0). Target logits are untouched and every token is distributed exactly as before.
+Checkpoint replays force-accept the already chosen tokens. depth-bench --restore, 2 questions x
+3 seeds (new `--seeds` option), 256 tokens:
+
+    draft          2k tok/cycle   2k t/s    260k tok/cycle   260k t/s
+    greedy (now)      3.167        42.36        3.339          22.39
+    sampled T=0.3     3.091        41.51        3.310          22.29
+    sampled T=0.6     3.024        40.18
+    sampled T=1.0     2.931        39.19
+
+Acceptance falls as the draft temperature rises: the draft's argmax is its best guess, and a
+sampled draft only wins when q tracks p, which this MTP head's does not. Patch kept at
+/mnt/fast/p100-scratch/spec-dist-sampling.patch. Reverted.
