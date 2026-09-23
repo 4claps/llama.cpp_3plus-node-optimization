@@ -7724,3 +7724,9 @@ target context's output buffer being cleared on reallocation. That buffer includ
 sized n_embd x n_batch for MTP's unmasked next-token embeddings, ~671 MB of host memory. It
 happens per request, not per token. The other large memset is `common_prompt_checkpoint::update_tgt`,
 also once per request. Neither is a decode cost.
+
+## Attempt 194 — two blocks per SM for the 1-token q4p kernel: worse, reverted
+
+`__launch_bounds__(256, 2)` at ncols1 == 1 caps it at 128 registers (from 162). ptxas spills 56 bytes
+to the stack, and it is slower everywhere. us per call, now -> two blocks: kv 262144 889 -> 969-976,
+131072 476 -> 522, 32768 140 -> 182-184, 2048 38.3 -> 41.1.
