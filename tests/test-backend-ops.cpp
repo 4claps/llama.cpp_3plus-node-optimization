@@ -10831,6 +10831,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     }
 
+    // Speculative-verify widths at the same shape: MTP verifies up to n_draft+1 = 5 tokens, and
+    // on Pascal these take the q4p kernel. kv 768 and 1280 leave the last KV chunk partly filled.
+    for (int kv : {256, 768, 1280, 4096, 32768}) {
+        for (int nb : {2, 3, 4, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
+    for (int kv : {768, 1280}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    }
+    // and without a mask, and with a second sequence
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+
     // Prefill-shaped correctness at the same operating shape. The sweep above is nb=1, which
     // never reaches the cuBLAS-GEMM attention path: that path fires only at Q->ne[1] >= 128 and
     // K->ne[1] >= 4096, i.e. on essentially every long-context prefill ubatch, and it is ON by
