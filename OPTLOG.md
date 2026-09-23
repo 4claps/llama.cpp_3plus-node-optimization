@@ -7730,3 +7730,23 @@ also once per request. Neither is a decode cost.
 `__launch_bounds__(256, 2)` at ncols1 == 1 caps it at 128 registers (from 162). ptxas spills 56 bytes
 to the stack, and it is slower everywhere. us per call, now -> two blocks: kv 262144 889 -> 969-976,
 131072 476 -> 522, 32768 140 -> 182-184, 2048 38.3 -> 41.1.
+
+## Attempt 195 — where a short chat turn's prompt time goes (analysis, no change)
+
+`qwen-server` reports ~0.7-1.2 s of "prompt eval" for a 25-token follow-up at 2k (1.8 s at 260k).
+That is time-to-first-token on every turn. From the nsys trace:
+
+- **First request after server start only:** ~1.1 s of `cudaMallocHost` plus 0.1 s of
+  `cudaFreeHost`. The output buffer is allocated lazily, then regrown. Under MTP it includes
+  `embd_nextn`, n_embd x n_batch floats (~671 MB of pinned host memory at -b 32768), and it is
+  cleared on each allocation.
+- **Every request:** at 25 tokens the matmuls take the dequantize + cuBLAS path (mmvq stops at 8
+  columns). GPU0 in the 2k window: `maxwell_hgemm_256x128_tn` 284 ms (504 calls, ~0.56 ms each,
+  ~4 TFLOPS, a 256x128 tile on a 25-wide GEMM), `dequantize_block_q6_K_vec4` 90 ms (every weight
+  converted to f16, every call), `mul_mat_vec_q` 76 ms, attention and the rest ~35 ms. About
+  0.5 s of GPU time, nearly independent of prompt length up to ~128 tokens.
+
+Not changed tonight. A narrower-tile GEMM for 9-127 columns would be the lever, but the fork's
+cuBLAS choice (ALGO6, attempt 153) was made for accuracy, and any replacement needs the same
+accuracy measurement first. The mmvq multi-column kernel scales worse than this past ~8 columns
+(5 columns already cost 2x of 1).

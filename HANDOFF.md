@@ -57,13 +57,17 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
    allows, against ~44% now. At 30 rows it is latency-bound (same time at 1189 and 1328 MHz),
    so more loads in flight should matter more than fewer instructions. Measure in the server,
    not only in test-backend-ops (OPTLOG 190).
-5. **`GGML_CUDA_DEVICES` above the physical GPU count isn't reproducible** (NaN in 4 of 8 runs at
+5. **Short-prompt prefill (time to first token per chat turn).** A 9-127 token prompt takes
+   ~0.5 s of GPU at any depth: cuBLAS's 256x128-tile HGEMM at ~4 TFLOPS on a skinny GEMM, plus a
+   full f16 dequant of the weights each call (OPTLOG 195). A narrow-tile kernel would help. Any
+   replacement must match ALGO6's accuracy (attempt 153).
+6. **`GGML_CUDA_DEVICES` above the physical GPU count isn't reproducible** (NaN in 4 of 8 runs at
    3 virtual devices). It follows the GEMM attention path. It's debug-only, and two physical GPUs
    are bit-stable. OPTLOG attempt 153 §8c.
-6. **Fuse the all-reduce widen into the ADD** (~+1% prefill). It needs an accumulating-copy path
+7. **Fuse the all-reduce widen into the ADD** (~+1% prefill). It needs an accumulating-copy path
    in `ggml-backend-meta.cpp`.
-7. **`gated_delta_net`** is 7% of prefill and at ~15% issue efficiency. It resisted three attempts.
-8. **Deepest prefill regressed ~10%** (95.1 → 85.4 t/s at `-d 262144`). Possibly thermal; not
+8. **`gated_delta_net`** is 7% of prefill and at ~15% issue efficiency. It resisted three attempts.
+9. **Deepest prefill regressed ~10%** (95.1 → 85.4 t/s at `-d 262144`). Possibly thermal; not
    bisected.
 
 ## Closed: don't re-sweep without new information
