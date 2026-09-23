@@ -7713,3 +7713,14 @@ explains the profiled run. A timing-dependent result in that binary can't be rul
 recurs, suspect the tensor-parallel exchange first (b67848c64 was a race there). GGML_CUDA_GRAPH_OPT
 (concurrent streams) is off. Worth a dedicated repeat-until-diverge test at 260k: same binary,
 N runs, with and without load on the other GPU.
+
+## Attempt 193 — reset only the written output_ids entries: no measurable gain, reverted
+
+`output_reserve` fills all of `output_ids` (n_batch = 32768 entries under -b 32768) with -1 on
+every decode, where a verify writes at most 5. A high-water mark made the reset touch only
+written entries. The output was identical, but the profiler's `memset` share didn't move (4.47% ->
+4.95% of main-thread samples) and neither did ms/cycle. The memset under `output_reserve` is the
+target context's output buffer being cleared on reallocation. That buffer includes `embd_nextn`,
+sized n_embd x n_batch for MTP's unmasked next-token embeddings, ~671 MB of host memory. It
+happens per request, not per token. The other large memset is `common_prompt_checkpoint::update_tgt`,
+also once per request. Neither is a decode cost.
