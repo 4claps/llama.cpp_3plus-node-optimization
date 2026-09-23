@@ -7659,3 +7659,57 @@ ABBA, not ABAB.
 
 Also an operational note: `pkill -f` with a pattern that appears in the calling shell's own
 command line kills that shell. Kill by PID only.
+
+## Attempt 192 — draft length from the draft's own confidence: loses; the ~40 ms graph rebuild it exposed, cut to ~20
+
+**The idea.** p_min 0.2 almost never stops a draft (3.98 of 4 drafts computed on average), so
+every verify is n_max + 1 wide, and each extra verify token costs more the deeper the context.
+A new env-gated log (`LLAMA_SPEC_LOG=<path>`, kept: one line per cycle with the drafted tokens'
+top-1 probabilities, accepted count and timings) showed the draft is well calibrated.
+Conditioned on reaching a position, P(accept) ~= the draft's top-1 p (0.9-1.0 -> 0.95, 0.5-0.6 ->
+0.54, 0.3-0.4 -> 0.31). A simulation with measured verify costs by width (2k: 41.5 / 49.2 / 56.5 /
+61.6 / 79.7 ms for 2/3/4/5/7 tokens; 64k: 47.4 / 57.5 / 66.7 / 77.6 / 102.6) predicted that
+stopping once the product of drafted p falls under 0.6 would cut ms/token by 11% at 2k, 15% at
+64k and 22% at 260k.
+
+**Reality.** t/s at 2k: 25.6 / 28.9 against 36.6 / 48.3 for the fixed width. Worse everywhere.
+The log shows why. When the verify width differs from the previous cycle's, the verify tail is
+~40 ms slower (2k, 5 tokens: 61.6 ms after a same-width cycle, 104.7 after a different one),
+because the target graph is only reused at an identical shape. A rebuild of the 4519-node verify
+graph measured 1.2-2.4 ms to build, 23-33 ms in `ggml_backend_sched_alloc_graph` and 14-23 ms in
+the meta backend's subgraph rebuild. The pmp profiler put 27% of the main thread in
+`ggml_backend_meta_get_split_state`, mostly as self time.
+
+**Rebuild fixes (kept, output byte-identical at 2k, 64k and 260k).**
+- The split-state cache and the simple-tensor map were `std::map`s. Now they are hashed, and
+  the cache is looked up once per call instead of four times.
+- The per-call vector of ten source states was value-initialized from scratch each time. It now
+  comes from a per-recursion-depth pool (a deque, so deeper calls can't move the shallower
+  calls' vectors), and absent sources set only the fields that are read.
+  Together: alloc 23-33 -> 10-17 ms, meta rebuild 14-23 -> 7-14 ms.
+- `GGML_BACKEND_META_MAX_DEVICES` 16 -> 4. The split state holds 16 segments per device and is
+  copied thousands of times per rebuild; it drops from ~2 KB to ~0.5 KB. Alloc -> 10-16 ms, meta
+  rebuild -> 4.5-7.4 ms. The whole rebuild is now 16-25 ms against 40-55.
+- Tried and dropped: comparing only the split-relevant tensor fields in the cache validation.
+  It is correct, but it measured nothing on its own.
+
+With rebuilds at ~20 ms the draft-length rule still loses at short context. ABBA, t/s (fixed /
+rule): 2k 38.2 37.7 / 33.0 33.0 and 50.3 48.5 / 37.2 36.7; 64k 35.8 34.9 / 34.1 32.7 and
+38.0 37.6 / 31.0 31.6; 260k 26.9 26.3 / 27.1 27.1 and 23.9 23.1 / 23.6 23.7. The rule was
+removed. It needs width changes to cost nothing, i.e. one cached graph per verify width. That
+means one scheduler per width plus a per-uid subgraph cache in the meta backend, which is the
+open thread for it.
+
+**An open question found on the way.** The 260k texts of this build differ from those of the
+binary used in attempt 191's A/B, from ~100 tokens in, while 2k and 64k match exactly. Reverting
+each of tonight's changes in turn (meta .cpp, header, speculative), up to a clean full build of
+HEAD, all reproduce the new text. `CUDA_LAUNCH_BLOCKING=1` reproduces it too, byte for byte,
+acceptance included. So the current build gives one answer, async or fully serialized, on all six
+prompt/depth cases tried. The earlier binary gave three different 260k texts, though: the two
+A/B runs agreed with each other, but a run of it under GGML_CUDA_OP_PROFILE matched one prompt of
+today's text and neither text on the other. The profiler does not disable fusion; it only adds
+events and a sync per graph. No source difference reproduces the earlier text, and nothing
+explains the profiled run. A timing-dependent result in that binary can't be ruled out. If it
+recurs, suspect the tensor-parallel exchange first (b67848c64 was a race there). GGML_CUDA_GRAPH_OPT
+(concurrent streams) is off. Worth a dedicated repeat-until-diverge test at 260k: same binary,
+N runs, with and without load on the other GPU.
