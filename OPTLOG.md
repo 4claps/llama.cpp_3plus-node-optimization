@@ -7565,3 +7565,56 @@ Real-world A/B on one build, via the env switch, interleaved and repeated, 256 t
 
 That is -3 to -5 ms per cycle, 4-5%. The generated text is byte-identical with the switch off
 and on, for all four prompts. Perplexity can't move: llama-perplexity never samples.
+
+## Attempt 189 — the CUDA backend's internal AllReduce on Pascal: exact, but no gain, reverted
+
+The server log showed "internal AllReduce init failed (n_devices != 2?)". The chunked-kernel
+AllReduce (one kernel per GPU, cross-GPU signalling through mapped pinned memory, ~6 API calls
+per exchange against the butterfly's ~16) was gated on Volta for one reason: `__nanosleep` in
+its spin loop. Enabled on sm_60 with a plain spin. Upstream's default BF16 wire format was turned
+off, since it rounds every tensor-parallel partial to 8 mantissa bits. It was limited to
+exchanges of 1 MB or less, so prefill kept the P2P butterfly and the 32 MB copy-engine scratch
+was never allocated.
+
+Outputs were byte-identical to the butterfly on all four prompts, since `own + peer` in fp32 is
+the same sum. It was not faster. tg64: 30.98 / 31.07 t/s against 31.32 / 31.25 for the butterfly.
+Real MTP cycle (ms), butterfly / internal: 2k 78.2 78.9 / 78.5 81.0 and 72.3 72.7 / 73.2 73.3;
+64k 89.7 90.3 / 90.4 91.1 and 91.0 91.5 / 91.7 92.2. The staging through host memory costs more
+GPU latency than the API calls it saves. Reverted; the patch is kept at
+/mnt/fast/p100-scratch/allreduce-pascal-internal.patch.
+
+Where the cycle goes, from the nsys trace (2k context, n_max 4, prefilter on): the verify is
+2388 kernels, 56.8 ms of GPU time in 62-68 ms of wall time. The four draft steps plus catch-up
+are 7.4 ms of GPU time. So ~64 ms of an ~72 ms real cycle is GPU work, and the verify's 5-column
+q6_K matvec is most of it. The rest of the host overhead is a ~200 us enqueue skew between the
+GPUs at the start of each graph (one host thread issues GPU0's subgraph before GPU1's),
+the draft context rebuilding its graph twice per cycle (catch-up n=5, draft n=1), and ~9
+synchronous input uploads per decode (the meta backend has no events, so the scheduler syncs
+both GPUs before each one).
+
+## Attempt 190 — split a 5-token q4p call into 3 + 2 tokens: faster in isolation only, reverted
+
+Per query row, 30 rows is q4p's slowest width (it can't take two KV positions per thread at 255
+registers). Two launches over the same cache, tokens 0-2 at R=18 and 3-4 at R=12, through
+shallow views of Q, the mask and dst. test-backend-ops, us per call, off / on:
+
+    kv      2048  4096  8192  16384  32768  65536  131072  262144
+    off       86   120   181    323    590   1086    2132    4193
+    on       133   134   245    345    541   1022    1889    3605
+
+Correct (FLASH_ATTN_EXT 4019/4019; 37/37 at the serving shape with the split forced at every
+depth), and -14% at 262144, even with both GPUs loaded at once. But in the real server it moved
+the 260k MTP cycle by less than the run-to-run spread. Two repeats each, two prompts:
+
+    ms/cycle   128k: 114.3 113.4 | 109.6 109.8  (off)   118.0 117.4 | 108.9 110.0  (on)
+               260k: 149.4 149.7 | 150.2 151.0  (off)   147.5 150.6 | 148.4 151.0  (on)
+
+GGML_CUDA_OP_PROFILE in the server shows why. A 5-token call at kv 260352 is 4.165 ms off and 3.981
+on: -4.4%, not -14%. The op test runs the attention alone at 1328 MHz (it draws ~43 W). The
+server runs at ~1189 MHz under the matvecs' power cap. The unsplit 30-row kernel takes the same
+time at both clocks (4.19 vs 4.17 ms), so it is latency-bound, not issue-bound. The split
+kernels are issue-bound and scale with the clock (3.61 x 1328/1189 = 4.03, against 3.98
+measured). **Lesson: time attention changes in the server, or at least at the server's clock.**
+The op test flatters anything that trades latency for instructions. It also says the next thing
+to try for R=30 is more loads in flight, not fewer instructions. Patch kept at
+/mnt/fast/p100-scratch/q4p-split5.patch.
