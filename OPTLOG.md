@@ -7774,3 +7774,47 @@ Checkpoint replays force-accept the already chosen tokens. depth-bench --restore
 Acceptance falls as the draft temperature rises: the draft's argmax is its best guess, and a
 sampled draft only wins when q tracks p, which this MTP head's does not. Patch kept at
 /mnt/fast/p100-scratch/spec-dist-sampling.patch. Reverted.
+
+## Attempt 197 — exact-integer q6_K verify matvec on the fp64 units: reaches parity, not a win (not kept)
+
+The 5-column q6_K matvec is ~48 ms of a ~75 ms MTP cycle at 2k, and it is ALU-bound: the dp4a
+emulation costs ~2.2 instructions per multiply-add (152 us at 8704x5120 against 82 us for one
+column). The idea: do the same exact integer arithmetic on the fp64 pipe, which dual-issues beside
+integer work.
+
+- Pack three activation columns into one double, x0 + x1*2^17 + x2*2^34, scaled by 2^970. Use the
+  unsigned 6-bit weight u as the raw bits of a double, i.e. the denormal u*2^-1074. Then one DFMA
+  adds u*(x0 + x1*2^17 + x2*2^34)*2^-104, exactly: three multiply-adds and no conversion.
+- Sums over a 16-value scale group stay below 2^16 per field and below 2^53 overall. The group
+  sums are pulled out of the mantissa with a magic constant, the bias of 32 is removed with a
+  precomputed 32*sum(x), and the scales go on in fp32 (exact) and double. The result rounds about
+  8x less often than the dp4a path.
+- Microbenchmark, pure ALU: 3.82 TMAC/s against 1.66 for the XMAD dp4a, a 2.3x gain. Denormal
+  DFMA runs at full speed on sm_60. Exactness: all eval cases at 1024/4360/2560 rows, K
+  5120/17408, n 2..7 pass, and so do the new m > 256 eval cases.
+
+The kernel did not follow the microbenchmark. us at 8704x5120 (test-backend-ops perf, GPU1):
+
+    version                                             n=2    n=5    (dp4a: 96 / 152)
+    v1  lane = 8 rows x 4 quarters, per-warp packing   130    204
+    v2-v3 row-split warps, hoisted offsets             162    194-253
+    v5  pre-packed X in global, lanes on groups         161    223
+    v7  weights staged through smem with 16B loads      143    188
+    v8-v9 prefetch a step ahead, guard-free full steps  129    167-172
+    v10 4 rows per lane, 8 warps                         123    161   (5120^2: 99 vs 95, 3072: 67 vs 66)
+    v11 lane = 8 slots x 4 row lanes, per-warp staging  131    219
+    v12 v10 + per-superblock 53-word slots (no conflicts) 141  177
+
+What the ablations showed:
+- In v6, the weight loads alone cost 126-138 us. Per-lane 32-bit loads move ~56 bytes per
+  instruction; staging with 16-byte loads (v7) brought loads alone down to 86-92 us.
+- In v10, the loop is down to ~6.4 instructions per value-row, near the design floor (2 DFMA,
+  1 PRMT, 0.75 decode, ~1.8 per-group extraction and scaling). But the IPC is ~0.7. Replacing the
+  weight reads from shared memory with constants saves 35 us, and dropping the two block barriers
+  per step saves 10. Making the reads conflict-free (v12) did not recover that 35.
+
+Best is v10, at parity. Without an instruction-level profiler on Pascal I could not find the
+stall. Kept out of the tree; the kernel versions and the hook are in /mnt/fast/p100-scratch
+(mmvq-q6k-f64.v12.cuh, f64-v10.cuh, f64-v11.cuh, mmvq-f64-hook.patch). What is kept: q6_K eval
+cases with more than 256 rows (the existing m=16 cases never reach the multi-column kernel on
+Pascal) and perf cases at the six per-GPU shapes, n 1..6.
