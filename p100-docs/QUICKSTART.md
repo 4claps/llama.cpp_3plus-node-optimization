@@ -88,14 +88,21 @@ If anything else shares GPU0, like a browser or a second display client, drop on
 
 ### Draft length: 3 or 4
 
-At full depth, `--spec-draft-n-max 3` is better. The verify batch (draft + 1) is then 4, which
-fills one attention tile exactly, while 5 needs a wider tile: 50.5 ms against 78.4 ms of
-attention per pass at 262144. At mixed, shallower depths, 4 measured better, because an accepted
-extra token saves a whole forward pass. Compare over several runs at your own depth. Acceptance
-depends on sampled tokens, so single runs are noisy.
+With `--spec-draft-p-min 0.2`, drafting almost never stops early (3.98 of 4 drafts on average),
+so every verify is `n_max + 1` tokens wide. A wider verify is cheap at short context and costly at
+depth, where attention runs once per verify token. Interleaved on one build, real sampling:
 
-MTP is worth ~1.7x at short context, and little at 229k (23.2 t/s against 21.5 plain), where the
-verify pass pays nearly the full attention cost.
+| context | n_max 3 against 4 |
+|---|---|
+| 2k | −3% t/s |
+| 64k | −8% |
+| 260k | **+17%** (24.1 against 20.6 t/s) |
+
+So 4 (the default in `qwen-server`) for most work, and 3 if you live past ~150k. Single runs
+spread by ~10%, because acceptance depends on the text, so compare several.
+
+MTP through the server, 2026-09-23 build, `--temp 0.3 --top-k 20`: 38-50 t/s at 2k, 36-38 at
+64k, 24-27 at 260k.
 
 ## Benchmarking decode
 

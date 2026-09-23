@@ -162,14 +162,22 @@ including what was reverted.
 | `04e9262d1` | 1 row per block for small q6_K matrices at 2-8 columns | the 5120x24 delta-net matmul at 5 columns: 35 → 10.7 µs |
 | `45d466bea` | radix-select top-k when CUB has no DeviceTopK | a 200k-entry row: 136 → 71 µs |
 | `66bbd1212` | **the samplers pick the top k straight from the logits** when nothing ahead of top-k in the chain can reorder them | under `-sm tensor` both the draft and verify samplers run on the CPU. Each sample built and partially sorted a 248k-entry array (~650 µs); one SSE2 scan takes 36. **−3 to −5 ms per cycle (4-5%)**, with byte-identical output |
+| `2bc1a9ac0` | **q4p hides its memory latency.** The softmax denominator leaves the PV loop (4 of 8 warps were adding into it, divergent, at every position), and the freed registers load V one position ahead and the next chunk's K during PV | at one block per SM it waited on memory. In the server at 260k: 5 tokens 4.165 → 3.906 ms, 1 token 1.071 → 1.016. MTP cycle −2.8% at 260k |
+| `a8b274ea6` | **tensor-parallel graph rebuilds in ~20 ms instead of ~45.** The meta backend's split-state cache and tensor map are hashed, looked up once, and their scratch pooled; `GGML_BACKEND_META_MAX_DEVICES` 16 → 4 shrinks the split state it copies thousands of times per rebuild | the target graph rebuilds whenever the batch shape changes: a new prompt, a KV size step, a different verify width. Byte-identical output |
 | `f9152a548` | slot save/restore also saves the MTP draft context | a restored slot drafts at full acceptance |
-| `34a9545a5` | `GGML_CUDA_OP_PROFILE=1`, `LLAMA_UBATCH_PROFILE=1`, `LLAMA_SPEC_PROFILE=1` | per-op GPU times, host phases per ubatch, and MTP catch-up and draft-step times, all env-gated |
+| `34a9545a5`, `fe9b48d87`, `8ea46770a` | `GGML_CUDA_OP_PROFILE=1`, `LLAMA_UBATCH_PROFILE=1`, `LLAMA_SPEC_PROFILE=1`, `LLAMA_SPEC_LOG=<path>`, and `tools/pmp` | per-op GPU times, host phases per ubatch, MTP step times, a per-cycle draft log, and a sampling CPU profiler for when `perf` is locked. All off by default |
 
 **Why the MTP cycle costs what it does.** An nsys trace at 2k context shows ~64 ms of GPU work in
 a ~72 ms cycle. The 5-token verify is 56.8 ms of it, and that is almost all the 5-column q6_K
 matvec, which is at its floor for exact arithmetic (OPTLOG 179 and 187). The rest is host time:
 sampling, which this round cut in half, plus graph rebuilds in the draft context and synchronous
 input uploads. Deeper in, attention takes over. At 260k about half of each cycle is 17 q4p calls.
+
+**Draft length.** The draft model's top-1 probability is well calibrated here: a drafted token
+with p 0.5-0.6 is accepted 54% of the time, 0.9-1.0 95%. A rule that stops drafting once the
+product of those probabilities falls under 0.6 simulates at 11-22% faster. In practice it loses,
+because a verify of a new width rebuilds the 64-layer graph, even at the new ~20 ms. It would pay
+with one cached graph per verify width (HANDOFF, open threads).
 
 **`--spec-draft-n-max`.** Drafting almost never stops early at `--spec-draft-p-min 0.2`, so every
 verify is `n_max + 1` tokens wide. A wider verify costs little at short context and a lot at

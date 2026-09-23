@@ -9,7 +9,8 @@ Where the work stands, and what's worth doing next. For the project rules and ga
   merge touched and how it was checked, and §10 for the real-world MTP work since.
 - `tg256` 31.3 t/s (upstream at the fork point: 17.51). Perplexity 2.6101 ± 0.0198 on the gate corpus.
 - Real-world MTP, ms per cycle through `llama-server` (`tools/depth-bench.py --restore`): ~73 at
-  2k, ~90 at 64k, ~110 at 128k, ~150 at 260k. The slot snapshots it restores are in
+  2k, ~87 at 64k, ~110 at 128k, ~143 at 260k. That is 38-50 t/s at 2k and 24-27 t/s at 260k,
+  depending on how much of the text the draft predicts. The slot snapshots it restores are in
   `/mnt/fast/p100-scratch/slots`, so a full-context measurement takes minutes, not an hour of prefill.
 - The release bundle at `/mnt/fast/p100-llamacpp-release` is refreshed from this branch.
   `diffs/HEAD-SHA.txt` there is authoritative.
@@ -24,7 +25,8 @@ steps and catch-up are 7.4 ms. The remaining ~8 ms is host time:
 
 - a ~200 µs skew at the start of every graph, because one host thread enqueues GPU0's subgraph
   before GPU1's and GPU0 then waits for GPU1 at the first all-reduce;
-- the draft context rebuilding its graph twice per cycle (catch-up is 5 tokens, a draft step 1);
+- the draft context rebuilding its graph twice per cycle (catch-up is 5 tokens, a draft step 1),
+  now under 1 ms each;
 - ~9 input uploads per decode, each syncing both GPUs, because the meta backend has no events.
 
 nsys works on Pascal (2022.4). If the importer fails, run
@@ -38,21 +40,30 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
    would double the enqueue rate, which matters in the draft steps. It needs host-side ordering
    between the two threads at every all-reduce (the peer copy's event must be recorded before
    the other side's stream waits on it). Worth maybe 2-4% at short context.
-2. **Keep two graphs in the draft context** (catch-up and draft step) so neither rebuilds. ~1.5
-   ms per cycle. The scheduler and the meta backend each cache only the last graph.
-3. **q4p occupancy.** Every variant runs one 256-thread block per SM (233-255 registers). At 30
+2. **One cached graph per batch shape.** The scheduler and the meta backend each keep only the
+   last graph, so any shape change rebuilds it: ~20 ms for the target (a8b274ea6 got it there
+   from ~45), under 1 ms for the draft context, which rebuilds twice per cycle. With a graph
+   per verify width, a confidence-based draft length (OPTLOG 192, `LLAMA_SPEC_LOG` has the
+   data) simulates at −11% ms/token at 2k, −15% at 64k and −22% at 260k. That needs one
+   scheduler (small compute buffers) per width, plus a per-uid subgraph cache in the meta
+   backend. Its external-view containers rotate two-deep today, which is the tricky part.
+3. **A possible timing-dependent result in an earlier binary.** One build gave three different
+   260k texts across normal and profiled runs. The current build agrees with itself, async and
+   under `CUDA_LAUNCH_BLOCKING=1`, on every case tried. See OPTLOG 192. A repeat-until-diverge
+   test at 260k would settle it.
+4. **q4p occupancy.** Every variant runs one 256-thread block per SM (233-255 registers). At 30
    rows the PV accumulators alone are 120 registers. A design that keeps fewer rows per thread,
    or splits PV across two blocks, might approach the ~70% FFMA efficiency the instruction mix
    allows, against ~44% now. At 30 rows it is latency-bound (same time at 1189 and 1328 MHz),
    so more loads in flight should matter more than fewer instructions. Measure in the server,
    not only in test-backend-ops (OPTLOG 190).
-4. **`GGML_CUDA_DEVICES` above the physical GPU count isn't reproducible** (NaN in 4 of 8 runs at
+5. **`GGML_CUDA_DEVICES` above the physical GPU count isn't reproducible** (NaN in 4 of 8 runs at
    3 virtual devices). It follows the GEMM attention path. It's debug-only, and two physical GPUs
    are bit-stable. OPTLOG attempt 153 §8c.
-5. **Fuse the all-reduce widen into the ADD** (~+1% prefill). It needs an accumulating-copy path
+6. **Fuse the all-reduce widen into the ADD** (~+1% prefill). It needs an accumulating-copy path
    in `ggml-backend-meta.cpp`.
-6. **`gated_delta_net`** is 7% of prefill and at ~15% issue efficiency. It resisted three attempts.
-7. **Deepest prefill regressed ~10%** (95.1 → 85.4 t/s at `-d 262144`). Possibly thermal; not
+7. **`gated_delta_net`** is 7% of prefill and at ~15% issue efficiency. It resisted three attempts.
+8. **Deepest prefill regressed ~10%** (95.1 → 85.4 t/s at `-d 262144`). Possibly thermal; not
    bisected.
 
 ## Closed: don't re-sweep without new information

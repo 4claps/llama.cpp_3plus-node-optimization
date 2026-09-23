@@ -11,9 +11,10 @@ It tracks upstream by merging. The last merge was upstream `f46bc30cb`
 
 | | upstream at the fork point | this fork |
 |---|---|---|
-| decode, `tg256` | 17.51 t/s | **30.6 t/s** |
+| decode, `tg256` | 17.51 t/s | **31.3 t/s** |
 | prefill, `pp2048` at `-ub 512` | 222.6 t/s | **380.4 t/s** (before the 2026-09-22 merge) |
-| decode at 229k context | — | 21.5 t/s plain, 23.2 with MTP |
+| MTP decode through `qwen-server`, real sampling | — | **38-50 t/s** at 2k, 36-38 at 64k, 24-27 at 260k |
+| decode at 229k context, 2026-09-22 build | — | 21.5 t/s plain, 23.2 with MTP |
 | perplexity (gate corpus, `-c 4096`) | — | **2.6101 ± 0.0198** (band 2.6209 ± 0.0199) |
 
 The speed didn't cost accuracy. Measured against an all-fp32 run, this fork's prefill matmuls are
