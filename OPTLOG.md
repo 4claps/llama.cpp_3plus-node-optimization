@@ -7511,3 +7511,21 @@ any rounding change forward through every later token. So on this model KLD cann
 equally-accurate implementations; per-op NMSE against the reference plus perplexity can. q4p adds
 nothing measurable on top (0.0033 with vs 0.0034 without), and its per-op NMSE is half the tile
 kernel's (1.5e-6 vs 3e-6).
+
+## Attempt 186 — CUDA graphs for small batches only (GGML_CUDA_GRAPHS_PRE_VOLTA=2): reverted
+
+Idea: capture graphs for decode/verify/draft only (no matmul/attention wider than 8 tokens),
+leaving out the prefill graphs whose instantiation exhausts VRAM at full context. Interleaved on
+one server per config, same snapshots, 384 tokens:
+
+    depth   n_max 4: graphs off / small   n_max 3: graphs off / small   (ms per cycle)
+      2k        79.6 / 78.0                     70.0 / 72.5
+     64k        94.8 / 95.2                     82.8 / 88.4
+    260k       153.4 / 155.2                   127.6 / 134.8
+
+No gain. Under -sm tensor each pass is ~257 small sub-graphs per GPU, so graph launches save
+little. GPU0 low point ~40 MiB lower with graphs. Reverted.
+
+Same run on n_max: 3 vs 4 is -3% t/s at 2k, -8% at 64k, +17% at 260k (24.1 vs 20.6). The n_max 4
+cycle at 260k is 153 ms here against 173 ms in attempt 183's run on the same build: run-to-run
+spread is ~10%, so only compare configurations interleaved in one run.
