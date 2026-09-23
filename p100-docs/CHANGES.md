@@ -147,6 +147,35 @@ the same either way.
 | KL divergence vs before, 8 chunks | — | 0.0015 mean, 98.6% same top token (all from `5fdfa6282`) |
 | `test-backend-ops` | 14593/14593 | 16180/16180, both GPUs |
 
+## 10. Real-world MTP speed, and decode at depth (2026-09-22/23)
+
+Measured through `llama-server` with the production flags (`qwen-server`'s, MTP on, sampling
+at `--temp 0.3 --top-k 20`), from saved slot snapshots at 2k, 16k, 64k, 128k and 260k context.
+The metric is milliseconds per MTP cycle (one verify, one catch-up and the draft steps), since
+tokens per second also depend on how many drafts the text happens to accept. `tools/depth-bench.py`
+does the filling, the snapshots and the measuring. OPTLOG attempts 177-190 have the details,
+including what was reverted.
+
+| commit | change | effect |
+|---|---|---|
+| `f7312ff1f` | **q4p: an fp32 flash-attention kernel for 1-5 tokens over the q4_0 cache.** Dequant is 2 instructions per value straight into fp32 (PRMT the nibble into a float's mantissa, one FADD), each value is reused by all 6-30 query rows, and Q, products and sums stay fp32 | at 262144: 1225 → 1001 µs (1 token), 4882 → 4307 (5 tokens). Half the per-op error of the tile kernel |
+| `04e9262d1` | 1 row per block for small q6_K matrices at 2-8 columns | the 5120x24 delta-net matmul at 5 columns: 35 → 10.7 µs |
+| `45d466bea` | radix-select top-k when CUB has no DeviceTopK | a 200k-entry row: 136 → 71 µs |
+| `66bbd1212` | **the samplers pick the top k straight from the logits** when nothing ahead of top-k in the chain can reorder them | under `-sm tensor` both the draft and verify samplers run on the CPU. Each sample built and partially sorted a 248k-entry array (~650 µs); one SSE2 scan takes 36. **−3 to −5 ms per cycle (4-5%)**, with byte-identical output |
+| `f9152a548` | slot save/restore also saves the MTP draft context | a restored slot drafts at full acceptance |
+| `34a9545a5` | `GGML_CUDA_OP_PROFILE=1`, `LLAMA_UBATCH_PROFILE=1`, `LLAMA_SPEC_PROFILE=1` | per-op GPU times, host phases per ubatch, and MTP catch-up and draft-step times, all env-gated |
+
+**Why the MTP cycle costs what it does.** An nsys trace at 2k context shows ~64 ms of GPU work in
+a ~72 ms cycle. The 5-token verify is 56.8 ms of it, and that is almost all the 5-column q6_K
+matvec, which is at its floor for exact arithmetic (OPTLOG 179 and 187). The rest is host time:
+sampling, which this round cut in half, plus graph rebuilds in the draft context and synchronous
+input uploads. Deeper in, attention takes over. At 260k about half of each cycle is 17 q4p calls.
+
+**`--spec-draft-n-max`.** Drafting almost never stops early at `--spec-draft-p-min 0.2`, so every
+verify is `n_max + 1` tokens wide. A wider verify costs little at short context and a lot at
+depth: n_max 3 against 4 is −3% t/s at 2k, −8% at 64k, and **+17% at 260k** (24.1 against 20.6
+t/s). `qwen-server` keeps 4. For work that lives past ~150k context, 3 is faster.
+
 ## Known gaps
 
 - **`GGML_CUDA_DEVICES` above the physical GPU count isn't reproducible.** At 3 virtual devices,
@@ -155,9 +184,19 @@ the same either way.
   attempt 153 §8c has the data.
 - **Deepest prefill is ~10% below its best measurement.** `pp2048` at `-d 262144` measured 95.1
   t/s during tuning and 85.4 later. Possibly thermal; not bisected.
-- **The remaining decode gap at depth is structural.** At 229k, attention is 23.7 of 46.6 ms per
-  token. The f16 KV path runs at the bandwidth limit, while q4_0 is dominated by dequant work.
-  Closing that needs a new register-resident kernel, not tuning.
+- **Attention at depth is compute-bound, not bandwidth-bound.** q4p (§10) is that
+  register-resident kernel, and at 262144 it runs the 5-token verify at ~44% of the P100's FFMA
+  peak. It uses 233-255 registers, so one block fits per SM. There may be another 1.5x in it,
+  but not from tuning knobs; attempt 181 swept those. Time attention changes in the server:
+  the op test runs attention alone at 1328 MHz, where the server's power cap holds 1189. The
+  5-token kernel is latency-bound and takes the same time at both clocks, so the op test
+  flatters changes that trade latency for instructions (OPTLOG 190).
+- **Prefill attention still accumulates in fp16.** The GEMM path (§3, long-context prefill)
+  accumulates QKᵀ over the 256 dimensions in fp16, and PV in fp16 within each 2048-key chunk,
+  folded into an fp32 running output. Perplexity can't see it (OPTLOG 152), but it is the one
+  place left where fp16 accumulates. `GGML_CUDA_FA_GEMM_PREC=32` makes it fp32 throughout,
+  more precise than upstream. It costs 11% of `pp2048` at depth 16384 and 27% at 65536.
+  Decode and verify never take this path.
 
 ## Scope
 
