@@ -7537,3 +7537,31 @@ The 5-column kernel issues 48 I2F per call (quarter rate on sm_60). A magic-numb
 SASS, but timing didn't move: 103.5 / 140.0 / 160.0 / 183.3 / 205.3 us for n=1..5 against 102.6 /
 140.9 / 158.2 / 181.2 / 202.1. The conversion pipe runs alongside the XMADs and was never the
 limiter. This kernel is at its practical floor for exact arithmetic.
+
+## Attempt 188 — top-k prefilter in common_sampler: kept
+
+An nsys trace of the real MTP cycle (2k context, n_max 4, 80 ms) showed ~6.5 ms per cycle when
+both GPUs sit idle waiting on the host. The largest piece was sampling. Backend sampling can't
+be used under -sm tensor ("backend sampling not supported with SPLIT_MODE_TENSOR"), so the draft
+sampler (top_k 10) and the server's verify sampler (top_k 20) both ran on the CPU. For each of the
+9 samples per cycle they built a 248k-entry candidate array and partially sorted it: ~450 us fill
+plus ~200 us sort at this CPU's clocks.
+
+When nothing ahead of top_k in the chain can reorder logits, set_logits now selects the k largest
+directly. That holds when penalties, DRY and top-n-sigma are no-ops for the request's params, and
+there is no logit bias, no mirostat, and no forcing reasoning budget. The selection is one SSE2
+threshold scan over the logits, 36 us against ~650. Everything after top_k sees the same k
+candidates in the same order as before. Ties keep ascending token order, and against a stable
+sort it matched on 3000 randomized cases, including ties, -inf and tiny vocabs. A grammar applied
+up front still gets the full vocabulary. The kill-switch is LLAMA_SAMPLER_PREFILTER=0.
+
+Real-world A/B on one build, via the env switch, interleaved and repeated, 256 tokens (ms/cycle):
+
+    depth   q    off          on
+     2k     0   81.8 84.8    79.6 79.1
+     2k     1   76.1 76.9    72.8 72.5
+    64k     0   94.0 94.9    89.7 90.5
+    64k     1   95.0 94.8    91.7 91.9
+
+That is -3 to -5 ms per cycle, 4-5%. The generated text is byte-identical with the switch off
+and on, for all four prompts. Perplexity can't move: llama-perplexity never samples.

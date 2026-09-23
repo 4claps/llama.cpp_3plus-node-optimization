@@ -81,6 +81,7 @@ def record(label, d, qi, r, t0, min_free):
         "gen_n": t.get("predicted_n"), "gen_tps": t.get("predicted_per_second"),
         "draft_n": t.get("draft_n"), "draft_accepted": t.get("draft_n_accepted"),
         "wall_s": round(time.time() - t0, 1), "gpu0_min_free": min_free,
+        "content": r.get("content", r.get("choices", [{}])[0].get("message", {}).get("content")),
     }
 
 
