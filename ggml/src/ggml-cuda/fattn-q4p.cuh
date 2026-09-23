@@ -58,6 +58,9 @@
 #ifndef Q4P_ROLL
 #define Q4P_ROLL 0
 #endif
+#ifndef Q4P_KPF
+#define Q4P_KPF 0
+#endif
 
 template <int R>
 struct fattn_q4p_cfg {
@@ -87,6 +90,9 @@ struct fattn_q4p_cfg {
     // QK over the BPS blocks of a split: rolled (1) keeps the kernel inside the instruction cache,
     // unrolled (2) holds the whole split's words in registers
     static constexpr bool ROLL = Q4P_KNOB(ROLL, 2) == 1;
+    // load the next chunk's K words during this chunk's PV phase (needs NW*PT spare registers;
+    // R=24 has none)
+    static constexpr bool KPF  = !ROLL && Q4P_KNOB(KPF, R == 24 ? 2 : 1) == 1;
 
     static_assert(R % RG == 0, "bad RG");
     static_assert(NT % (NDG*RG) == 0 && NPG >= 1, "bad DPT");
@@ -211,15 +217,17 @@ static __global__ void flash_attn_ext_q4p(
     const int pg   = tid / (NDG*RG);
 
     float acc[RQ][DPT];
-    float l[RQ];
 #pragma unroll
     for (int r = 0; r < RQ; ++r) {
-        l[r] = 0.0f;
 #pragma unroll
         for (int j = 0; j < DPT; ++j) {
             acc[r][j] = 0.0f;
         }
     }
+    // softmax denominator of row tid, for tid < R: summed once per chunk from P_s, so the PV
+    // loop neither spends registers on it nor diverges to add it
+    float l_row = 0.0f;
+    const int l_off = tid < R ? (tid / RQ)*RQP + tid % RQ : 0;
 
     // this thread's V word: block b, word k of each row
     const int pv_d0 = fattn_q4p_pv_dim<DPT>(dg, 0);
@@ -233,6 +241,23 @@ static __global__ void flash_attn_ext_q4p(
 
     __syncthreads();
 
+    constexpr int NW = cfg::ROLL ? 1 : 9*BPS/2; // aligned words per split of a row
+    uint32_t un[PT][NW]; // with KPF: the K words of the chunk about to start
+    auto load_k = [&](const int kc) {
+#pragma unroll
+        for (int pt = 0; pt < PT; ++pt) {
+            const int pos = kc + qslot + NQP*pt;
+            const uint32_t * sp = (const uint32_t *) (Kb + int64_t(pos < ne11 ? pos : 0)*nb11 + qsplit*(18*BPS));
+#pragma unroll
+            for (int j = 0; j < NW; ++j) {
+                un[pt][j] = __ldg(sp + j);
+            }
+        }
+    };
+    if constexpr (cfg::KPF) {
+        load_k(blockIdx.y*C);
+    }
+
     for (int k0 = blockIdx.y*C; k0 < ne11; k0 += gridDim.y*C) {
         const int p_end = min(C, ne11 - k0);
 
@@ -245,7 +270,6 @@ static __global__ void flash_attn_ext_q4p(
         }
 
         // ---- S = Q K^T for this thread's PT positions and RQ rows, over its split of the dims ----
-        constexpr int NW = cfg::ROLL ? 1 : 9*BPS/2; // aligned words per split of a row
         uint32_t u[PT][NW];
         bool kvalid[PT];
         const uint32_t * segp[PT];
@@ -254,7 +278,12 @@ static __global__ void flash_attn_ext_q4p(
             const int pos = k0 + qslot + NQP*pt;
             kvalid[pt] = pos < ne11;
             segp[pt] = (const uint32_t *) (Kb + int64_t(kvalid[pt] ? pos : 0)*nb11 + qsplit*(18*BPS));
-            if constexpr (!cfg::ROLL) {
+            if constexpr (cfg::KPF) {
+#pragma unroll
+                for (int j = 0; j < NW; ++j) {
+                    u[pt][j] = un[pt][j];
+                }
+            } else if constexpr (!cfg::ROLL) {
 #pragma unroll
                 for (int j = 0; j < NW; ++j) {
                     u[pt][j] = __ldg(segp[pt] + j);
@@ -431,12 +460,12 @@ static __global__ void flash_attn_ext_q4p(
                 }
                 a_s[tid] = exp2f(m_s[tid] - mx);
                 m_s[tid] = mx;
+                l_row *= a_s[tid];
             }
             __syncthreads();
 #pragma unroll
             for (int rl = 0; rl < RQ; ++rl) {
                 const float a = a_s[vgrp*RQ + rl];
-                l[rl] *= a;
 #pragma unroll
                 for (int j = 0; j < DPT; ++j) {
                     acc[rl][j] *= a;
@@ -472,13 +501,36 @@ static __global__ void flash_attn_ext_q4p(
             }
         }
 
+        if (tid < R) {
+            float ls = 0.0f;
+            for (int p = 0; p < p_end; ++p) {
+                ls += P_s[p*PSTR + l_off];
+            }
+            l_row += ls;
+        }
+
+        // the next chunk's K words, in flight during the PV phase
+        if constexpr (cfg::KPF) {
+            load_k(k0 + gridDim.y*C);
+        }
+
         // ---- O += P V ----
+        // V words are loaded one position ahead: at one block per SM there are too few warps to
+        // hide an L2 round trip behind the FMAs of the others
+        const char * vrow0 = Vb + int64_t(k0 + min(pg, p_end - 1))*nb21;
+        uint32_t nd  = fattn_q4p_ld16(vrow0 + 18*pv_b);
+        uint32_t nw0 = __ldg((const uint32_t *) (vrow0 + pv_oa));
+        uint32_t nw1 = __ldg((const uint32_t *) (vrow0 + pv_oa + 4));
 #pragma unroll 2
         for (int p = pg; p < p_end; p += NPG) {
-            const char * vrow = Vb + int64_t(k0 + p)*nb21;
-            const float    dv = __half2float(__ushort_as_half((unsigned short) fattn_q4p_ld16(vrow + 18*pv_b)));
-            const uint32_t wv = __byte_perm(__ldg((const uint32_t *) (vrow + pv_oa)),
-                                            __ldg((const uint32_t *) (vrow + pv_oa + 4)), pv_sel);
+            const float    dv = __half2float(__ushort_as_half((unsigned short) nd));
+            const uint32_t wv = __byte_perm(nw0, nw1, pv_sel);
+            {
+                const char * vrow = Vb + int64_t(k0 + min(p + NPG, p_end - 1))*nb21;
+                nd  = fattn_q4p_ld16(vrow + 18*pv_b);
+                nw0 = __ldg((const uint32_t *) (vrow + pv_oa));
+                nw1 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+            }
 
             float y[DPT];
             if constexpr (DPT == 8) {
@@ -507,12 +559,6 @@ static __global__ void flash_attn_ext_q4p(
                 const float4 pq = ((const float4 *) (P_s + p*PSTR + vgrp*RQP))[rq];
                 P[4*rq + 0] = pq.x; P[4*rq + 1] = pq.y; P[4*rq + 2] = pq.z; P[4*rq + 3] = pq.w;
             }
-            if (dg == 0) {
-#pragma unroll
-                for (int r = 0; r < RQ; ++r) {
-                    l[r] += P[r];
-                }
-            }
             if constexpr (cfg::FOLD) {
 #pragma unroll
                 for (int r = 0; r < RQ; ++r) {
@@ -540,10 +586,11 @@ static __global__ void flash_attn_ext_q4p(
     }
 
     // ---- reduce the NPG partial outputs and the partial denominators ----
-    if (dg == 0) {
+    if (tid < R) {
+        red_s[0][tid] = l_row;
 #pragma unroll
-        for (int r = 0; r < RQ; ++r) {
-            red_s[pg][vgrp*RQ + r] = l[r];
+        for (int w = 1; w < NPG; ++w) {
+            red_s[w][tid] = 0.0f;
         }
     }
     float * O_s = Q_s;

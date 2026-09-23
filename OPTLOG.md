@@ -7618,3 +7618,44 @@ measured). **Lesson: time attention changes in the server, or at least at the se
 The op test flatters anything that trades latency for instructions. It also says the next thing
 to try for R=30 is more loads in flight, not fewer instructions. Patch kept at
 /mnt/fast/p100-scratch/q4p-split5.patch.
+
+## Attempt 191 — q4p: hide its memory latency (softmax denominator out of the PV loop, V and K loaded ahead): kept
+
+Attempt 190 showed the 5-token kernel runs at the same speed at 1189 and 1328 MHz, so it waits
+on memory rather than issue. At 233-255 registers there is one 256-thread block per SM, which is
+too few warps to cover an L2 round trip. Three changes:
+
+1. The softmax denominator `l`. Every thread held `l[RQ]` (30 registers at 5 tokens), and the
+   `dg == 0` lanes added P into it inside the PV loop. That made 4 of 8 warps diverge through
+   30 extra FADDs per position. Now thread `tid < R` sums its row of P_s once per chunk and
+   holds one register. That frees 18-30 registers and removes the divergence.
+2. PV loads V words one position ahead, into the freed registers.
+3. The next chunk's K words (NW*PT registers) are loaded before this chunk's PV phase and consumed
+   at the next chunk's start. That is skipped at R=24, which is at 251 registers either way.
+
+Both accumulations stay fp32. Only the order of the `l` sum changes (sequential per chunk).
+FLASH_ATTN_EXT 4019/4019 on both GPUs, and 37/37 at the serving shape.
+
+us per call, test-backend-ops (1328 MHz), attempt 181 -> now:
+
+    kv 262144   1 tok 1001 -> 889    2: 1505 -> 1365   3: 2199 -> 1917   4: 2830 -> 2505   5: 4193 -> 3950
+    kv 131072   1: 512 -> 476   2: 770 -> 709   3: 1116 -> 1001   4: 1383 -> 1266   5: 2150 -> 1992
+    kv 32768    1: 149 -> 140   2: 225 -> 208   3: 317 -> 287     4: 399 -> 366     5: 577 -> 542
+    kv 2048     1: 36.3 -> 38.3 (+2 us)  2: 57.5 -> 57.9  3: 75.6 -> 72.9  4: 60.9 -> 58.5  5: 85.7 -> 84.1
+
+In the server (GGML_CUDA_OP_PROFILE, 260k, ~1189 MHz): 5 tokens 4.165 -> 3.906 ms, 4 tokens 2.71
+-> 2.48, 1 token 1.071 -> 1.016.
+
+End to end the first A/B (head, new, head, new) was confounded by drift. The last run was the
+slowest at every depth, 2k included, where attention is too small to matter. Rerun ABBA (head,
+new, new, head) at 128k and 260k, 256 tokens, two prompts (ms/cycle):
+
+    128k  q0  head 113.8 115.4  new 113.4 115.6     q1  head 109.0 112.2  new 107.6 108.1   -1.3%
+    260k  q0  head 148.3 150.7  new 146.2 147.3     q1  head 150.3 154.1  new 145.4 147.4   -2.8%
+
+At 260k every new run beats every head run. **Method note:** a run-to-run drift of several
+percent across ~40 minutes of continuous load is real (GPU1 reached 79 C). Order A/B pairs as
+ABBA, not ABAB.
+
+Also an operational note: `pkill -f` with a pattern that appears in the calling shell's own
+command line kills that shell. Kill by PID only.
