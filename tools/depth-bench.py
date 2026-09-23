@@ -104,6 +104,7 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--n-max", default="", help="comma list of per-request speculative.n_max values (restore mode)")
     ap.add_argument("--server-n-max", type=int, default=0, help="override --spec-draft-n-max on the server")
+    ap.add_argument("--seeds", type=int, default=1, help="restore mode: repeat each question with this many seeds")
     ap.add_argument("--graphs", default="0", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 0)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--fill", metavar="DIR")
@@ -160,18 +161,18 @@ def main():
             for ent in manifest:
                 if want and not any(abs(ent["n_tokens"] - d) < 4096 for d in want):
                     continue
-                for nm in nmaxs:
-                    for qi, q in enumerate(QUESTIONS):
+                for nm, si, (qi, q) in [(nm, si, qq) for nm in nmaxs for si in range(a.seeds) for qq in enumerate(QUESTIONS)]:
                         post(f"/slots/0?action=restore", {"filename": ent["file"]})
                         full = open(os.path.join(slot_dir, ent["prompt_file"]), encoding="utf-8").read() + q
                         full = render_tail(full, ent)
-                        body = {"prompt": full, "n_predict": a.n_predict, "cache_prompt": True, "seed": 1234 + qi}
+                        body = {"prompt": full, "n_predict": a.n_predict, "cache_prompt": True, "seed": 1234 + qi + 1000 * si}
                         if nm is not None:
                             body["speculative.n_max"] = nm
                         t0 = time.time()
                         r = post("/completion", body)
                         rec = record(a.label + (f" nmax={nm}" if nm is not None else ""), ent["n_tokens"], qi, r, t0, min_free[0])
                         rec["n_max"] = nm
+                        rec["seed"] = body["seed"]
                         out.write(json.dumps(rec) + "\n"); out.flush()
                         print(f"n_max={nm} ", end=""); show(rec)
             return
