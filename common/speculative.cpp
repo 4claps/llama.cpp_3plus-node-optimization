@@ -1365,7 +1365,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // LLAMA_SPEC_PROFILE=1: wall time of each phase, synchronized, printed every 64 draft calls
     bool    prof = getenv("LLAMA_SPEC_PROFILE") != nullptr;
+
     int64_t prof_catchup_us = 0, prof_step_us = 0, prof_n_catchup = 0, prof_n_step = 0, prof_n_draft = 0;
+
+    // LLAMA_SPEC_LOG=<path>: one line per cycle and sequence -- position, draft time, time from the
+    // end of drafting to the accept (the verify plus sampling), accepted count, and the top-1
+    // probability of every drafted token, the one that stopped drafting included. For studying
+    // draft-length policies offline.
+    FILE * spec_log = [] {
+        const char * path = getenv("LLAMA_SPEC_LOG");
+        return path ? fopen(path, "a") : nullptr;
+    }();
+    struct spec_log_rec {
+        llama_pos          pos0 = 0;
+        int64_t            t_begin = 0, t_end = 0;
+        std::vector<float> p;
+    };
+    std::vector<spec_log_rec> spec_log_recs;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1448,6 +1464,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (spec_log) {
+            fclose(spec_log);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1631,6 +1650,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            if (spec_log) {
+                spec_log_recs.resize(n_seq);
+                spec_log_recs[seq_id].pos0    = dp.pos0;
+                spec_log_recs[seq_id].t_begin = ggml_time_us();
+                spec_log_recs[seq_id].p.clear();
+            }
+
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
@@ -1692,6 +1718,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
+
+                if (spec_log) {
+                    spec_log_recs[seq_id].p.push_back(cur_p->data[0].p);
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1768,6 +1798,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+            if (spec_log) {
+                spec_log_recs[seq_id].t_end = ggml_time_us();
+            }
         }
     }
 
@@ -1784,6 +1817,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        if (spec_log && seq_id < (llama_seq_id) spec_log_recs.size() && spec_log_recs[seq_id].t_end > 0) {
+            const auto & r = spec_log_recs[seq_id];
+            fprintf(spec_log, "%d %lld %lld %d", (int) r.pos0, (long long) (r.t_end - r.t_begin),
+                    (long long) (ggml_time_us() - r.t_end), (int) n_accepted);
+            for (const float pv : r.p) {
+                fprintf(spec_log, " %.4f", pv);
+            }
+            fprintf(spec_log, "\n");
+            fflush(spec_log);
+            spec_log_recs[seq_id].t_end = 0;
+        }
     }
 };
 
