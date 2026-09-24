@@ -7927,3 +7927,15 @@ t/s):
 
 5 pads every verify to 6 tokens and loses everywhere. 3 loses 6% at 2k and ties at depth, where
 the draft rule already trims. `qwen-server` keeps 4.
+
+**Tried and dropped: a windowed MTP draft.** A mask-only experiment restricting the draft's single
+attention layer to the last W positions (the target still verifies everything, so output is
+unaffected) to see whether its ~8 ms per cycle of attention over 260k could go. Acceptance
+collapses: tokens per cycle 3.51 (full context) → 2.89 (W 32k) → 2.72 (W 4k). The MTP head uses
+the long context.
+
+**Tried and dropped: an MTP catch-up of only the accepted tokens.** The catch-up was deferred until
+acceptance and run with `llama_set_n_active_tokens(ctx_dft, accepted)`. It is deterministic but not
+byte-identical to the full catch-up, because the 2-4 column matvec and q4p variants round
+differently from the 5-wide ones, so a draft occasionally changes. It also saved nothing
+measurable: 260k ms/cycle 132.9 / 127.0 / 130.6 / 122.8 against 132.5 / 128.0 / 130.2 / 123.1.
