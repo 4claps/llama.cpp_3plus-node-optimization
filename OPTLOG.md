@@ -7939,3 +7939,26 @@ acceptance and run with `llama_set_n_active_tokens(ctx_dft, accepted)`. It is de
 byte-identical to the full catch-up, because the 2-4 column matvec and q4p variants round
 differently from the 5-wide ones, so a draft occasionally changes. It also saved nothing
 measurable: 260k ms/cycle 132.9 / 127.0 / 130.6 / 122.8 against 132.5 / 128.0 / 130.2 / 123.1.
+
+## Attempt 200 — where the 2026-09-23 goal (55 t/s at 2k, 31 at 260k) ended
+
+The goal was real-world MTP decode of 55 t/s at 2k and 31 t/s at 260k, with math byte-identical or
+rounding less. depth-bench restore mode, 2 questions x 2 seeds, ABBA, 8 requests per arm and depth.
+The current build (d3a650552, released) against the release this goal started from (4a991193e):
+
+    depth    4a991193e           d3a650552            t/s
+      2k     40.33 (80.6 ms)     41.77 (77.8 ms)      +4%
+     64k     29.39 (104.6)       34.89 (84.6)         +19%
+    128k     28.36 (122.4)       32.06 (100.1)        +13%
+    260k     20.54 (164.0)       24.72 (141.9)        +20%
+
+The targets were not reached. On this workload a cycle carries ~3.25 tokens at 2k and ~3.5 at 260k,
+so 55 and 31 t/s need ~59 and ~113 ms cycles. The GPU work alone is ~68 ms at 2k (a 60 ms verify,
+~48 ms of it the 5-column q6_K matvec at its exact-arithmetic floor) and ~120 ms at 260k (5-token
+attention over the cache at ~45% of fp32 FMA peak, which the q4p sweeps could not move). The
+levers left are all small: chaining the draft steps on the device (~5%, blocked by the logits being
+vocabulary-split under -sm tensor), draft-only CUDA graphs, and small-op fusion.
+
+Tried this goal and not kept: speculative sampling (196), the fp64-integer matvec (197, parity),
+a cost-aware draft rule, n_max 3 and 5, a windowed draft, and an accepted-only catch-up.
+Kept: the fixed-width verify with a depth-scheduled draft length (198) and the KQ-mask fast path (199).
