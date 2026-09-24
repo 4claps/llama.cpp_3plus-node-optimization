@@ -90,6 +90,12 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Fixed-width speculative verify: the next decodes' ubatches (2..8 tokens) have only their first
+// n tokens real, the rest padding the caller rolls back. Backends that support it then run the
+// costly ops on the real tokens only, with the results a graph of width n would give, while the
+// graph keeps one shape and is reused. 0 turns it off.
+LLAMA_API void llama_set_n_active_tokens(struct llama_context * ctx, int32_t n);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

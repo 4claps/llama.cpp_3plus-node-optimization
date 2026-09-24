@@ -1366,6 +1366,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // LLAMA_SPEC_PROFILE=1: wall time of each phase, synchronized, printed every 64 draft calls
     bool    prof = getenv("LLAMA_SPEC_PROFILE") != nullptr;
 
+    // Also stop drafting once the product of the drafted tokens' top-1 probabilities would fall
+    // below a threshold. The draft is well calibrated (OPTLOG 192), so this trims the verify to the
+    // tokens likely to be accepted. It pays only deep in the context, where every extra verify token
+    // costs a full pass of attention over the KV cache; at short context a wider verify is nearly
+    // free and a shorter draft only loses tokens (OPTLOG 198). So the threshold follows the depth:
+    // 0 below 16k, rising to 0.3 at 48k and beyond. Without a fixed-width verify every change of
+    // draft length rebuilds the target graph (~26 ms), so the server enables this together with its
+    // padded verify (LLAMA_SPEC_PAD). LLAMA_SPEC_P_CUM=<p> fixes the threshold instead.
+    float p_cum_env = [] {
+        const char * s = getenv("LLAMA_SPEC_P_CUM");
+        return s ? (float) atof(s) : -1.0f;
+    }();
+    std::vector<float> p_cum;
+
+    float p_cum_min(const llama_pos pos) const {
+        if (p_cum_env >= 0.0f) {
+            return p_cum_env;
+        }
+        if (!params.pad_verify) {
+            return 0.0f;
+        }
+        const float t = std::clamp((float) (pos - 16384) / (float) (49152 - 16384), 0.0f, 1.0f);
+        return 0.3f*t;
+    }
+
+
     int64_t prof_catchup_us = 0, prof_step_us = 0, prof_n_catchup = 0, prof_n_step = 0, prof_n_draft = 0;
 
     // LLAMA_SPEC_LOG=<path>: one line per cycle and sequence -- position, draft time, time from the
@@ -1649,6 +1675,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            p_cum.resize(n_seq);
+            p_cum[seq_id] = 1.0f;
 
             if (spec_log) {
                 spec_log_recs.resize(n_seq);
@@ -1724,12 +1752,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                const float pc_next = p_cum[seq_id]*cur_p->data[0].p;
+                const bool  stop    = cur_p->data[0].p < params.p_min || pc_next < p_cum_min(dparams.at(seq_id).pos0);
+                if (stop) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
                 }
+                p_cum[seq_id] = pc_next;
 
                 common_sampler_accept(smpl, id, true);
 

@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "active-tokens.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -1722,8 +1723,12 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+    // a fixed-width verify graph may have only the first columns real (active-tokens.cuh)
+    const int64_t ne11a = ids ? ne11 : ggml_cuda_active_cols(ne11);
+    const int64_t ne1a  = ids ? ne1  : (ne11a < ne11 ? ne11a : ne1);
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    const size_t  q8_1_bytes  = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const size_t  q8_1_bytes  = ne13*ne12 * ne11a*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
     // Reuse the quantized activation when consecutive matmuls share it. In a transformer block
     // q/k/v read one normed input and gate/up read another, so this removes roughly two fifths
@@ -1756,7 +1761,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, (char *) ctx.mmvq_q8_1_ptr[dev], src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, (char *) ctx.mmvq_q8_1_ptr[dev], src0->type, ne10, s11, s12, s13, ne10_padded, ne11a, ne12, ne13, stream);
 
         ctx.mmvq_q8_1_src1[dev] = src1;
         ctx.mmvq_q8_1_data[dev] = src1_d;
@@ -1774,11 +1779,11 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const int64_t s12 = ne11*s11;
+    const int64_t s12 = ne11a*s11;
     const int64_t s13 = ne12*s12;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
-    const int64_t ncols_dst          = ids ? ne2  : ne1;
+    const int64_t ncols_dst          = ids ? ne2  : ne1a;
     const int64_t nchannels_y        = ids ? ne11 : ne12;
     const int64_t nchannels_dst      = ids ? ne1  : ne2;
     const int64_t stride_col_dst     = ids ? s2   : s1;

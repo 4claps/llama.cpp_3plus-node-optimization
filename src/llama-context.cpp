@@ -1467,7 +1467,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const int64_t tp3 = g_ubatch_prof.on ? ggml_time_us() : 0;
+    // fixed-width verify: declare the real tokens to the backends for this enqueue only
+    static const auto set_active = [] {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        return reg ? (void (*)(int, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_active_tokens") : nullptr;
+    }();
+    const bool active = set_active && cparams.n_active_tokens > 0 && ubatch.n_tokens >= 2 && ubatch.n_tokens <= 8 &&
+        cparams.n_active_tokens < (int32_t) ubatch.n_tokens;
+    if (active) {
+        set_active(cparams.n_active_tokens, (int) ubatch.n_tokens);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (active) {
+        set_active(0, 0);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3992,6 +4005,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+void llama_set_n_active_tokens(llama_context * ctx, int32_t n) {
+    ctx->set_n_active_tokens(n);
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {

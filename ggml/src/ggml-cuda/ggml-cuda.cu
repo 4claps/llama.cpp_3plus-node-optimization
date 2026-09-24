@@ -6041,8 +6041,19 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+int ggml_cuda_active_tokens_n    = 0;
+int ggml_cuda_active_tokens_full = 0;
+
+static void ggml_backend_cuda_set_active_tokens(const int n_active, const int n_full) {
+    ggml_cuda_active_tokens_n    = n_active;
+    ggml_cuda_active_tokens_full = n_full;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_set_active_tokens") == 0) {
+        return (void *)ggml_backend_cuda_set_active_tokens;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

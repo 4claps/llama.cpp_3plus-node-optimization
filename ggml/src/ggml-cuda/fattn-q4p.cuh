@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "active-tokens.cuh"
 
 // Flash attention for pre-Volta GPUs over a q4_0 K/V cache at head size 256, for the few-token
 // batches of decode and speculative verify (one to five tokens, one GQA group of six heads).
@@ -702,6 +703,18 @@ static void ggml_cuda_flash_attn_ext_q4p_case(ggml_backend_cuda_context & ctx, g
 }
 
 static void ggml_cuda_flash_attn_ext_q4p(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // a fixed-width verify graph may have only its first tokens real (active-tokens.cuh): run the
+    // kernel on views of Q and the output that stop there. The mask keeps its rows.
+    const int64_t n_act = ggml_cuda_active_cols(dst->src[0]->ne[1]);
+    ggml_tensor q_act, dst_act;
+    if (n_act < dst->src[0]->ne[1]) {
+        q_act          = *dst->src[0];
+        q_act.ne[1]    = n_act;
+        dst_act        = *dst;
+        dst_act.ne[2]  = n_act;
+        dst_act.src[0] = &q_act;
+        dst = &dst_act;
+    }
     switch (dst->src[0]->ne[1]) {
         case 1: ggml_cuda_flash_attn_ext_q4p_case<1>(ctx, dst); break;
         case 2: ggml_cuda_flash_attn_ext_q4p_case<2>(ctx, dst); break;
