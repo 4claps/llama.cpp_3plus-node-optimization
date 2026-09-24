@@ -7890,3 +7890,40 @@ The two runs of each arm agree within 1-2 t/s. Gates: perplexity 2.6101 (unchang
 3/3. tg256 read 30.21 on warm cards. ABBA against the release build on the same warm cards gave
 parity (28.0 vs 27.7, then 26.9 vs 26.9), and plain decode takes none of the new paths: n=1
 matvecs and attention are untouched, and the mask fast path only makes the fill cheaper.
+
+## Attempt 199 — the KQ-mask fast path, made to actually run (M-RoPE): kept
+
+Attempt 198's single-sequence mask fast path required 1-D positions. Qwen3.5 uses M-RoPE, so every
+ubatch has 2-D positions and the path never ran. That is also why its exactness check passed.
+A 260k profile still showed the mask fill at ~10% of the host thread in two variants: f16 causal
+2-D (the target and the draft) and f32 non-causal 2-D.
+
+Now the fast path covers both. Causal masks keep a cell iff `0 <= pos <= p1`, vectorized. Under
+M-RoPE only cells at the token's own position can differ from the 1-D rule, and those (found in
+the pass that already collects the cells near the batch) are rechecked with the 2-D test.
+Non-causal masks keep every used cell. `LLAMA_KQ_MASK_FAST=0` turns it off.
+
+Exact: with the path on and off, one binary gives byte-identical text at 2k and 260k on every seed.
+One 260k seed differs from an earlier binary's text with the path on *and* off. That is the
+build-to-build variation at 260k (HANDOFF open thread), not this change.
+
+ABBA, 2 questions x 2 seeds per arm, ms per cycle (t/s):
+
+    depth   off              on
+     64k    82.1 (35.23)     80.9 (35.78)    -1.5%
+    128k    99.6 (31.93)     97.4 (32.66)    -2.2%
+    260k   140.4 (24.98)    135.2 (25.94)    -3.7%
+
+A draft step at 260k went from 5.17 to 4.30 ms (its GPU work is ~2.4). After this the mask fill is
+~1.7% of the host thread.
+
+**`--spec-draft-n-max` with the fixed-width verify and depth rule** (ABBA, 2 questions x 2 seeds,
+t/s):
+
+    depth   n_max 3   n_max 4   n_max 5
+      2k     39.3      42.0-42.1   35.3
+     64k     34.4      34.3-35.6   30.5
+    260k     24.9      24.5-24.9   20.5
+
+5 pads every verify to 6 tokens and loses everywhere. 3 loses 6% at 2k and ties at depth, where
+the draft rule already trims. `qwen-server` keeps 4.
