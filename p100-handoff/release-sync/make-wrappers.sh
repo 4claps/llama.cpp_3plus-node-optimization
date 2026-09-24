@@ -79,6 +79,10 @@ MODEL="${QWEN_MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}"
 LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" export LD_LIBRARY_PATH
 : "${GGML_CUDA_P2P:=1}"              ; export GGML_CUDA_P2P
 : "${GGML_CUDA_GRAPHS_PRE_VOLTA:=0}" ; export GGML_CUDA_GRAPHS_PRE_VOLTA
+# Sampled MTP drafts, verified with the speculative-sampling rule (lossless). At the model card's
+# temp 1.0: +15% tokens per cycle at 2k, +8% at 260k (OPTLOG 202).
+: "${LLAMA_SPEC_SAMPLE_TEMP:=1.0}"   ; export LLAMA_SPEC_SAMPLE_TEMP
+: "${LLAMA_SPEC_DRAFT_TOPK:=20}"     ; export LLAMA_SPEC_DRAFT_TOPK
 
 exec "$BUILD/llama-server" \
   -m "$MODEL" \

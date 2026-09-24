@@ -105,6 +105,7 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--n-max", default="", help="comma list of per-request speculative.n_max values (restore mode)")
     ap.add_argument("--server-n-max", type=int, default=0, help="override --spec-draft-n-max on the server")
+    ap.add_argument("--server-p-min", type=float, default=-1, help="override --spec-draft-p-min on the server")
     ap.add_argument("--seeds", type=int, default=1, help="restore mode: repeat each question with this many seeds")
     ap.add_argument("--graphs", default="0", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 0)")
     g = ap.add_mutually_exclusive_group()
@@ -118,10 +119,15 @@ def main():
     args = list(SERVER_ARGS)
     if a.server_n_max:
         args[args.index("--spec-draft-n-max") + 1] = str(a.server_n_max)
+    if a.server_p_min >= 0:
+        args[args.index("--spec-draft-p-min") + 1] = str(a.server_p_min)
     if slot_dir:
         os.makedirs(slot_dir, exist_ok=True)
         args += ["--slot-save-path", slot_dir.rstrip("/") + "/"]
     env = dict(os.environ, LD_LIBRARY_PATH=a.bindir, GGML_CUDA_P2P="1", GGML_CUDA_GRAPHS_PRE_VOLTA=a.graphs)
+    # qwen-server's defaults for the sampled MTP draft (OPTLOG 202); the environment overrides them
+    env.setdefault("LLAMA_SPEC_SAMPLE_TEMP", "1.0")
+    env.setdefault("LLAMA_SPEC_DRAFT_TOPK", "20")
     log = open(a.out + ".server.log", "w")
     srv = subprocess.Popen([os.path.join(a.bindir, "llama-server")] + args, env=env,
                            stdout=log, stderr=subprocess.STDOUT)
