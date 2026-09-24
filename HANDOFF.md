@@ -9,13 +9,13 @@ Where the work stands, and what's worth doing next. For the project rules and ga
   merge touched and how it was checked, and §10 for the real-world MTP work since.
 - `tg256` 31.3 t/s (upstream at the fork point: 17.51). Perplexity 2.6101 ± 0.0198 on the gate corpus.
 - Real-world MTP through `llama-server` (`tools/depth-bench.py --restore --seeds 2`, 2 questions
-  x 2 seeds): 41 t/s at 2k, 34 at 64k, 31 at 128k, 24 at 260k (ms per cycle ~79 / 87 / 105 / 144).
+  x 2 seeds): 42 t/s at 2k, 35 at 64k, 32 at 128k, 25-26 at 260k (ms per cycle ~77 / 81 / 97 / 135).
   A single request swings by ±15% with how much of the text the draft predicts, so use several
   seeds, ABBA order, and compare tokens and ms per cycle separately. The slot snapshots are in
   `/mnt/fast/p100-scratch/slots`, so a full-context measurement takes minutes, not an hour of prefill.
 - The release bundle at `/mnt/fast/p100-llamacpp-release` is refreshed from this branch.
   `diffs/HEAD-SHA.txt` there is authoritative.
-- ~198 attempts are logged in `OPTLOG.md`. Its CLOSING SUMMARY (line ~1896) is from 2026-09-01 and
+- ~199 attempts are logged in `OPTLOG.md`. Its CLOSING SUMMARY (line ~1896) is from 2026-09-01 and
   predates the long-context work. The later attempts are the current story.
 
 ## Where the MTP cycle goes (nsys, 2026-09-23, fixed-width verify)
@@ -27,8 +27,8 @@ The MTP catch-up is ~1.3 ms, and four draft steps are ~1.8 ms of GPU each. Host 
 ~0.7 between draft steps, and ~1.7 before the next verify. Enqueueing the verify graph itself takes the
 host ~46 ms (~10 us per kernel over ~4600 launches), which the GPU hides at 2k.
 
-At 260k (~145 ms, GPUs 76-78% busy): the verify is ~106 ms at width 5, and a draft step ~5 ms
-of wall time for ~2.4 ms of GPU (attention over the whole cache plus the vocabulary
+At 260k (~135 ms): the verify is ~106 ms at width 5, and a draft step ~4.3 ms of wall time
+(5.2 before the M-RoPE mask fast path) for ~2.4 ms of GPU (attention over the whole cache plus the vocabulary
 projection).
 
 Even with no host gaps at all, the GPU work alone caps real-world MTP at ~47 t/s at 2k and ~29 t/s at
