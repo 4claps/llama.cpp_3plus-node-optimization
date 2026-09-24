@@ -7967,3 +7967,39 @@ Kept: the fixed-width verify with a depth-scheduled draft length (198) and the K
 decode, capped so the verify and prefill graphs stay uncaptured). Byte-identical text. No gain:
 ABBA 2k 77.6 → 78.0 ms/cycle, 260k 137.2 → 141.7. A draft step's KV views move every step, so
 its graphs are re-captured instead of replayed.
+
+## Attempt 201 — the baseline at the model card's sampling, and an fp16 accuracy simulation
+
+**Every MTP figure before 2026-09-24 used the wrong sampling.** `qwen-server` and `depth-bench.py`
+passed `--temp 0.3 --top-k 20`. Qwen3.8-27B's model card (thinking mode) is temp 1.0, top-k 20,
+top-p 0.95, min-p 0; the gguf carries the first three, but not min-p (5b46e14ca). depth-bench now
+also runs the user's real serving shape: `--mmproj` loaded, `-ub 1024`.
+
+Release build d3a650552, restore mode, 2 questions x 3 seeds, 256 tokens:
+
+    depth    t/s (range)          accept   ms/cycle   tok/cycle
+      2k     36.91 (34.3-39.7)    0.456     74.8       2.76
+     64k     34.07 (32.3-35.9)    0.600     79.0       2.69
+    128k     30.01 (27.4-32.2)    0.628     94.5       2.84
+    260k     23.43 (19.6-26.8)    0.647    129.8       3.06
+
+Control, same build and snapshots at temp 0.3: 2k 42.65 t/s (36.9-48.1), 74.4 ms/cycle. The cycle
+is unchanged, so the drop is fewer accepted drafts, not a regression. GPU0 low point 684 MiB free,
+with vision loaded.
+
+**fp16 accuracy, simulated** (`/mnt/fast/p100-scratch/f16-accuracy-sim.c`). A q6_K row of 5120,
+2000 rows, NMSE against a double reference over the same dequantized weights, activations Gaussian
+with 0 / 0.2% / 1% outlier channels at 60x:
+
+    A  today: q8_1 activations, exact integer dot           2.8e-5 / 1.6e-4 / 1.5e-4
+    B  fp16 activations (per-32 power-of-2 prescale),
+       fused fp16 FMA chains of 8 per lane, fp32 fold/16    2.3e-7 / 1.5e-7 / 1.6e-7
+    E  as B, sub-block scale folded into the weight
+       (sc*(q-32) <= 2016, exact in fp16), fold/32           3.8e-7 / 3.5e-7 / 3.2e-7
+    D  naive: whole row accumulated in fp16                 1.0e-4 / 7.7e-5 / 7.5e-5
+
+Today's error is dominated by rounding the activations to 8 bits, not by the arithmetic. fp16
+with short chains folded into fp32 is ~100x closer to the reference. The noise in llama.cpp
+issue #25593 is the D kind, long fp16 accumulation. This is synthetic data. On the real model the
+check is per-op NMSE against the CPU reference, and KLD against an all-fp32 run (not against the
+current build, which isn't the truth).

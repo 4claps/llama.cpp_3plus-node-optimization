@@ -28,10 +28,11 @@ CORPUS = "/mnt/fast/p100-scratch/deep-corpus.txt"
 PORT = 8099
 FLOOR_MIB = 250
 
-# qwen-server's flags, minus --host/--tools/--mcp-servers-config (they never touch the GPU path)
+# the user's serving flags (vision on, -ub 1024), minus --host/--tools/--mcp-servers-config
 SERVER_ARGS = [
     "-m", MODEL, "-ngl", "99", "-sm", "tensor", "-fa", "1", "-ctk", "q4_0", "-ctv", "q4_0",
-    "-c", "262144", "-b", "32768", "-ub", "2048", "-np", "1",
+    "-c", "262144", "-b", "32768", "-ub", "1024", "-np", "1",
+    "--mmproj", "/mnt/fast/models/mmproj-Qwen3.8-27B-Q8_0.gguf",
     "--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--spec-draft-p-min", "0.2",
     "-ngld", "99", "-ubd", "64", "-ctkd", "q4_0", "-ctvd", "q4_0",
     "--jinja", "--temp", "1.0", "--top-k", "20", "--top-p", "0.95", "--min-p", "0.0",
