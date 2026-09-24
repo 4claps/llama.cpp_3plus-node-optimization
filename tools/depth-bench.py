@@ -34,7 +34,7 @@ SERVER_ARGS = [
     "-c", "262144", "-b", "32768", "-ub", "2048", "-np", "1",
     "--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--spec-draft-p-min", "0.2",
     "-ngld", "99", "-ubd", "64", "-ctkd", "q4_0", "-ctvd", "q4_0",
-    "--jinja", "--temp", "0.3", "--top-k", "20",
+    "--jinja", "--temp", "1.0", "--top-k", "20", "--top-p", "0.95", "--min-p", "0.0",
     "--host", "127.0.0.1", "--port", str(PORT),
 ]
 

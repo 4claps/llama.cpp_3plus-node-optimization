@@ -38,7 +38,7 @@ the model.
       --mmproj /mnt/fast/models/mmproj-Qwen3.8-27B-Q8_0.gguf
       -ub 1024                     # instead of 2048
 
-`qwen-server` also passes `--temp 0.3 --top-k 20`.
+`qwen-server` also passes the model card's sampling, `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0`. The gguf carries the first three itself, but not min-p, so without the flag llama.cpp's 0.05 applies. Don't change these: other values make the model loop.
 
 ### What the flags do
 
