@@ -8003,3 +8003,29 @@ with short chains folded into fp32 is ~100x closer to the reference. The noise i
 issue #25593 is the D kind, long fp16 accumulation. This is synthetic data. On the real model the
 check is per-op NMSE against the CPU reference, and KLD against an all-fp32 run (not against the
 current build, which isn't the truth).
+
+## Attempt 202 — speculative sampling for the MTP draft, at the model card's temperature: kept (env-gated)
+
+Attempt 196 lost at temp 0.3, where the target is nearly greedy and a greedy draft already
+matches it. At temp 1.0 the target really samples. A greedy draft is accepted with probability
+p(argmax), while a sampled draft is accepted with sum min(p, q). Ported from
+spec-dist-sampling.patch onto the fixed-width verify:
+- the draft samples from its top candidates at `LLAMA_SPEC_SAMPLE_TEMP` and records q;
+- the server verifies with min(1, p/q) and, on rejection, draws from max(p - q, 0);
+- only the real (unpadded) drafts are verified;
+- checkpoint replays keep the tokens already chosen.
+
+Every token is distributed exactly as the target's sampler chain would draw it. Target logits are
+untouched. Same seeds give byte-identical text run to run. `LLAMA_SPEC_DRAFT_TOPK` (default 10)
+sets the draft's candidate count.
+
+depth-bench restore, model-card sampling, 2 questions x 4 seeds (2k) / x 3 seeds (260k):
+
+    2k    greedy draft (off)            tok/cycle 2.76   36.96 t/s  (6 requests)
+          sampled T=0.7 / 1.0 / 1.4                3.13 / 3.09 / 3.08
+          T=1.0, top-10 vs top-20, ABBA            3.10 vs 3.18
+    260k  off vs T=1.0 top-20                      2.97 vs 3.21  (22.15 vs 23.00 t/s)
+
+**Measurement note:** ms/cycle drifted 75 -> 82 over ~40 minutes of back-to-back runs (GPUs at
+73-77 C), on byte-identical text. For draft-side changes compare tokens per cycle, and interleave
+anything that compares ms.

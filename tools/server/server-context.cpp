@@ -267,6 +267,8 @@ struct server_slot {
     // real (-1: not padded)
     int  spec_n_real = -1;
     std::mt19937 spec_synth_rng;
+    std::mt19937 spec_dist_rng;
+    bool spec_replay_forced = false; // the replayed tokens came from the speculative-sampling rule
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -380,6 +382,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_replay_forced = false;
         spec_n_real = -1;
 
         last_nl_pos    = 0;
@@ -1830,6 +1833,10 @@ private:
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
+
+            if (spec) {
+                slot.spec_dist_rng.seed(common_sampler_get_seed(slot.smpl.get()) ^ 0x9e3779b9u);
+            }
 
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
@@ -3988,7 +3995,26 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 std::vector<llama_token> accepted;
-                if (slot.spec_n_real >= 0 && !slot.spec_is_replay && synth_probs.empty()) {
+                // the speculative-sampling rule, when the draft was sampled (LLAMA_SPEC_SAMPLE_TEMP)
+                const auto & dists = common_speculative_get_draft_params(spec.get(), slot.id).dists;
+                const size_t n_real_draft = slot.spec_n_real >= 0 ? (size_t) slot.spec_n_real : n_draft;
+                const bool use_dist = synth_probs.empty() && !slot.spec_is_replay && !dists.empty() && dists.size() >= n_real_draft;
+                if (slot.spec_is_replay && slot.spec_replay_forced) {
+                    // replaying tokens the speculative-sampling rule already chose: keep them and
+                    // sample only the position after them
+                    for (size_t i = 0; i < n_draft; ++i) {
+                        common_sampler_accept(slot.smpl.get(), slot.spec_draft[i], true);
+                        accepted.push_back(slot.spec_draft[i]);
+                    }
+                    const llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch[n_draft]);
+                    common_sampler_accept(slot.smpl.get(), id, true);
+                    accepted.push_back(id);
+                } else if (use_dist) {
+                    const llama_tokens         draft_real(slot.spec_draft.begin(), slot.spec_draft.begin() + n_real_draft);
+                    const std::vector<int32_t> idxs_real(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + n_real_draft + 1);
+                    accepted = common_sampler_sample_and_accept_n_dist(slot.smpl.get(), slot.ctx_tgt, std::vector<int>(idxs_real.begin(), idxs_real.end()),
+                            draft_real, dists, slot.spec_dist_rng);
+                } else if (slot.spec_n_real >= 0 && !slot.spec_is_replay && synth_probs.empty()) {
                     // padded verify: only the first spec_n_real drafts (and their outputs) are real
                     const int nr = slot.spec_n_real;
                     const llama_tokens         draft_real(slot.spec_draft.begin(), slot.spec_draft.begin() + nr);
@@ -4002,6 +4028,7 @@ private:
                                 synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 }
                 slot.spec_n_real = -1;
+                slot.spec_replay_forced = false;
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4021,6 +4048,7 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.spec_replay_forced = use_dist;
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;

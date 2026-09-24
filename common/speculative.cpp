@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <random>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1366,6 +1367,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // LLAMA_SPEC_PROFILE=1: wall time of each phase, synchronized, printed every 64 draft calls
     bool    prof = getenv("LLAMA_SPEC_PROFILE") != nullptr;
 
+    // LLAMA_SPEC_SAMPLE_TEMP=T > 0: sample each draft token from the draft's top candidates at
+    // temperature T instead of taking the argmax, and record the distribution in dp.dists so the
+    // target verifies with the speculative-sampling rule. The stop rule is unchanged.
+    float        sample_temp = [] {
+        const char * s = getenv("LLAMA_SPEC_SAMPLE_TEMP");
+        return s ? (float) atof(s) : 0.0f;
+    }();
+    std::mt19937 sample_rng{0x5eed};
+
     // Also stop drafting once the product of the drafted tokens' top-1 probabilities would fall
     // below a threshold. The draft is well calibrated (OPTLOG 192), so this trims the verify to the
     // tokens likely to be accepted. It pays only deep in the context, where every extra verify token
@@ -1442,7 +1452,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            // LLAMA_SPEC_DRAFT_TOPK: candidates the draft keeps (default 10)
+            sparams.top_k    = getenv("LLAMA_SPEC_DRAFT_TOPK") ? atoi(getenv("LLAMA_SPEC_DRAFT_TOPK")) : 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -1675,6 +1686,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            dp.dists.clear();
             p_cum.resize(n_seq);
             p_cum[seq_id] = 1.0f;
 
@@ -1745,7 +1757,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
 
                 if (spec_log) {
                     spec_log_recs[seq_id].p.push_back(cur_p->data[0].p);
@@ -1762,9 +1774,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 p_cum[seq_id] = pc_next;
 
-                common_sampler_accept(smpl, id, true);
-
                 auto & dp = dparams.at(seq_id);
+
+                if (sample_temp > 0.0f) {
+                    // cur_p is sorted by p, i.e. by logit
+                    std::vector<llama_token_data> q(cur_p->data, cur_p->data + cur_p->size);
+                    const float l0 = q[0].logit;
+                    double sum = 0.0;
+                    for (auto & c : q) {
+                        c.p = expf((c.logit - l0) / sample_temp);
+                        sum += c.p;
+                    }
+                    for (auto & c : q) {
+                        c.p = (float) (c.p / sum);
+                    }
+                    const double u = std::uniform_real_distribution<double>(0.0, 1.0)(sample_rng);
+                    double acc = 0.0;
+                    size_t k = 0;
+                    for (; k + 1 < q.size(); ++k) {
+                        acc += q[k].p;
+                        if (u < acc) {
+                            break;
+                        }
+                    }
+                    id = q[k].id;
+                    dp.dists.push_back(std::move(q));
+                }
+
+                common_sampler_accept(smpl, id, true);
                 auto & result = *dp.result;
 
                 result.push_back(id);
