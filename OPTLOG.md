@@ -7962,3 +7962,8 @@ vocabulary-split under -sm tensor), draft-only CUDA graphs, and small-op fusion.
 Tried this goal and not kept: speculative sampling (196), the fp64-integer matvec (197, parity),
 a cost-aware draft rule, n_max 3 and 5, a windowed draft, and an accepted-only catch-up.
 Kept: the fixed-width verify with a depth-scheduled draft length (198) and the KQ-mask fast path (199).
+
+**Tried and dropped: CUDA graphs for single-token graphs only** (the MTP draft steps and plain
+decode, capped so the verify and prefill graphs stay uncaptured). Byte-identical text. No gain:
+ABBA 2k 77.6 → 78.0 ms/cycle, 260k 137.2 → 141.7. A draft step's KV views move every step, so
+its graphs are re-captured instead of replayed.
