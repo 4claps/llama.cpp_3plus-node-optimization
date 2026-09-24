@@ -1631,22 +1631,30 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
             }
 
-            // one sequence, plain causal mask: a cell is kept iff it is used and not in the future.
-            // Vectorizable, and it reads 4 bytes per cell instead of the 32-byte sequence set, which
-            // at 262144 cells takes the first row of a mask from ~1.5 ms to a fraction of that.
-            if constexpr (causal && !swa && !is_2d && !alibi) {
-                if (!prev && args.single_seq) {
+            // one sequence, no SWA or ALiBi: a cell is kept iff it is used and, for a causal mask, not
+            // in the future. Vectorizable, and it reads 4 bytes per cell instead of the 32-byte
+            // sequence set, which at 262144 cells takes the first row of a mask from ~1.5 ms to a
+            // fraction of that. With M-RoPE only the cells at the token's own position can differ
+            // from the 1-D rule; they are rechecked with the 2-D test below.
+            if constexpr (!swa && !alibi) {
+                static const bool fast = [] { const char * e = getenv("LLAMA_KQ_MASK_FAST"); return !e || atoi(e) != 0; }();
+                if (fast && !prev && args.single_seq) {
                     const llama_pos * cpos = cells.pos_data();
                     T * row = data + idst;
                     for (int64_t j = 0; j < n_kv; ++j) {
                         const llama_pos c = cpos[j];
-                        row[j] = (c >= 0 && c <= p1) ? mask_keep : mask_drop;
+                        row[j] = (c >= 0 && (!causal || c <= p1)) ? mask_keep : mask_drop;
                     }
                     // the cells the other tokens of this sequence may flip (see below)
                     const llama_pos thr = seq_pos_min[seq_id] - (int32_t) (n_swa + 32);
                     for (int64_t j = 0; j < n_kv; ++j) {
                         if (cpos[j] >= thr && cpos[j] >= 0) {
                             idxs.push_back((uint32_t) j);
+                            if constexpr (causal && is_2d) {
+                                if (cpos[j] == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                                    row[j] = mask_drop;
+                                }
+                            }
                         }
                     }
                     continue;
