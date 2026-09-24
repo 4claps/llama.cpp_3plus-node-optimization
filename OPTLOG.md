@@ -8029,3 +8029,41 @@ depth-bench restore, model-card sampling, 2 questions x 4 seeds (2k) / x 3 seeds
 **Measurement note:** ms/cycle drifted 75 -> 82 over ~40 minutes of back-to-back runs (GPUs at
 73-77 C), on byte-identical text. For draft-side changes compare tokens per cycle, and interleave
 anything that compares ms.
+
+## Attempt 203 — fp16 q6_K verify matvec: correct and ~300x more accurate, but only ~8% faster (parked)
+
+Built in the new harness (`p100-handoff/tools/mmvq-harness`, ~7 s per version). The best
+version, v7, is in `mmvq-harness/f16/`. The scheme:
+- x -> half with a power-of-2 prescale per (column, 1024-value window);
+- weight = d*1024*sc*(q-32) in half;
+- a fused fp16 chain of 16 HFMA2 per lane, folded into fp32 once per window;
+- activations read straight from L2, weights staged per warp, no block barriers.
+
+Every per-GPU K is an even number of q6_K blocks, so each block's 2-byte phase is known at
+compile time.
+
+NMSE against a double reference on real weights: 4e-7, against 1.3e-4 for today's q8_1 path.
+
+    shape       today (test-backend-ops)   v7 (harness)
+    8704x5120   154 us                     141 us
+    5120x8704   156 us                     155 us
+
+Ablations: with no weight or activation loads at all it still takes 125 us, so it is
+issue-bound at ~1.9 instructions per multiply-add (math is 0.5). Converting each weight pair to
+fp16 costs 3 instructions (PRMT, HSUB2, HMUL2), and that cost is shared by only 5 columns. The
+dp4a emulation turned out cheaper per column than estimated. Worth ~2 ms per verify pass. Not
+integrated.
+
+Where a 2k verify pass goes (GGML_CUDA_OP_PROFILE, llama-bench pp5 @ d2048, per GPU): 58.6 ms,
+of which 46.7 ms is q6_K matvecs and ~12 ms small ops (304 ADDs at ~6 us, norms, GET_ROWS,
+CONCAT). Host enqueue of a verify is ~46 ms, so GPU savings below that need launch cuts too.
+
+Also measured and dropped:
+- Draft length / p_min with sampled drafts (2k, ABBA): n_max 4 / p_min 0.2 stays best
+  (43.6 t/s); n_max 3, 5 and p_min 0.05, 0.3, 0.4 all lose.
+- A draft vocabulary cut to the first N token ids: 65536 covers 96% of generated tokens and
+  would save ~3.4 ms per cycle, but the lost drafts cancel it out.
+
+**Next (the 260k lever):** fp16 inside the 5-token q4p attention. Its q4_0 -> half conversion is
+shared by 30 query rows, not 5. The kernel is ~48% of fp32 peak, at 3.9 ms per call x 17 calls
+per cycle. fattn.cu rebuilds in 30 s.
