@@ -7813,8 +7813,80 @@ What the ablations showed:
   weight reads from shared memory with constants saves 35 us, and dropping the two block barriers
   per step saves 10. Making the reads conflict-free (v12) did not recover that 35.
 
-Best is v10, at parity. Without an instruction-level profiler on Pascal I could not find the
-stall. Kept out of the tree; the kernel versions and the hook are in /mnt/fast/p100-scratch
+Best is v10, at parity. v13 made it persistent (one block per SM looping over row groups, with the
+prefetch carried across them): 158 / 96 / 66 us against 152 / 95 / 66, still parity. The pure-ALU
+microbenchmark itself runs at IPC ~1.1 with the fp64 pipe 64% busy. At ~6.4 instructions per
+value-row that puts the compute floor near 110 us, so this design cannot beat the dp4a kernel
+by the margin the 2k goal needs. Kept out of the tree; the kernel versions and the hook are in /mnt/fast/p100-scratch
 (mmvq-q6k-f64.v12.cuh, f64-v10.cuh, f64-v11.cuh, mmvq-f64-hook.patch). What is kept: q6_K eval
 cases with more than 256 rows (the existing m=16 cases never reach the multi-column kernel on
 Pascal) and perf cases at the six per-GPU shapes, n 1..6.
+
+## Attempt 198 — fixed-width verify, and a draft length that follows the depth: kept
+
+**The rebuild cost, measured.** A target graph rebuild on a change of verify width costs 1.8 ms
+to build the graph, 15.2 ms in `ggml_backend_sched_alloc_graph` and 8.8 ms rebuilding the meta
+backend's subgraphs, ~26 ms in all. Draft-context rebuilds are ~0.4 ms. Under a
+cumulative-probability draft rule (stop drafting once the product of drafted top-1 p falls below
+0.6), ~85% of cycles changed width. In the meta backend, the split-state cache is cleared entirely
+on the first stale entry, and the external-view containers rotate two-deep, so a per-width graph
+cache would need real work there.
+
+**Fixed-width verify instead.** The server pads a short draft to n_max (repeating its last token),
+so the verify graph always has one shape and is reused, and it declares the real token count for
+that decode (`llama_set_n_active_tokens`, staging API). The CUDA backend honours it in the two ops
+whose cost scales with the width: the q6_K matvec (`ggml_cuda_mul_mat_vec_q` quantizes and multiplies
+only the first columns) and the q4p flash attention (a view of Q stopping at the real tokens).
+
+This is exact. Each column of a matvec depends only on itself and causal attention only on
+earlier tokens, so the real tokens get exactly what a width-k graph gives them. The padded tokens
+are garbage and are rolled back like rejected drafts, since they sit in the draft for bookkeeping
+while acceptance only looks at the real ones. Check: with the draft rule off (drafts cut only by
+p_min), the padded and unpadded servers give byte-identical text at 2k.
+
+**The draft rule: where it pays.** depth-bench restore mode, 2 questions x 2 seeds, 256 tokens,
+padded verify, fixed width (p 0) run first and again last, t/s:
+
+    depth   p 0 (first / last)   p 0.2   p 0.3   p 0.35  p 0.45  p 0.5   p 0.6
+      2k      42.9 / 41.3                42.1            41.7            40.0
+     64k      32.7 / 30.7        33.6            36.0            33.9
+    128k      31.0 / 28.2        30.7            29.8            29.4
+    260k      23.0 / 21.8                25.6            25.5            24.1
+
+At 2k a wider verify is nearly free (verify 39.5 / 46.3 / 53.1 / 63.8 ms for 1..4 drafted), and a
+shorter draft only loses tokens. At 260k each verify token costs a pass of attention over the whole
+cache (60 / 75 / 91 / 106 ms), so trimming pays: +10-14% at 0.3. So the threshold follows the
+depth: 0 below 16k, rising to 0.3 at 48k and beyond. The run-to-run spread (first against last
+fixed run) is 5-9%, so 64k and 128k are only roughly placed.
+
+Tried and dropped: a cost-aware rule, keeping the next token only if expected tokens per ms rise,
+with verify time by width learned online. Without exploration it collapsed to one-token drafts.
+With a full draft every 8th cycle it gave -4% at 2k and +7% at 260k, below the plain threshold.
+
+**What the rest of a 260k cycle is** (nsys, 2x P100, padded verify): the GPUs are only 76-78% busy.
+The gaps are host work between dependent graphs: ~5.8 ms after the verify (sampling, bookkeeping,
+the MTP catch-up enqueue), ~2-3.5 ms before each of the 4 draft steps, and ~4.5 ms before the
+verify. A draft step is ~2.4 ms of GPU work but ~5 ms of wall time at 260k (~2.45 ms at 2k).
+
+- Mask filling was ~7 ms per cycle at 260k: the first row of each graph's mask is a per-cell
+  pass reading a 32-byte sequence bitset per cell. A single-sequence fast path (one sequence, plain
+  causal mask) reads only the 4-byte position and vectorizes. Exact: 8 of 8 texts at 2k and 260k
+  are byte-identical to before.
+- Draft steps chained on the device (token and hidden state copied device-side from one step to
+  the next, one sync at the end) would remove most of the remaining gap, ~4 ms per cycle at 2k
+  and ~10 at 260k. Not done: under -sm tensor the logits and candidates are split across the GPUs.
+
+**Validation of the kept defaults** (padded verify + depth schedule) against LLAMA_SPEC_PAD=0
+(which also disables the draft rule), ABBA with 2 questions x 2 seeds per arm, 8 requests per
+arm and depth. t/s, then tokens per cycle and ms per cycle:
+
+    depth    before                 after                  t/s
+      2k     40.54  3.25   80.2     41.05  3.25   79.2     +1% (noise)
+     64k     30.03  3.08  102.4     34.01  2.95   86.8     +13%
+    128k     28.68  3.47  121.0     30.64  3.21  104.8     +7%
+    260k     20.93  3.37  160.9     24.29  3.51  144.4     +16%
+
+The two runs of each arm agree within 1-2 t/s. Gates: perplexity 2.6101 (unchanged), FA eval
+3/3. tg256 read 30.21 on warm cards. ABBA against the release build on the same warm cards gave
+parity (28.0 vs 27.7, then 26.9 vs 26.9), and plain decode takes none of the new paths: n=1
+matvecs and attention are untouched, and the mask fast path only makes the fill cheaper.
