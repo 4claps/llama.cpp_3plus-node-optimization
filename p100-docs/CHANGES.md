@@ -165,6 +165,8 @@ including what was reverted.
 | `2bc1a9ac0` | **q4p hides its memory latency.** The softmax denominator leaves the PV loop (4 of 8 warps were adding into it, divergent, at every position), and the freed registers load V one position ahead and the next chunk's K during PV | at one block per SM it waited on memory. In the server at 260k: 5 tokens 4.165 → 3.906 ms, 1 token 1.071 → 1.016. MTP cycle −2.8% at 260k |
 | `a8b274ea6` | **tensor-parallel graph rebuilds in ~20 ms instead of ~45.** The meta backend's split-state cache and tensor map are hashed, looked up once, and their scratch pooled; `GGML_BACKEND_META_MAX_DEVICES` 16 → 4 shrinks the split state it copies thousands of times per rebuild | the target graph rebuilds whenever the batch shape changes: a new prompt, a KV size step, a different verify width. Byte-identical output |
 | `f9152a548` | slot save/restore also saves the MTP draft context | a restored slot drafts at full acceptance |
+| `8736a7ef3` | **fixed-width verify, and a draft length that follows the depth.** The server pads a short draft to `n_max`, so the verify graph keeps one shape and is never rebuilt, and declares the real token count per decode (`llama_set_n_active_tokens`). The q6_K matvec and the q4p attention then compute only the real tokens, exactly what a narrower graph gives them. With width changes free, the MTP draft also stops once the product of its top-1 probabilities falls below 0.3 from 48k context on (0 below 16k, a ramp between) | ABBA, 8 requests per arm: 2k 40.5 → 41.1, 64k 30.0 → 34.0, 128k 28.7 → 30.6, **260k 20.9 → 24.3 t/s (+16%)**. Byte-identical text when draft lengths do not vary. `LLAMA_SPEC_PAD=0` turns it off, `LLAMA_SPEC_P_CUM=<p>` fixes the threshold |
+| `1f6a8681a` | single-sequence fast path for the first row of the KQ mask: read only the 4-byte cell position, vectorized, instead of each cell's 32-byte sequence set | ~1.5 ms per graph at 262144 cells, six graphs per cycle. Byte-identical output |
 | `34a9545a5`, `fe9b48d87`, `8ea46770a` | `GGML_CUDA_OP_PROFILE=1`, `LLAMA_UBATCH_PROFILE=1`, `LLAMA_SPEC_PROFILE=1`, `LLAMA_SPEC_LOG=<path>`, and `tools/pmp` | per-op GPU times, host phases per ubatch, MTP step times, a per-cycle draft log, and a sampling CPU profiler for when `perf` is locked. All off by default |
 
 **Why the MTP cycle costs what it does.** An nsys trace at 2k context shows ~64 ms of GPU work in
@@ -175,14 +177,18 @@ input uploads. Deeper in, attention takes over. At 260k about half of each cycle
 
 **Draft length.** The draft model's top-1 probability is well calibrated here: a drafted token
 with p 0.5-0.6 is accepted 54% of the time, 0.9-1.0 95%. A rule that stops drafting once the
-product of those probabilities falls under 0.6 simulates at 11-22% faster. In practice it loses,
-because a verify of a new width rebuilds the 64-layer graph, even at the new ~20 ms. It would pay
-with one cached graph per verify width (HANDOFF, open threads).
+product of those probabilities falls under a threshold only pays where a verify token is
+expensive. At 2k a verify of 2/3/4/5 tokens costs 46/53/58/64 ms, so a shorter draft loses more
+tokens than it saves time. At 260k it costs 75/91/106/~120 ms and the rule gains 10-16%.
+Without the fixed-width verify each change of width rebuilt the 64-layer graph (~26 ms:
+1.8 ms graph build, 15 ms scheduler allocation, 9 ms meta subgraphs), which ate the gain. A
+cost-aware rule that learned the verify times online did worse than the plain threshold
+(OPTLOG 198).
 
-**`--spec-draft-n-max`.** Drafting almost never stops early at `--spec-draft-p-min 0.2`, so every
-verify is `n_max + 1` tokens wide. A wider verify costs little at short context and a lot at
-depth: n_max 3 against 4 is −3% t/s at 2k, −8% at 64k, and **+17% at 260k** (24.1 against 20.6
-t/s). `qwen-server` keeps 4. For work that lives past ~150k context, 3 is faster.
+**`--spec-draft-n-max`.** Before the depth-scheduled draft length, drafting almost never stopped
+early at `--spec-draft-p-min 0.2`, so every verify was `n_max + 1` tokens wide, and n_max 3 was
++17% at 260k (24.1 against 20.6 t/s) but −3% at 2k. The draft rule now shortens drafts at depth
+by itself, so `qwen-server` keeps 4.
 
 ## Known gaps
 

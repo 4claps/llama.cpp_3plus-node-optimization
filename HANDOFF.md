@@ -8,26 +8,31 @@ Where the work stands, and what's worth doing next. For the project rules and ga
 - Branch `p100-optimizations`, merged with upstream `f46bc30cb`. See CHANGES §9 for what the
   merge touched and how it was checked, and §10 for the real-world MTP work since.
 - `tg256` 31.3 t/s (upstream at the fork point: 17.51). Perplexity 2.6101 ± 0.0198 on the gate corpus.
-- Real-world MTP, ms per cycle through `llama-server` (`tools/depth-bench.py --restore`): ~73 at
-  2k, ~87 at 64k, ~110 at 128k, ~143 at 260k. That is 38-50 t/s at 2k and 24-27 t/s at 260k,
-  depending on how much of the text the draft predicts. The slot snapshots it restores are in
+- Real-world MTP through `llama-server` (`tools/depth-bench.py --restore --seeds 2`, 2 questions
+  x 2 seeds): 41 t/s at 2k, 34 at 64k, 31 at 128k, 24 at 260k (ms per cycle ~79 / 87 / 105 / 144).
+  A single request swings by ±15% with how much of the text the draft predicts, so use several
+  seeds, ABBA order, and compare tokens and ms per cycle separately. The slot snapshots are in
   `/mnt/fast/p100-scratch/slots`, so a full-context measurement takes minutes, not an hour of prefill.
 - The release bundle at `/mnt/fast/p100-llamacpp-release` is refreshed from this branch.
   `diffs/HEAD-SHA.txt` there is authoritative.
-- ~190 attempts are logged in `OPTLOG.md`. Its CLOSING SUMMARY (line ~1896) is from 2026-09-01 and
+- ~198 attempts are logged in `OPTLOG.md`. Its CLOSING SUMMARY (line ~1896) is from 2026-09-01 and
   predates the long-context work. The later attempts are the current story.
 
-## Where the MTP cycle goes (nsys, 2k context, n_max 4)
+## Where the MTP cycle goes (nsys, 2026-09-23, fixed-width verify)
 
-~64 ms of GPU work in a ~72 ms cycle. The 5-token verify is 56.8 ms of GPU time, nearly all of it
-the 5-column q6_K matvec, which is at its floor for exact arithmetic (OPTLOG 179, 187). The draft
-steps and catch-up are 7.4 ms. The remaining ~8 ms is host time:
+At 2k (~75 ms cycle, GPUs 73% busy): verify ~60 ms of GPU, nearly all of it the 5-column q6_K
+matvec, which is at its floor for exact arithmetic (OPTLOG 179, 187, and the fp64 attempt 197).
+The MTP catch-up is ~1.3 ms, and four draft steps are ~1.8 ms of GPU each. Host gaps come to ~12 ms:
+~4.5 after the verify (sampling, bookkeeping, the catch-up enqueue), ~2.8 after the catch-up,
+~0.7 between draft steps, and ~1.7 before the next verify. Enqueueing the verify graph itself takes the
+host ~46 ms (~10 us per kernel over ~4600 launches), which the GPU hides at 2k.
 
-- a ~200 µs skew at the start of every graph, because one host thread enqueues GPU0's subgraph
-  before GPU1's and GPU0 then waits for GPU1 at the first all-reduce;
-- the draft context rebuilding its graph twice per cycle (catch-up is 5 tokens, a draft step 1),
-  now under 1 ms each;
-- ~9 input uploads per decode, each syncing both GPUs, because the meta backend has no events.
+At 260k (~145 ms, GPUs 76-78% busy): the verify is ~106 ms at width 5, and a draft step ~5 ms
+of wall time for ~2.4 ms of GPU (attention over the whole cache plus the vocabulary
+projection).
+
+Even with no host gaps at all, the GPU work alone caps real-world MTP at ~47 t/s at 2k and ~29 t/s at
+260k on this workload (~3.3 tokens per cycle).
 
 nsys works on Pascal (2022.4). If the importer fails, run
 `/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter -i X.qdstrm` and then
@@ -36,17 +41,18 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
 
 ## Open threads
 
-1. **Per-GPU enqueue threads in `ggml-backend-meta.cpp`.** This would fix the skew above, and it
-   would double the enqueue rate, which matters in the draft steps. It needs host-side ordering
+1. **Per-GPU enqueue threads in `ggml-backend-meta.cpp`.** One host thread enqueues GPU0's subgraph
+   before GPU1's, so GPU0 waits ~200 us for GPU1 at the first all-reduce of every graph. Two
+   threads would fix that and double the enqueue rate, which matters in the draft steps. It needs host-side ordering
    between the two threads at every all-reduce (the peer copy's event must be recorded before
    the other side's stream waits on it). Worth maybe 2-4% at short context.
-2. **One cached graph per batch shape.** The scheduler and the meta backend each keep only the
-   last graph, so any shape change rebuilds it: ~20 ms for the target (a8b274ea6 got it there
-   from ~45), under 1 ms for the draft context, which rebuilds twice per cycle. With a graph
-   per verify width, a confidence-based draft length (OPTLOG 192, `LLAMA_SPEC_LOG` has the
-   data) simulates at −11% ms/token at 2k, −15% at 64k and −22% at 260k. That needs one
-   scheduler (small compute buffers) per width, plus a per-uid subgraph cache in the meta
-   backend. Its external-view containers rotate two-deep today, which is the tricky part.
+2. **Chain the MTP draft steps on the device.** Each step waits on the host for the previous
+   step's token and hidden state. Feeding them device-side (the top-1 candidate and `h_nextn`
+   into the next step's inputs), with one read-back at the end, would save ~4 ms per cycle at 2k
+   and ~10 at 260k. The meta backend has no `cpy_tensor_async`, and the logits are
+   vocabulary-split across the GPUs, which is the tricky part. The per-width graph cache this
+   thread used to describe is no longer needed: the fixed-width verify (8736a7ef3) removed the
+   rebuilds another way.
 3. **A possible timing-dependent result in an earlier binary.** One build gave three different
    260k texts across normal and profiled runs. The current build agrees with itself, async and
    under `CUDA_LAUNCH_BLOCKING=1`, on every case tried. See OPTLOG 192. A repeat-until-diverge
