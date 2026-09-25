@@ -918,6 +918,7 @@ private:
 
     common_speculative_init_result_ptr spec_init;
     bool spec_pad = false; // verify at a fixed width, padding short drafts
+    bool spec_reads_prompt = true; // a draft type reads the prompt tokens when drafting
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1295,6 +1296,7 @@ private:
             params_base.speculative.draft.pad_verify = spec_pad;
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                spec_reads_prompt = !spec || common_speculative_draft_reads_prompt(spec.get());
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
@@ -3092,7 +3094,11 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // a copy of the whole prompt (260k tokens at full context) that only some draft
+                        // types read; the MTP draft does not
+                        if (spec_reads_prompt) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,

@@ -2915,6 +2915,15 @@ void common_speculative_free(common_speculative * spec) {
     delete spec;
 }
 
+bool common_speculative_draft_reads_prompt(const common_speculative * spec) {
+    for (const auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            return true;
+        }
+    }
+    return false;
+}
+
 common_speculative_draft_params & common_speculative_get_draft_params(
         common_speculative * spec,
         llama_seq_id seq_id) {

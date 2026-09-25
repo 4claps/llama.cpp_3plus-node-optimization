@@ -77,6 +77,10 @@ struct common_speculative_draft_params {
     std::vector<std::vector<llama_token_data>> dists = {};
 };
 
+// whether any configured draft type reads common_speculative_draft_params::prompt when drafting (the
+// MTP draft does not); a caller can skip rebuilding it every cycle otherwise
+bool common_speculative_draft_reads_prompt(const common_speculative * spec);
+
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
 // optionally call once at the beginning of a new generation

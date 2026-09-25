@@ -8174,3 +8174,11 @@ ABBA, 2 questions x 2 seeds, text byte-identical in every arm at both depths:
 
     2k    69.9 -> 69.2 ms/cycle (43.23 -> 43.67 t/s)
     260k 116.9 -> 112.9 ms/cycle (26.92 -> 27.82 t/s)   (hot cards, 75-77 C)
+
+## Attempt 208 — skip the per-cycle prompt copy when no draft type reads it: kept
+
+Before every draft the server rebuilt `slot.spec_prompt = prompt.tokens.get_text_tokens()`, a copy
+of the whole prompt (260k tokens at full context). Only the n-gram draft types read it; MTP does
+not. The copy is now skipped when every configured type is MTP (`common_speculative_draft_reads_prompt`).
+Host timeline at 260k (LLAMA_TL): accept -> draft start 1.06 -> 0.55 ms. The catch-up enqueue, after
+attempt 207, is 2.34 -> 1.11 ms.
