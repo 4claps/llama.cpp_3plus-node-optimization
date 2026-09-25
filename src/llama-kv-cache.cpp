@@ -1641,18 +1641,27 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (fast && !prev && args.single_seq) {
                     const llama_pos * cpos = cells.pos_data();
                     T * row = data + idst;
-                    for (int64_t j = 0; j < n_kv; ++j) {
-                        const llama_pos c = cpos[j];
-                        row[j] = (c >= 0 && (!causal || c <= p1)) ? mask_keep : mask_drop;
-                    }
-                    // the cells the other tokens of this sequence may flip (see below)
+                    // one pass: the mask row, and a flag per 64 cells for "may hold a cell the other
+                    // tokens of this sequence could flip" (pos >= thr, see below), so the second
+                    // pass only visits those few blocks instead of rereading every position
                     const llama_pos thr = seq_pos_min[seq_id] - (int32_t) (n_swa + 32);
-                    for (int64_t j = 0; j < n_kv; ++j) {
-                        if (cpos[j] >= thr && cpos[j] >= 0) {
-                            idxs.push_back((uint32_t) j);
-                            if constexpr (causal && is_2d) {
-                                if (cpos[j] == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
-                                    row[j] = mask_drop;
+                    for (int64_t j0 = 0; j0 < n_kv; j0 += 64) {
+                        const int64_t j1 = std::min<int64_t>(n_kv, j0 + 64);
+                        llama_pos bm = -1;
+                        for (int64_t j = j0; j < j1; ++j) {
+                            const llama_pos c = cpos[j];
+                            row[j] = (c >= 0 && (!causal || c <= p1)) ? mask_keep : mask_drop;
+                            bm = std::max(bm, c);
+                        }
+                        if (bm >= thr && bm >= 0) {
+                            for (int64_t j = j0; j < j1; ++j) {
+                                if (cpos[j] >= thr && cpos[j] >= 0) {
+                                    idxs.push_back((uint32_t) j);
+                                    if constexpr (causal && is_2d) {
+                                        if (cpos[j] == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                                            row[j] = mask_drop;
+                                        }
+                                    }
                                 }
                             }
                         }
