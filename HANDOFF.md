@@ -3,36 +3,48 @@
 Where the work stands, and what's worth doing next. For the project rules and gates, see
 `CLAUDE.md`. For the results and changes, see `p100-docs/`.
 
-## State (2026-09-23)
+## State (2026-09-25)
 
-- Branch `p100-optimizations`, merged with upstream `f46bc30cb`. See CHANGES §9 for what the
-  merge touched and how it was checked, and §10 for the real-world MTP work since.
-- `tg256` 31.3 t/s (upstream at the fork point: 17.51). Perplexity 2.6101 ± 0.0198 on the gate corpus.
-- Real-world MTP through `llama-server` (`tools/depth-bench.py --restore --seeds 2`, 2 questions
-  x 2 seeds): 42 t/s at 2k, 35 at 64k, 32 at 128k, 25-26 at 260k (ms per cycle ~77 / 81 / 97 / 135).
-  A single request swings by ±15% with how much of the text the draft predicts, so use several
-  seeds, ABBA order, and compare tokens and ms per cycle separately. The slot snapshots are in
-  `/mnt/fast/p100-scratch/slots`, so a full-context measurement takes minutes, not an hour of prefill.
-- The release bundle at `/mnt/fast/p100-llamacpp-release` is refreshed from this branch.
-  `diffs/HEAD-SHA.txt` there is authoritative.
-- ~199 attempts are logged in `OPTLOG.md`. Its CLOSING SUMMARY (line ~1896) is from 2026-09-01 and
-  predates the long-context work. The later attempts are the current story.
+- Branch `p100-optimizations`, merged with upstream `f46bc30cb`.
+- **Sampling is the model card's:** temp 1.0, top-k 20, top-p 0.95, min-p 0. `qwen-server` and
+  `depth-bench.py` forced temp 0.3 before 2026-09-24, so every MTP figure before then is at the wrong
+  sampling (OPTLOG 201).
+- `tg256` ~31 t/s. Perplexity 2.6101 on the gate corpus (the prefill path is untouched since).
+- Real-world MTP, cold cards, `depth-bench.py --restore`, 2 questions x 5 seeds, vision loaded,
+  `-ub 1024`: **~30 t/s at 260k** (107 ms per cycle, 3.24 tokens per cycle) and **~49 t/s at 2k**
+  (64 ms, 3.16). The 2026-09-24 baseline at the same sampling was 23.4 and 36.9. Hot cards (after an
+  hour of load) read 10-15% lower.
+- Goal (user, 2026-09-24): 55 t/s at 2k and 31 at ~260k, with math as good as or better than before.
+  260k is ~3% short. 2k is ~12% short, and no lever found so far is that large.
+- Not done: the release bundle has not been refreshed since d3a650552 (it lacks every change below),
+  and the full gate suite has not been run on this build.
 
-## Where the MTP cycle goes (nsys, 2026-09-23, fixed-width verify)
+## What changed on 2026-09-24/25 (OPTLOG 201-213)
 
-At 2k (~75 ms cycle, GPUs 73% busy): verify ~60 ms of GPU, nearly all of it the 5-column q6_K
-matvec, which is at its floor for exact arithmetic (OPTLOG 179, 187, and the fp64 attempt 197).
-The MTP catch-up is ~1.3 ms, and four draft steps are ~1.8 ms of GPU each. Host gaps come to ~12 ms:
-~4.5 after the verify (sampling, bookkeeping, the catch-up enqueue), ~2.8 after the catch-up,
-~0.7 between draft steps, and ~1.7 before the next verify. Enqueueing the verify graph itself takes the
-host ~46 ms (~10 us per kernel over ~4600 launches), which the GPU hides at 2k.
+- Sampled MTP drafts verified with the speculative-sampling rule (lossless; +15% tokens per cycle
+  at 2k). `LLAMA_SPEC_SAMPLE_TEMP=1.0`, `LLAMA_SPEC_DRAFT_TOPK=20`, set by qwen-server / depth-bench.
+- fp16 q6_K verify matvec (`mmvq-f16.cu`), 2-5 columns: -10..16% per call, and closer to fp32
+  (verify-path KLD against an all-fp32 run 0.00354 -> 0.00274).
+- 5-token q4p attention over half the GQA group per block, DPT 8 for 15/18 rows: -16% per call at 260k.
+- The MTP catch-up stores K/V only (-4 ms per cycle at 260k).
+- CUDA graphs for single-token graphs only (`GGML_CUDA_GRAPHS_PRE_VOLTA=3`, now the default).
+- Host: one sync per split for user inputs, no per-cycle prompt copy, a one-pass mask fill.
+- Tools: `p100-handoff/tools/mmvq-harness/` (a kernel in ~7 s), `tools/quick.sh` (a verify pass in
+  35 s), depth-bench `--server-prefix` (nsys/pmp), `LLAMA_TL=1` host timeline, `GGML_CUDA_GRAPH_DEBUG=1`.
 
-At 260k (~135 ms): the verify is ~106 ms at width 5, and a draft step ~4.3 ms of wall time
-(5.2 before the M-RoPE mask fast path) for ~2.4 ms of GPU (attention over the whole cache plus the vocabulary
-projection).
+## Where the MTP cycle goes now (nsys, 260k, warm, ~128 ms)
 
-Even with no host gaps at all, the GPU work alone caps real-world MTP at ~47 t/s at 2k and ~29 t/s at
-260k on this workload (~3.3 tokens per cycle).
+GPU0: attention 52 ms (the 5-token verify calls 40, the 1-token draft steps 4.6), matvecs 47 (fp16
+path 37, integer 8, including 4.7 of draft-step vocabulary projection), ~1900 small-op launches
+~10 ms, idle 14 ms (~4 at the 128 tensor-parallel exchanges, the rest host work between graphs).
+A draft step is ~1.1 ms of host (the 260k-column mask fill and upload, input copies) plus ~2.5 ms of
+GPU. At 2k a verify pass is ~51 ms (quick.sh), ~30 of it the fp16 matvec.
+
+Levers measured and not worth it (details in OPTLOG): fp16 in attention (loses accuracy against
+the fp32 q4p), 2-blocks-per-SM attention configs, draft vocabulary caps, top-p on the draft
+distribution, n_max 3/5, p_min, p_cum thresholds, all-graph CUDA graphs (freezes the fixed-width
+verify's token count). Open: a persistent device-side KQ mask (~1.5-2% at 260k), fusing the
+delta-net state gather into its kernel (~1% at 2k), overlapping draft-step host prep with the GPU.
 
 nsys works on Pascal (2022.4). If the importer fails, run
 `/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter -i X.qdstrm` and then
