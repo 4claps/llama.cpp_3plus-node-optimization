@@ -8182,3 +8182,15 @@ of the whole prompt (260k tokens at full context). Only the n-gram draft types r
 not. The copy is now skipped when every configured type is MTP (`common_speculative_draft_reads_prompt`).
 Host timeline at 260k (LLAMA_TL): accept -> draft start 1.06 -> 0.55 ms. The catch-up enqueue, after
 attempt 207, is 2.34 -> 1.11 ms.
+
+## Attempt 209 — cache the fp16 path's activation across matmuls that share src1: kept
+
+nsys at 260k showed the fp16 path's prep kernel at 1.65 ms per cycle. It ran once per matmul, but
+gate/up and the q/k/v projections share their input. It is now cached per CUDA context, keyed on
+the src1 node, and cleared at each graph compute, like the integer path's q8_1 cache. quick.sh ABBA:
+53.27 / 53.34 -> 52.75 / 52.76 ms per verify pass. Output is unchanged (the same prep result is
+reused).
+
+Where a 260k cycle goes now (nsys, GPU0, warm, 127.7 ms wall): attention 52 ms (the 5-token verify
+calls 40, the 1-token draft steps 4.6), matvecs 47 (fp16 path 37, integer 8), small ops 10, GPU idle
+14.3.
