@@ -10,16 +10,19 @@ Where the work stands, and what's worth doing next. For the project rules and ga
   `depth-bench.py` forced temp 0.3 before 2026-09-24, so every MTP figure before then is at the wrong
   sampling (OPTLOG 201).
 - `tg256` ~31 t/s. Perplexity 2.6101 on the gate corpus (the prefill path is untouched since).
-- Real-world MTP, cold cards, `depth-bench.py --restore`, 2 questions x 5 seeds, vision loaded,
-  `-ub 1024`: **~30 t/s at 260k** (107 ms per cycle, 3.24 tokens per cycle) and **~49 t/s at 2k**
-  (64 ms, 3.16). The 2026-09-24 baseline at the same sampling was 23.4 and 36.9. Hot cards (after an
-  hour of load) read 10-15% lower.
+- Real-world MTP, cold cards, `depth-bench.py --restore`, vision loaded, `-ub 1024`, model-card
+  sampling: **~29.6-30 t/s at 260k** (20 requests: 29.62, 105 ms per cycle, 3.1 tokens per cycle)
+  and **~49 t/s at 2k** (10 requests: 49.4, 60 ms, 3.0). The 2026-09-24 baseline at the same sampling
+  was 23.4 and 36.9. Per-request spread is +-10%, and a batch of 10 moves +-3%, so compare batches
+  of 20 or use ABBA. Hot cards read 10-15% lower.
 - Goal (user, 2026-09-24): 55 t/s at 2k and 31 at ~260k, with math as good as or better than before.
-  260k is ~3% short. 2k is ~12% short, and no lever found so far is that large.
+  260k is ~3-4% short. 2k is ~11% short.
+- Gates on 3ba045898: tg256 32.02, perplexity 2.6101 (in band), FLASH_ATTN_EXT eval passes. The
+  verify path against an all-fp32 run: KLD 0.00162 (the integer path gave 0.00354).
 - Not done: the release bundle has not been refreshed since d3a650552 (it lacks every change below),
   and the full gate suite has not been run on this build.
 
-## What changed on 2026-09-24/25 (OPTLOG 201-213)
+## What changed on 2026-09-24/25 (OPTLOG 201-218)
 
 - Sampled MTP drafts verified with the speculative-sampling rule (lossless; +15% tokens per cycle
   at 2k). `LLAMA_SPEC_SAMPLE_TEMP=1.0`, `LLAMA_SPEC_DRAFT_TOPK=20`, set by qwen-server / depth-bench.
@@ -28,7 +31,12 @@ Where the work stands, and what's worth doing next. For the project rules and ga
 - 5-token q4p attention over half the GQA group per block, DPT 8 for 15/18 rows: -16% per call at 260k.
 - The MTP catch-up stores K/V only (-4 ms per cycle at 260k).
 - CUDA graphs for single-token graphs only (`GGML_CUDA_GRAPHS_PRE_VOLTA=3`, now the default).
-- Host: one sync per split for user inputs, no per-cycle prompt copy, a one-pass mask fill.
+- Host: one sync per split and async uploads for user inputs, no per-cycle prompt copy, an SSE2
+  one-pass mask fill.
+- Delta-net: the recurrent-state and conv-state gathers are read in place by their consumers, and
+  the 5 conv-state rollback snapshot copies per layer run as one launch.
+- fp16 verify matvec on every q6_K matrix of >= 16 rows (split K below 256 rows); 6 blocks per SM.
+- Draft cutoff at depth 0.22 (was 0.3): neutral within noise; left at 0.22.
 - Tools: `p100-handoff/tools/mmvq-harness/` (a kernel in ~7 s), `tools/quick.sh` (a verify pass in
   35 s), depth-bench `--server-prefix` (nsys/pmp), `LLAMA_TL=1` host timeline, `GGML_CUDA_GRAPH_DEBUG=1`.
 
