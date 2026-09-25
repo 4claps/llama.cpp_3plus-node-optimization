@@ -8067,3 +8067,21 @@ Also measured and dropped:
 **Next (the 260k lever):** fp16 inside the 5-token q4p attention. Its q4_0 -> half conversion is
 shared by 30 query rows, not 5. The kernel is ~48% of fp32 peak, at 3.9 ms per call x 17 calls
 per cycle. fattn.cu rebuilds in 30 s.
+
+## Attempt 204 — 5-token q4p over half the GQA group per block: kept
+
+At 30 query rows (5 tokens x GQA 6) the PV accumulators take ~120 registers per thread, so one
+256-thread block fills an SM. The 5th token cost 1.5 ms per call at 262144 (4 tokens: 2544 us, 5:
+4026). Launching the 5-token case with ncols2 = 3 gives 15 rows per block and two blocks per head
+group. Each K/V value is then dequantized twice (2 instructions per value).
+
+    test-backend-ops (1328 MHz), kv 262144   nc2 6 -> 3: 5 tokens 3988 -> 3373 us; 4 tokens 2487 -> 2622 (not used)
+                                             nc2 2 (10 rows): 3653
+    in the server at 260k (GGML_CUDA_OP_PROFILE, ~1189 MHz), per call:
+        5 tokens, verify    3.551 -> 3.270 ms
+        5 tokens, catch-up  3.075 -> 2.947 ms
+        4 tokens            2.48 -> 2.78 (so 4 tokens keep nc2 = 6)
+
+The arithmetic is the same fp32 per row. Only the QK split count changes with R (NSPLIT 4 -> 2),
+which reorders one fp32 sum. FLASH_ATTN_EXT eval 6/6 at the serving shape, and the full
+FLASH_ATTN_EXT suite passes. `GGML_CUDA_Q4P_NC2=6` restores the old launch.

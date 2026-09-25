@@ -694,12 +694,17 @@ static bool ggml_cuda_fattn_q4p_supported(const ggml_tensor * dst) {
     return true;
 }
 
-template <int ncols1>
+template <int ncols1, int ncols2 = 6>
 static void ggml_cuda_flash_attn_ext_q4p_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    constexpr int ncols2 = 6;
     fattn_kernel_t kernel = flash_attn_ext_q4p<ncols1, ncols2>;
     launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, kernel, 256/WARP_SIZE, 0,
         fattn_q4p_cfg<ncols1*ncols2>::C, false, false, false, false);
+}
+
+// GGML_CUDA_Q4P_NC2=6 runs the 5-token case over the whole GQA group per block (the old default)
+static int q4p_half_group() {
+    static const int v = [] { const char * s = getenv("GGML_CUDA_Q4P_NC2"); return s ? atoi(s) : 3; }();
+    return v;
 }
 
 static void ggml_cuda_flash_attn_ext_q4p(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -720,7 +725,14 @@ static void ggml_cuda_flash_attn_ext_q4p(ggml_backend_cuda_context & ctx, ggml_t
         case 2: ggml_cuda_flash_attn_ext_q4p_case<2>(ctx, dst); break;
         case 3: ggml_cuda_flash_attn_ext_q4p_case<3>(ctx, dst); break;
         case 4: ggml_cuda_flash_attn_ext_q4p_case<4>(ctx, dst); break;
-        case 5: ggml_cuda_flash_attn_ext_q4p_case<5>(ctx, dst); break;
+        case 5:
+            // 30 rows need ~120 accumulator registers per thread, so one block fills an SM and there
+            // are too few warps to hide the loads. Half the GQA group per block (15 rows) runs two
+            // blocks per SM and dequantizes each K/V value twice: 3.55 -> 3.27 ms per call at 260k in
+            // the server. 4 tokens lose (2.48 -> 2.78). OPTLOG 204.
+            if (q4p_half_group() == 6) { ggml_cuda_flash_attn_ext_q4p_case<5>(ctx, dst); }
+            else                       { ggml_cuda_flash_attn_ext_q4p_case<5, 3>(ctx, dst); }
+            break;
         default: GGML_ABORT("fatal error");
     }
 }
