@@ -8145,3 +8145,11 @@ a double reference).
 Then the threshold was lowered to >= 3072 rows. test-backend-ops at 5 columns: 5120x5120 98 -> 89 us,
 3072x5120 67 -> 61; at 3 columns 5120x5120 75 -> 71, 3072x5120 54 -> 53. quick.sh ABBA (hot cards,
 77 C): 58.15 / 59.71 -> 57.84 / 57.84 ms. `GGML_CUDA_MMVQ_F16_MINROWS` sets it.
+
+And then every K with an even number of q6_K blocks. test-backend-ops had under-read nothing; it
+was the harness that was pessimistic. At 5 columns: 5120x8704 (down) 161 -> 146 us, 5120x3072 61 -> 57.
+Eval cases added at 3072 rows and K 3072 / 8704; q6_K MUL_MAT eval 54/54.
+
+    quick.sh ABBA, verify pass at 2k: 57.03 / 57.68 -> 53.29 / 53.45 ms (-7%)
+    verify path (-ub 5) against the all-fp32 base, 3 chunks:
+        KLD 0.002735 +- 0.000086 (integer path 0.003540), RMS dp 1.652 % (1.891), same top 97.70 %
