@@ -8141,3 +8141,7 @@ GGML_CUDA_FA_GEMM_PREC=32`, -ub 2048). Then the verify path (-ub 5), 3 chunks x 
 
 Closer to fp32 at the model level, in line with the per-op NMSE (4.6e-7 against 1.3e-4 against
 a double reference).
+
+Then the threshold was lowered to >= 3072 rows. test-backend-ops at 5 columns: 5120x5120 98 -> 89 us,
+3072x5120 67 -> 61; at 3 columns 5120x5120 75 -> 71, 3072x5120 54 -> 53. quick.sh ABBA (hot cards,
+77 C): 58.15 / 59.71 -> 57.84 / 57.84 ms. `GGML_CUDA_MMVQ_F16_MINROWS` sets it.
