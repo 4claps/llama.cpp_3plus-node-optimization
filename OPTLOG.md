@@ -8295,3 +8295,18 @@ eval 54/54 (the m=16 cases now take the split-K kernel).
 
 Also: an SSE2 fill for the single-sequence f16 mask (libllama is built without -march): 122 -> 69 us
 per row at 260k, byte-identical text.
+
+## Attempt 216 — batch the delta-net conv-state snapshot copies into one launch: kept
+
+`GGML_CUDA_OP_PROFILE=2` (new: keys also by node name) showed the server's biggest small op:
+`CPY [cache_r_l <- conv_input]`, 41760 calls in a 256-token 2k run, ~4.3 us each. With MTP the
+delta-net keeps K = n_rs_seq + 1 = 5 conv-state rollback snapshots and writes each with its own CPY:
+48 x 5 = 240 launches per verify. (llama-bench has n_rs_seq 0, so quick.sh never saw them.)
+`cpy-batch.cu` runs consecutive CPYs as one launch when they have the same shape and strides, with
+sources viewing one tensor and contiguous destinations viewing another.
+`GGML_CUDA_CPY_BATCH=0` turns it off. Server op profile at 2k: 41760 CPY (178 ms) -> 8352 fused
+launches (67 ms), about -0.64 ms per verify. Text byte-identical on/off at 2k and 260k; CPY eval
+249/249.
+
+Also fixed: `GGML_CUDA_OP_PROFILE` crashed the server with single-token CUDA graphs on (events
+recorded inside a stream capture cannot be timed). It now profiles eager evaluations only.

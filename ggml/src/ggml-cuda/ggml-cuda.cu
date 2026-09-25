@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16.cuh"
+#include "ggml-cuda/cpy-batch.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -3770,6 +3771,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
+    // consecutive same-shape copies between the same two tensors (delta-net conv-state snapshots)
+    if (cgraph->nodes[i]->op == GGML_OP_CPY) {
+        const int n_skip = ggml_cuda_try_cpy_batch(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
     ggml_tensor * node = cgraph->nodes[i];
 
     if (node->op == GGML_OP_MUL) {
@@ -4567,6 +4576,17 @@ static std::string ggml_cuda_op_prof_key(const ggml_tensor * node, const char * 
     } else {
         snprintf(buf, sizeof(buf), " n=%lld", (long long) node->ne[1]);
     }
+    // GGML_CUDA_OP_PROFILE=2: also key by the node name (digits dropped, so layers group together)
+    static const bool names = [] { const char * s = getenv("GGML_CUDA_OP_PROFILE"); return s && atoi(s) == 2; }();
+    if (names) {
+        std::string nm;
+        for (const char * c = node->name; *c; ++c) {
+            if (*c < '0' || *c > '9') {
+                nm += *c;
+            }
+        }
+        return k + buf + " [" + nm + "]";
+    }
     return k + buf;
 }
 
@@ -4710,7 +4730,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            if (ggml_cuda_op_prof * P = ggml_cuda_op_prof_get(cuda_ctx->device)) {
+            if (ggml_cuda_op_prof * P = use_cuda_graph ? nullptr : ggml_cuda_op_prof_get(cuda_ctx->device)) {
                 if (!P->g0) {
                     CUDA_CHECK(cudaEventCreate(&P->g0));
                     CUDA_CHECK(cudaEventCreate(&P->g1));
@@ -4759,7 +4779,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                ggml_cuda_op_prof * prof = ggml_cuda_op_prof_get(cuda_ctx->device);
+                // events recorded into a CUDA graph capture cannot be timed: profile only eager runs
+                ggml_cuda_op_prof * prof = use_cuda_graph ? nullptr : ggml_cuda_op_prof_get(cuda_ctx->device);
                 cudaEvent_t prof_e0 = nullptr;
                 if (prof) {
                     prof_e0 = prof->ev();
@@ -4823,7 +4844,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
         }
 
-        if (ggml_cuda_op_prof * P = ggml_cuda_op_prof_get(cuda_ctx->device)) {
+        if (ggml_cuda_op_prof * P = use_cuda_graph ? nullptr : ggml_cuda_op_prof_get(cuda_ctx->device)) {
             if (!use_cuda_graph) {
                 ggml_cuda_op_prof_flush(P, cuda_ctx->device, cuda_ctx->stream());
             }
