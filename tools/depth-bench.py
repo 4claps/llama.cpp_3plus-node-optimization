@@ -106,6 +106,7 @@ def main():
     ap.add_argument("--n-max", default="", help="comma list of per-request speculative.n_max values (restore mode)")
     ap.add_argument("--server-n-max", type=int, default=0, help="override --spec-draft-n-max on the server")
     ap.add_argument("--server-p-min", type=float, default=-1, help="override --spec-draft-p-min on the server")
+    ap.add_argument("--server-prefix", default="", help="command prefix for the server, e.g. an nsys profile invocation")
     ap.add_argument("--seeds", type=int, default=1, help="restore mode: repeat each question with this many seeds")
     ap.add_argument("--graphs", default="0", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 0)")
     g = ap.add_mutually_exclusive_group()
@@ -129,7 +130,7 @@ def main():
     env.setdefault("LLAMA_SPEC_SAMPLE_TEMP", "1.0")
     env.setdefault("LLAMA_SPEC_DRAFT_TOPK", "20")
     log = open(a.out + ".server.log", "w")
-    srv = subprocess.Popen([os.path.join(a.bindir, "llama-server")] + args, env=env,
+    srv = subprocess.Popen(a.server_prefix.split() + [os.path.join(a.bindir, "llama-server")] + args, env=env,
                            stdout=log, stderr=subprocess.STDOUT)
     min_free = [10**9]
     stop = threading.Event()

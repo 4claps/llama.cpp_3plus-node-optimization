@@ -8096,3 +8096,24 @@ Then the 15-row configuration was swept (fattn-q4p-tune.h, 30 s per build), kv 2
 DPT 8 is kept for 15 and 18 rows. In the server at 260k the 5-token verify call is now 2.983 ms,
 down from 3.551 at the start of this attempt (-16%). FLASH_ATTN_EXT 36/36 at the serving shape.
 
+
+## Attempt 205 — host gaps at 260k, and one sync per split for user inputs: kept (small)
+
+nsys + pmp at 260k, per cycle:
+- GPU0 is idle 13-16 ms of ~134 (under nsys): 7-10 ms in gaps > 0.2 ms between graphs, ~4.3 ms in
+  ~127 gaps of 20-200 us (the 128 tensor-parallel exchanges of the verify), ~2 ms in tiny gaps.
+- The host issues ~5200 kernel launches (42 ms of host time) and ~320 stream syncs per cycle.
+- Copies per cycle on GPU0: ~7.8 MB of KQ masks H2D (~0.8 ms) and ~3 MB of logits D2H (0.34 ms).
+- The gap after the verify is the MTP catch-up's llama_decode, 1.2 ms (2k) to 2.1 ms (260k) of host
+  time, spent before its first kernel.
+- No checkpoint replays (every cycle has exactly 17 multi-token attention calls).
+- 1-token q4p: half-group launches are slower (900 -> 1154 us), and no 6-row knob beats the default.
+
+Kept: `ggml_backend_sched_compute_splits` synced the split backend (both GPUs under -sm tensor)
+before every user-input copy. The copies are blocking and nothing is enqueued between them, so
+one sync per split is enough. ABBA, 2 questions x 2 seeds:
+
+    2k    71.5 -> 71.0 ms/cycle (42.97 -> 43.20 t/s)
+    260k 115.2 -> 114.3 ms/cycle (26.39 -> 26.59 t/s)
+
+Text is byte-identical in both arms.

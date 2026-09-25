@@ -1668,7 +1668,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // copy the input tensors to the split backend
+        // copy the input tensors to the split backend. A user input is copied with a blocking copy
+        // after the split backend has finished with the previous contents: once that sync is done,
+        // nothing is enqueued on the split backend until the loop ends, so later user inputs of the
+        // same split need no sync of their own (each one costs a stream sync per device, and a
+        // tensor-parallel decode has ~9 of them per graph).
+        bool split_backend_idle = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1678,11 +1683,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                } else if (!split_backend_idle) {
                     ggml_backend_synchronize(split_backend);
+                    split_backend_idle = true;
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                split_backend_idle = false; // the paths below may enqueue async work on the split backend
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
