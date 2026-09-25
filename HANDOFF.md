@@ -3,7 +3,7 @@
 Where the work stands, and what's worth doing next. For the project rules and gates, see
 `CLAUDE.md`. For the results and changes, see `p100-docs/`.
 
-## State (2026-09-25)
+## State (2026-09-25, morning)
 
 - Branch `p100-optimizations`, merged with upstream `f46bc30cb`.
 - **Sampling is the model card's:** temp 1.0, top-k 20, top-p 0.95, min-p 0. `qwen-server` and
@@ -19,8 +19,16 @@ Where the work stands, and what's worth doing next. For the project rules and ga
   260k is ~3-4% short. 2k is ~11% short.
 - Gates on 3ba045898: tg256 32.02, perplexity 2.6101 (in band), FLASH_ATTN_EXT eval passes. The
   verify path against an all-fp32 run: KLD 0.00162 (the integer path gave 0.00354).
-- Not done: the release bundle has not been refreshed since d3a650552 (it lacks every change below),
-  and the full gate suite has not been run on this build.
+- **Next steps (agreed with the user 2026-09-25):**
+  1. Run `./tools/gate.sh --full` on this build. It was started and stopped at user request; the
+     quick gates (tg256 32.02, perplexity 2.6101, FLASH_ATTN_EXT) passed on 3ba045898.
+  2. Refresh the release bundle through `p100-handoff/release-sync/` (it is still d3a650552, so
+     `qwen-server` on PATH runs none of the 2026-09-24/25 work). The regenerated wrapper sets
+     `GGML_CUDA_GRAPHS_PRE_VOLTA=3`, `LLAMA_SPEC_SAMPLE_TEMP=1.0`, `LLAMA_SPEC_DRAFT_TOPK=20` and the
+     model-card sampling.
+  3. Optional, for the last 3-4% at 260k: a two-kernel q4p attention (score pass, then value pass)
+     so each fits more warps. The single kernel is at one 256-thread block per SM and ~255
+     registers; every 2-block and 512-thread variant spills (OPTLOG 204, 219, 220).
 
 ## What changed on 2026-09-24/25 (OPTLOG 201-218)
 
