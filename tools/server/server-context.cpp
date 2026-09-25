@@ -12,6 +12,12 @@
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_set_n_active_tokens (fixed-width verify)
+
+// TIMELINE EXPERIMENT (LLAMA_TL=1): phase marks on stderr
+static inline void tl_mark(const char * tag) {
+    static const bool on = getenv("LLAMA_TL") != nullptr;
+    if (on) { fprintf(stderr, "TL %s %lld\n", tag, (long long) ggml_time_us()); }
+}
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -3105,12 +3111,15 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            tl_mark("D0");
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            tl_mark("D1");
         }
 
         // make checkpoints if needed
+        tl_mark("C0");
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3170,6 +3179,7 @@ private:
             }
         });
 
+        tl_mark("C1");
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
@@ -3754,17 +3764,20 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         const bool padded = batch.n_active > 0 && batch_view.n_tokens == batch.n_active_full && off == 0;
+        tl_mark("V0");
         queue_tasks.yield_to_queue([&]() {
             if (padded) {
                 llama_set_n_active_tokens(ctx_tgt, batch.n_active);
             }
             ret = llama_decode(ctx_tgt, batch_view);
+            tl_mark("V1");
             if (padded) {
                 llama_set_n_active_tokens(ctx_tgt, 0);
             }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            tl_mark("V2");
         });
 
         if (ret != 0) {
@@ -3825,9 +3838,11 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            tl_mark("P0");
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            tl_mark("P1");
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3985,6 +4000,7 @@ private:
 
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
+            tl_mark("A0");
 
             GGML_ASSERT(n_draft > 0);
 
@@ -4079,6 +4095,7 @@ private:
                 slot.spec_draft = std::move(accepted);
             }
 
+            tl_mark("A1");
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;

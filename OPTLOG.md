@@ -8153,3 +8153,24 @@ Eval cases added at 3072 rows and K 3072 / 8704; q6_K MUL_MAT eval 54/54.
     quick.sh ABBA, verify pass at 2k: 57.03 / 57.68 -> 53.29 / 53.45 ms (-7%)
     verify path (-ub 5) against the all-fp32 base, 3 chunks:
         KLD 0.002735 +- 0.000086 (integer path 0.003540), RMS dp 1.652 % (1.891), same top 97.70 %
+
+## Attempt 207 — the MTP catch-up stores K/V only: kept
+
+A host timeline (`LLAMA_TL=1`, phase marks on stderr; kept as a diagnostic) at 260k, per cycle:
+verify enqueue 65 ms then sync 41 ms; catch-up enqueue 2.3 ms; accept 0.5 ms; 1.1 ms until drafting
+starts; four draft steps of ~1.05 ms enqueue + ~2.45 ms wait/sample each. At 2k the same host phases
+are 1.45 / 0.44 / 0.55 / 0.89 + 1.44 ms.
+
+The catch-up (common_speculative_process) runs the MTP layer over the verified tokens with no
+outputs. Its only purpose is to write their K/V into the draft's cache. The caller keeps the
+*target's* hidden states, and the draft context extracts masked rows (0 here). But the graph
+selected outputs only at the very end, so it still computed attention over the whole cache (~3 ms
+at 260k), the output projection and the FFN, and filled and uploaded a 260k-column mask. With
+n_outputs == 0 the MTP graph now stores K/V (with the same rotation handling as build_attn) and
+returns. `llm_graph_input_out_ids::set_input` needed the same unallocated-tensor guard the KQ mask
+already had. `LLAMA_MTP_KV_ONLY=0` restores the full pass.
+
+ABBA, 2 questions x 2 seeds, text byte-identical in every arm at both depths:
+
+    2k    69.9 -> 69.2 ms/cycle (43.23 -> 43.67 t/s)
+    260k 116.9 -> 112.9 ms/cycle (26.92 -> 27.82 t/s)   (hot cards, 75-77 C)

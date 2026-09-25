@@ -1727,7 +1727,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int64_t t_step = prof ? ggml_time_us() : 0;
+            static const bool tl = getenv("LLAMA_TL") != nullptr;
+            if (tl) { fprintf(stderr, "TL S0 %lld\n", (long long) ggml_time_us()); }
             int ret = llama_decode(ctx_dft, batch);
+            if (tl) { fprintf(stderr, "TL S1 %lld\n", (long long) ggml_time_us()); }
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
