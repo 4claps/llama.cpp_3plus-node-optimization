@@ -8085,3 +8085,14 @@ group. Each K/V value is then dequantized twice (2 instructions per value).
 The arithmetic is the same fp32 per row. Only the QK split count changes with R (NSPLIT 4 -> 2),
 which reorders one fp32 sum. FLASH_ATTN_EXT eval 6/6 at the serving shape, and the full
 FLASH_ATTN_EXT suite passes. `GGML_CUDA_Q4P_NC2=6` restores the old launch.
+
+Then the 15-row configuration was swept (fattn-q4p-tune.h, 30 s per build), kv 262144, us:
+
+    default (NSPLIT 2, PT 2, DPT 4)   3403    PT 1: 3713    DPT 2: 4367    NSPLIT 4: 3678
+    __launch_bounds__(256,2)          6066 (spills)       with PT 1: 3801
+    DPT 8                             3074    + PF off: 3013    + NSPLIT 4: 3336    + PT 1: 3487
+    18 rows (3 tokens), DPT 4 -> 8    1931 -> 1873          24 rows, DPT 4 -> 8: 2488 -> 4939
+
+DPT 8 is kept for 15 and 18 rows. In the server at 260k the 5-token verify call is now 2.983 ms,
+down from 3.551 at the start of this attempt (-16%). FLASH_ATTN_EXT 36/36 at the serving shape.
+

@@ -62,6 +62,9 @@
 #ifndef Q4P_KPF
 #define Q4P_KPF 0
 #endif
+#ifndef Q4P_MINB
+#define Q4P_MINB 1
+#endif
 
 template <int R>
 struct fattn_q4p_cfg {
@@ -80,7 +83,8 @@ struct fattn_q4p_cfg {
     // scale per 32-dim partial sum (fewer multiplies) or per value (fewer registers)
     static constexpr bool BLOCK_T = RQ <= 6;
     // PV: a thread owns DPT output dimensions for the RQ rows of its group, over every NPG-th position.
-    static constexpr int DPT    = Q4P_KNOB(DPT, R <= 12 ? 8 : 4);
+    // 15 and 18 rows: 8 (15: 3403 -> 3074 us, 18: 1931 -> 1873 at kv 262144; 24 rows: 2488 -> 4939). OPTLOG 204.
+    static constexpr int DPT    = Q4P_KNOB(DPT, R <= 18 ? 8 : 4);
     static constexpr int NDG    = FATTN_Q4P_D/DPT;
     static constexpr int NPG    = NT/(NDG*RG);
     // Fold the V block scale into P (RQ multiplies per position) or into V (DPT multiplies).
@@ -132,7 +136,7 @@ static __device__ __forceinline__ int fattn_q4p_pv_dim(const int dg, const int j
 }
 
 template <int ncols1, int ncols2>
-__launch_bounds__(256, 1)
+__launch_bounds__(256, (ncols1*ncols2 == Q4P_TUNE_R) ? Q4P_MINB : 1)
 static __global__ void flash_attn_ext_q4p(
         const char * __restrict__ Q,
         const char * __restrict__ K,
