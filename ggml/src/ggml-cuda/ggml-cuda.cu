@@ -2770,6 +2770,30 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+
+    // GGML_CUDA_GRAPHS_PRE_VOLTA=3: graphs only for single-token graphs (MTP draft steps, plain
+    // decode). Not for 1-node graphs: the tensor-parallel backend reuses one auxiliary graph object
+    // for every exchange's ADD, whose shape alternates, so it never stabilizes. Not for multi-token
+    // graphs: a fixed-width verify's real-token count (active-tokens.cuh) is read at enqueue time and
+    // would be frozen into a captured graph.
+    static const bool single_token_only = [] {
+        const char * s = getenv("GGML_CUDA_GRAPHS_PRE_VOLTA");
+        return s && atoi(s) == 3;
+    }();
+    if (single_token_only) {
+        if (cgraph->n_nodes <= 1) {
+            return false;
+        }
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1] && node->src[1]->ne[1] > 1) {
+                return false;
+            }
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]->ne[1] > 1) {
+                return false;
+            }
+        }
+    }
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2845,6 +2869,24 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // DEBUG (GGML_CUDA_GRAPH_DEBUG=1): report the first node whose properties changed
+            static const bool dbg = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+            if (dbg && !res) {
+                const ggml_cuda_graph::node_properties & o = graph->node_props[i];
+                const char * what = "?";
+                if (o.node.data != prop.node.data) what = "data";
+                else if (memcmp(o.node.ne, prop.node.ne, sizeof(o.node.ne))) what = "ne";
+                else if (memcmp(o.node.nb, prop.node.nb, sizeof(o.node.nb))) what = "nb";
+                else if (memcmp(o.node.op_params, prop.node.op_params, sizeof(o.node.op_params))) what = "op_params";
+                else if (memcmp(o.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(o.node_src_data_ptrs))) what = "src data";
+                else if (memcmp(o.node_src_ne, prop.node_src_ne, sizeof(o.node_src_ne))) what = "src ne";
+                else if (memcmp(o.node.src, prop.node.src, sizeof(o.node.src))) what = "src ptrs";
+                else if (o.node.view_src != prop.node.view_src || o.node.view_offs != prop.node.view_offs) what = "view";
+                else if (memcmp(o.node.name, prop.node.name, sizeof(o.node.name))) what = "name";
+                else if (o.node.extra != prop.node.extra) what = "extra";
+                else what = "other field";
+                fprintf(stderr, "CUDA graph update: n_nodes %d, node %d '%s' (%s) changed: %s\n", cgraph->n_nodes, i, prop.node.name, ggml_op_name(prop.node.op), what);
+            }
             graph->node_props[i] = prop;
             res = true;
         }

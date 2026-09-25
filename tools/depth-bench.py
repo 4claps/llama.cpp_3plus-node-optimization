@@ -108,7 +108,7 @@ def main():
     ap.add_argument("--server-p-min", type=float, default=-1, help="override --spec-draft-p-min on the server")
     ap.add_argument("--server-prefix", default="", help="command prefix for the server, e.g. an nsys profile invocation")
     ap.add_argument("--seeds", type=int, default=1, help="restore mode: repeat each question with this many seeds")
-    ap.add_argument("--graphs", default="0", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 0)")
+    ap.add_argument("--graphs", default="3", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 3, single-token graphs only)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--fill", metavar="DIR")
     g.add_argument("--restore", metavar="DIR")

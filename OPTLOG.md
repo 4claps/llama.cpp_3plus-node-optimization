@@ -8224,3 +8224,22 @@ request sequences (as the ABBA runs do).
 Cold 260k, 10 requests (5 seeds), before/after the matvec occupancy change (different request
 histories, so this includes draft-sample noise): 29.90 / 28.75 t/s, 109.1 / 108.6 ms per cycle.
 Same run, 2k: 49.22 t/s, 64.3 ms per cycle, 3.16 tokens per cycle.
+
+## Attempt 212 — CUDA graphs for single-token graphs only (GGML_CUDA_GRAPHS_PRE_VOLTA=3): kept
+
+Why graphs were re-captured every step (a new `GGML_CUDA_GRAPH_DEBUG=1` prints the first changed
+node): 1280 of the updates in a short 2k run were the tensor-parallel backend's 1-node ADD graphs.
+It reuses one auxiliary graph object for every exchange, and its shape alternates between the
+verify (5 tokens) and the draft (1 token). Capturing multi-token graphs is also wrong with the
+fixed-width verify: the real-token count is read at enqueue time and would be frozen into the
+capture. That is why earlier graph runs changed the text.
+
+Mode 3 captures only graphs with more than one node whose matmuls and attention are single-token:
+the MTP draft steps and plain decode. No prefill graph is instantiated, so the full-context VRAM
+problem that forced graphs off does not arise (GPU0 low point 818-820 MiB at 260k, unchanged).
+ABBA, 2 questions x 2 seeds, text byte-identical in every arm:
+
+    2k    67.2 -> 66.2 ms/cycle (46.19 -> 46.84 t/s)
+    260k 116.6 -> 114.3 ms/cycle (28.32 -> 28.83 t/s)
+
+Now the default in qwen-server and depth-bench.
