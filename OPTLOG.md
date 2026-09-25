@@ -8194,3 +8194,15 @@ reused).
 Where a 260k cycle goes now (nsys, GPU0, warm, 127.7 ms wall): attention 52 ms (the 5-token verify
 calls 40, the 1-token draft steps 4.6), matvecs 47 (fp16 path 37, integer 8), small ops 10, GPU idle
 14.3.
+
+## Attempt 210 — fp16 verify matvec: 6 blocks per SM: kept
+
+The in-tree kernel ran at 191 registers (~5 blocks of 2 warps per SM). A geometry sweep (warps per
+block x rows per warp) found nothing better than 2 x 4. `__launch_bounds__(64, 6)` caps it at 168
+registers with no spills. (minBlocks 8 -> 128 registers, spills, 147 us; 10 -> 351 us.)
+test-backend-ops, 5 columns, us:
+
+    8704x5120 131.5 -> 129.6   5120x8704 138.9 -> 131.1   5120x5120 88.7 -> 79.1
+    3072x5120  60.9 ->  59.1   5120x3072  57.2 ->  50.0   6144x5120 97.1 -> 95.9
+
+quick.sh (2k verify pass): 52.75 -> 51.45 ms. q6_K eval 54/54. The arithmetic is unchanged.
