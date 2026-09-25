@@ -8243,3 +8243,14 @@ ABBA, 2 questions x 2 seeds, text byte-identical in every arm:
     260k 116.6 -> 114.3 ms/cycle (28.32 -> 28.83 t/s)
 
 Now the default in qwen-server and depth-bench.
+
+## Attempt 213 — delta-net conv concat: one thread per element for narrow rows: kept
+
+`concat_non_cont` launched one 256-thread block per dim-1 row and looped over dim 0. The delta-net
+conv input is 3 conv-state columns plus the batch's tokens (8 wide at 5 tokens) across ~5120
+channels per GPU: 5120 blocks with 248 of 256 threads idle, ~16 us at 2k and ~22 us at 260k, once
+per delta-net layer. For dim-0 concats up to 64 wide, a flat kernel now gives each thread one
+output element: 8.1 us per call (launch-bound), the same copy. CONCAT eval 177/177.
+
+Also: p_min 0.1 / 0.2 / 0.3 at 260k with sampled drafts give identical acceptance and tokens per
+cycle (the depth-scheduled p_cum rule stops drafts first). Kept at 0.2.
