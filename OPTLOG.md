@@ -8310,3 +8310,20 @@ launches (67 ms), about -0.64 ms per verify. Text byte-identical on/off at 2k an
 
 Also fixed: `GGML_CUDA_OP_PROFILE` crashed the server with single-token CUDA graphs on (events
 recorded inside a stream capture cannot be timed). It now profiles eager evaluations only.
+
+## Attempt 217 — async user-input uploads, one sync per split: kept (small)
+
+`ggml_backend_sched_compute_splits` copied each host input to the split backend with a blocking
+copy. Under -sm tensor that is a memcpy plus a stream sync per GPU per input, ~9 inputs per graph.
+Host inputs now go out with `set_tensor_async`, to every GPU at once (the two uploads of a mirrored
+260k mask overlap), and a single sync after the input loop keeps upstream's guarantee: the user's
+input buffer is free when the call returns. The tensor-parallel backend's `set_tensor_async` asserted
+on layouts it does not splice; it now falls back to the blocking buffer path for those.
+`GGML_SCHED_ASYNC_INPUTS=0` restores the old copies.
+
+Host timeline (LLAMA_TL): draft-step enqueue 0.91 -> 0.77 ms, catch-up enqueue 1.09 -> 1.00 ms. One
+request each: 260k 101.0 / 114.2 -> 100.6 / 113.4 ms per cycle. Text byte-identical on/off at 2k and
+260k.
+
+Cold, 20 requests at 260k before this (seeds 0-9, 2 batches with cooldown): 29.95 t/s, 101.2 ms per
+cycle, 3.04 tokens per cycle; 10 requests at 2k: 49.39 t/s, 60.1 ms, 2.97.

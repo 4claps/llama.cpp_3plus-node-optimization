@@ -1674,6 +1674,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // same split need no sync of their own (each one costs a stream sync per device, and a
         // tensor-parallel decode has ~9 of them per graph).
         bool split_backend_idle = false;
+        bool inputs_in_flight   = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1687,7 +1688,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
                     split_backend_idle = true;
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                // Host inputs go out asynchronously (to every device of a multi-device backend at once),
+                // with a single sync after the loop instead of one blocking copy per input.
+                static const bool async_inputs = [] {
+                    const char * e = getenv("GGML_SCHED_ASYNC_INPUTS");
+                    return !e || atoi(e) != 0;
+                }();
+                if (async_inputs && sched->events[split_backend_id][sched->cur_copy] == NULL &&
+                        split_backend->iface.set_tensor_async != NULL && input->buffer != NULL &&
+                        ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy)) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    inputs_in_flight = true;
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 split_backend_idle = false; // the paths below may enqueue async work on the split backend
                 // wait for the split backend to finish using the input before overwriting it
@@ -1800,6 +1814,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        // the user may overwrite the inputs once this returns: wait for the async input copies
+        if (inputs_in_flight) {
+            ggml_backend_synchronize(split_backend);
         }
 
         if (!sched->callback_eval) {
