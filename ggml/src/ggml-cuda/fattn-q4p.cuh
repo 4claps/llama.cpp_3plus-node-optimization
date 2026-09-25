@@ -189,6 +189,10 @@ static __global__ void flash_attn_ext_q4p(
     __shared__ float m_s[R];                              // running max, log2 units
     __shared__ float a_s[R];                              // rescale factor
     __shared__ float red_s[8][R];
+    constexpr int LRP  = R <= 16 ? 16 : 32;   // rows (padded) of the parallel denominator sum
+    constexpr int LPPS = C / (NT/LRP);        // positions per thread in it
+    static_assert(C % (NT/LRP) == 0, "bad denominator split");
+    __shared__ float lsum_s[NT/WARP_SIZE][LRP];
 
     ggml_cuda_pdl_sync();
 
@@ -232,7 +236,6 @@ static __global__ void flash_attn_ext_q4p(
     // softmax denominator of row tid, for tid < R: summed once per chunk from P_s, so the PV
     // loop neither spends registers on it nor diverges to add it
     float l_row = 0.0f;
-    const int l_off = tid < R ? (tid / RQ)*RQP + tid % RQ : 0;
 
     // this thread's V word: block b, word k of each row
     const int pv_d0 = fattn_q4p_pv_dim<DPT>(dg, 0);
@@ -506,12 +509,30 @@ static __global__ void flash_attn_ext_q4p(
             }
         }
 
-        if (tid < R) {
+        // This chunk's softmax denominators, summed by every thread over a segment of one row, not
+        // by R threads walking all C positions: that serial loop sat on warp 0, and the whole block
+        // waited for it at the chunk-end barrier. Thread tid owns row tid % LRP and positions
+        // [seg*LPPS, (seg+1)*LPPS); per-warp partials go to lsum_s, and the R row owners add them
+        // after the chunk-end barrier.
+        {
+            const int lr = tid % LRP, seg = tid / LRP;
             float ls = 0.0f;
-            for (int p = 0; p < p_end; ++p) {
-                ls += P_s[p*PSTR + l_off];
+            if (lr < R) {
+                const int off = (lr / RQ)*RQP + lr % RQ;
+#pragma unroll
+                for (int j = 0; j < LPPS; ++j) {
+                    const int p = seg*LPPS + j;
+                    if (p < p_end) {
+                        ls += P_s[p*PSTR + off];
+                    }
+                }
             }
-            l_row += ls;
+            if constexpr (LRP == 16) {
+                ls += __shfl_xor_sync(0xFFFFFFFF, ls, 16, WARP_SIZE);
+            }
+            if (lane < LRP) {
+                lsum_s[warp][lane] = ls;
+            }
         }
 
         // the next chunk's K words, in flight during the PV phase
@@ -588,6 +609,14 @@ static __global__ void flash_attn_ext_q4p(
             }
         }
         __syncthreads();
+        if (tid < R) {
+            float ls = 0.0f;
+#pragma unroll
+            for (int w = 0; w < NT/WARP_SIZE; ++w) {
+                ls += lsum_s[w][tid];
+            }
+            l_row += ls;
+        }
     }
 
     // ---- reduce the NPG partial outputs and the partial denominators ----
