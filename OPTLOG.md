@@ -8350,3 +8350,6 @@ goes away), 12 rows 1367 -> 1268-1285, 24 rows neutral, 18 rows worse (1926 -> 1
 throughout; only where the scale is applied changes. FLASH_ATTN_EXT 36/36 at the serving shape. In
 the server at 260k the 5-token call goes 2.983 -> 2.949 ms: at the server's clock this kernel is
 more latency-bound, so fewer instructions buy less.
+
+Also tried for 15 rows: 512-thread blocks capped at 128 registers (16 warps per SM) with DPT 4 / PT 1:
+4146-4359 us against 3018 (spills); with DPT 8, 18181 us. One 256-thread block per SM stays best.
