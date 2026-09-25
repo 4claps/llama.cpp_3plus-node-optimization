@@ -107,6 +107,7 @@ def main():
     ap.add_argument("--server-n-max", type=int, default=0, help="override --spec-draft-n-max on the server")
     ap.add_argument("--server-p-min", type=float, default=-1, help="override --spec-draft-p-min on the server")
     ap.add_argument("--server-prefix", default="", help="command prefix for the server, e.g. an nsys profile invocation")
+    ap.add_argument("--seed-offset", type=int, default=0, help="restore mode: first seed index (to draw new seeds)")
     ap.add_argument("--seeds", type=int, default=1, help="restore mode: repeat each question with this many seeds")
     ap.add_argument("--graphs", default="3", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 3, single-token graphs only)")
     g = ap.add_mutually_exclusive_group()
@@ -169,7 +170,7 @@ def main():
             for ent in manifest:
                 if want and not any(abs(ent["n_tokens"] - d) < 4096 for d in want):
                     continue
-                for nm, si, (qi, q) in [(nm, si, qq) for nm in nmaxs for si in range(a.seeds) for qq in enumerate(QUESTIONS)]:
+                for nm, si, (qi, q) in [(nm, si, qq) for nm in nmaxs for si in range(a.seed_offset, a.seed_offset + a.seeds) for qq in enumerate(QUESTIONS)]:
                         post(f"/slots/0?action=restore", {"filename": ent["file"]})
                         full = open(os.path.join(slot_dir, ent["prompt_file"]), encoding="utf-8").read() + q
                         full = render_tail(full, ent)
