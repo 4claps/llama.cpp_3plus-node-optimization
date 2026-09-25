@@ -8327,3 +8327,7 @@ request each: 260k 101.0 / 114.2 -> 100.6 / 113.4 ms per cycle. Text byte-identi
 
 Cold, 20 requests at 260k before this (seeds 0-9, 2 batches with cooldown): 29.95 t/s, 101.2 ms per
 cycle, 3.04 tokens per cycle; 10 requests at 2k: 49.39 t/s, 60.1 ms, 2.97.
+
+Gates on 3ba045898 (full rebuild, cooled cards): tg256 32.02 +- 0.18 t/s (was ~31.3; single-token
+CUDA graphs help plain decode too), perplexity 2.6101 +- 0.0198 (unchanged, in band), FLASH_ATTN_EXT
+eval passes.
