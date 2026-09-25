@@ -8353,3 +8353,12 @@ more latency-bound, so fewer instructions buy less.
 
 Also tried for 15 rows: 512-thread blocks capped at 128 registers (16 warps per SM) with DPT 4 / PT 1:
 4146-4359 us against 3018 (spills); with DPT 8, 18181 us. One 256-thread block per SM stays best.
+
+## Attempt 220 — CUDA graphs for the verify too, keyed by the real-token count: no gain, reverted
+
+Mode 4 captured every graph of <= 8 tokens (verify, catch-up, draft steps), with the graph key
+including the fixed-width verify's real-token count so each width gets its own capture. Text was
+byte-identical to mode 3, but 260k 109.4 / 103.5 -> 109.9 / 104.5 ms per cycle, and GPU0's low point
+fell 816 -> 638 MiB from the instantiated graphs. An accidental run of the *old* library with mode 4
+(every graph captured, width frozen) showed ~94 ms per cycle, but that was wrong output: the frozen
+width made the verify compute fewer columns (acceptance collapsed). Reverted; mode 3 stays.
