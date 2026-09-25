@@ -8117,3 +8117,27 @@ one sync per split is enough. ABBA, 2 questions x 2 seeds:
     260k 115.2 -> 114.3 ms/cycle (26.39 -> 26.59 t/s)
 
 Text is byte-identical in both arms.
+
+## Attempt 206 — fp16 q6_K verify matvec, integrated for K = 5120 with >= 6144 rows: kept
+
+v7 from attempt 203, in its own file `mmvq-f16.cu` (it compiles in ~14 s). mmvq.cu itself takes
+127 s. Across the other per-GPU shapes, 5 columns (harness / test-backend-ops):
+
+    8704x5120 (gate, up)  154 -> 133 us    6144x5120 (attn q)  115 -> 97 us
+    5120x5120, 3072x5120  tie              5120x3072, 5120x8704  lose (kept on the integer path)
+
+The path is gated to K = 5120 with >= 6144 rows at 2-5 columns; `GGML_CUDA_MMVQ_F16=0` turns it off.
+New eval cases at 6144, 6150 (partial row block) and 8704 rows, n 2-5: 12/12, and all q6_K MUL_MAT
+eval cases pass.
+
+In the model: quick.sh (one 5-token verify pass at 2k), ABBA: 56.84 / 57.04 -> 54.79 / 54.89 ms
+(-3.7%).
+
+Accuracy at the model level: KLD base from an all-fp32 run (`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32
+GGML_CUDA_FA_GEMM_PREC=32`, -ub 2048). Then the verify path (-ub 5), 3 chunks x 4096, gate corpus:
+
+    integer path   KLD 0.003540 +- 0.000118   RMS dp 1.891 %   PPL ratio 1.0005 +- 0.0012
+    fp16 path      KLD 0.003257 +- 0.000103   RMS dp 1.800 %   PPL ratio 1.0020 +- 0.0011
+
+Closer to fp32 at the model level, in line with the per-op NMSE (4.6e-7 against 1.3e-4 against
+a double reference).

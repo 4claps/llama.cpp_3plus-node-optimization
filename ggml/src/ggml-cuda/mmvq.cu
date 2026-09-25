@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-f16.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1726,6 +1727,11 @@ void ggml_cuda_mul_mat_vec_q(
     // a fixed-width verify graph may have only the first columns real (active-tokens.cuh)
     const int64_t ne11a = ids ? ne11 : ggml_cuda_active_cols(ne11);
     const int64_t ne1a  = ids ? ne1  : (ne11a < ne11 ? ne11a : ne1);
+
+    // Pascal: fp16 path for the verify widths where it is faster (mmvq-f16.cu)
+    if (!ids && !fusion && ggml_cuda_mmvq_f16_try(ctx, src0, src1, dst, ne11a)) {
+        return;
+    }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_1_bytes  = ne13*ne12 * ne11a*ne10_padded * sizeof(block_q8_1)/QK8_1;
