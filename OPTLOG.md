@@ -8341,3 +8341,12 @@ wider verify pays at depth. 260k, ABBA, 2 questions x 3 seeds per arm:
     0.22 26.20      3.14            119.7        vs 0.15  25.34  3.22  127.0   (hot)
 
 The schedule still ramps from 0 below 16k to its full value at 48k.
+
+## Attempt 219 — q4p: apply the K block scale once per 32-dim block at 12 and 15 rows: kept (small)
+
+BLOCK_T (sum q*n per block, then one FFMA by d, instead of scaling every dequantized value) was on
+only for <= 6 rows. kv 262144, test-backend-ops: 15 rows 3055 -> 2973-3004 us (and the 32-byte spill
+goes away), 12 rows 1367 -> 1268-1285, 24 rows neutral, 18 rows worse (1926 -> 1975, left off). fp32
+throughout; only where the scale is applied changes. FLASH_ATTN_EXT 36/36 at the serving shape. In
+the server at 260k the 5-token call goes 2.983 -> 2.949 ms: at the server's clock this kernel is
+more latency-bound, so fewer instructions buy less.

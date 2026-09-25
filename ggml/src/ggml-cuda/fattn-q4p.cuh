@@ -81,7 +81,11 @@ struct fattn_q4p_cfg {
     static constexpr int DPS    = FATTN_Q4P_D/NSPLIT;     // dimensions per split
     static constexpr int QREG   = DPS*RQP + 4;            // one (split, group) region of Q_s; +4 spreads banks
     // scale per 32-dim partial sum (fewer multiplies) or per value (fewer registers)
-    static constexpr bool BLOCK_T = RQ <= 6;
+#ifndef Q4P_BLOCKT
+#define Q4P_BLOCKT 0
+#endif
+    // also at 12 and 15 rows (kv 262144: 1367 -> 1285 us, 3055 -> 2973); 18 rows lose (1926 -> 1975). OPTLOG 219.
+    static constexpr bool BLOCK_T = Q4P_KNOB(BLOCKT, (RQ <= 6 || RQ == 12 || RQ == 15) ? 1 : 2) == 1;
     // PV: a thread owns DPT output dimensions for the RQ rows of its group, over every NPG-th position.
     // 15 and 18 rows: 8 (15: 3403 -> 3074 us, 18: 1931 -> 1873 at kv 262144; 24 rows: 2488 -> 4939). OPTLOG 204.
     static constexpr int DPT    = Q4P_KNOB(DPT, R <= 18 ? 8 : 4);
