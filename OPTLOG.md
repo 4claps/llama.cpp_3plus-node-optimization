@@ -8254,3 +8254,21 @@ output element: 8.1 us per call (launch-bound), the same copy. CONCAT eval 177/1
 
 Also: p_min 0.1 / 0.2 / 0.3 at 260k with sampled drafts give identical acceptance and tokens per
 cycle (the depth-scheduled p_cum rule stops drafts first). Kept at 0.2.
+
+## Attempt 214 — the delta-net state gather read in place by the kernel: kept
+
+build_rs gathers each sequence's recurrent state from its cache slot with a GET_ROWS before the
+gated delta net reads it: a ~3 MB copy per delta-net layer per pass (~9 us each at bandwidth). The
+CUDA executor now skips a single-row F32 GET_ROWS whose only consumer, through reshape views, is a
+gated delta net's state input, and registers it. The kernel reads the state in place through the
+row index, on the device, with no sync. Each block reads its own (head, column) slice before
+writing that slice, so this is safe even when the snapshot slot written back is the source row.
+`GGML_CUDA_GDN_GATHER=0` turns it off.
+
+Text is byte-identical with it on and off at 2k and 260k. GATED_DELTA_NET eval 36/36. Op profile
+(llama-bench pp5 @ d2048, GPU0, same number of passes): GET_ROWS 367.6 -> 152.1 ms (the state
+gathers are gone), GATED_DELTA_NET 396.2 -> 419.3 ms (reading from the cache rows), net -0.46 ms per
+verify pass.
+
+Also: draft temperature 0.7 vs 1.0 at 260k, 12 requests each: 3.19 vs 3.22 tokens per cycle (no
+difference). Kept at 1.0.

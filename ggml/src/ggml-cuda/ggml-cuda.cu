@@ -3690,6 +3690,74 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// GET_ROWS that gathers recurrent states whose only consumer, through reshape views, is a gated delta
+// net's state input: skip it and let the kernel read the rows in place (gated_delta_net.cuh).
+// GGML_CUDA_GDN_GATHER=0 turns it off.
+static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_CUDA_GDN_GATHER");
+        return !s || atoi(s) != 0;
+    }();
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!enabled || node->op != GGML_OP_GET_ROWS || (node->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            node->type != GGML_TYPE_F32 || node->src[0]->type != GGML_TYPE_F32 || node->src[1]->type != GGML_TYPE_I32 ||
+            node->src[0]->nb[0] != sizeof(float) || !ggml_is_contiguous(node) || !ggml_is_contiguous(node->src[1]) ||
+            node->ne[2] != 1 || node->ne[3] != 1 || node->src[0]->ne[2] != 1 || node->src[0]->ne[3] != 1 ||
+            node->src[1]->ne[0] != node->ne[1]) {
+        return false;
+    }
+    const ggml_tensor * aliases[8] = { node };
+    int n_alias = 1;
+    auto is_alias = [&](const ggml_tensor * t) {
+        for (int a = 0; a < n_alias; ++a) {
+            if (t == aliases[a]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const ggml_tensor * gdn = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        bool uses = false;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (n->src[k] && is_alias(n->src[k])) {
+                uses = true;
+            }
+        }
+        if (n->view_src && is_alias(n->view_src)) {
+            uses = true;
+        }
+        if (!uses) {
+            continue;
+        }
+        if ((n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) && n->view_offs == 0 &&
+                ggml_nbytes(n) == ggml_nbytes(node) && ggml_is_contiguous(n) && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            if (n_alias == 8) {
+                return false;
+            }
+            aliases[n_alias++] = n;
+            continue;
+        }
+        if (n->op == GGML_OP_GATED_DELTA_NET && gdn == nullptr && is_alias(n->src[5])) {
+            for (int k = 0; k < 5; ++k) {
+                if (n->src[k] && is_alias(n->src[k])) {
+                    return false;
+                }
+            }
+            gdn = n;
+            continue;
+        }
+        return false; // any other consumer needs the gathered copy
+    }
+    if (gdn == nullptr) {
+        return false;
+    }
+    ggml_cuda_gdn_gather_register(gdn, (const float *) node->src[0]->data, (const int32_t *) node->src[1]->data,
+                                  node->src[0]->nb[1] / sizeof(float));
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4693,6 +4761,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     CUDA_CHECK(cudaEventRecord(prof_e0, cuda_ctx->stream()));
                 }
 
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cgraph, i)) {
+                    continue; // the gated delta net reads the rows in place
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (prof && nodes_to_skip != 0) {
@@ -4823,6 +4895,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // activation is only valid within a single graph evaluation.
     cuda_ctx->mmvq_q8_1_invalidate();
     ggml_cuda_mmvq_f16_invalidate(*cuda_ctx);
+    ggml_cuda_gdn_gather_reset();
 
     ggml_cuda_set_device(cuda_ctx->device);
 
