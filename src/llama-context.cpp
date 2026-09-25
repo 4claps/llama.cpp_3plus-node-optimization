@@ -1398,7 +1398,9 @@ static llama_ubatch_prof g_ubatch_prof;
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     const int64_t tp0 = g_ubatch_prof.on ? ggml_time_us() : 0;
-    if (g_ubatch_prof.on && ubatch.n_tokens > 1) {
+    static const int prof_ntok = getenv("LLAMA_UBATCH_PROFILE") ? atoi(getenv("LLAMA_UBATCH_PROFILE")) : 0; // 1: single-token ubatches only
+    const bool prof_this = prof_ntok == 1 ? ubatch.n_tokens == 1 : ubatch.n_tokens > 1;
+    if (g_ubatch_prof.on && prof_this) {
         ggml_backend_sched_synchronize(sched.get()); // separate the previous ubatch's GPU time
         g_ubatch_prof.sync += ggml_time_us() - tp0;
     }
@@ -1486,7 +1488,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
-    if (g_ubatch_prof.on && ubatch.n_tokens > 1) {
+    if (g_ubatch_prof.on && prof_this) {
         const int64_t tp4 = ggml_time_us();
         auto & P = g_ubatch_prof;
         P.build += tp2 - tp1; P.inputs += tp3 - tp2; P.compute += tp4 - tp3;
