@@ -10867,6 +10867,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the fp16-product / fp32-accumulation prefill GEMM on Pascal (gemm-fold.cu) takes >= 1024 rows
+    // past the mmvq widths; 1028 rows and 130 columns leave partial tiles
+    for (int m : {1024, 1028}) {
+        for (int n : {9, 130}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048, 64, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 1024, 130, 4096, {1, 1}, {1, 1}));
+
     // Prefill-shaped correctness at the same operating shape. The sweep above is nb=1, which
     // never reaches the cuBLAS-GEMM attention path: that path fires only at Q->ne[1] >= 128 and
     // K->ne[1] >= 4096, i.e. on essentially every long-context prefill ubatch, and it is ON by

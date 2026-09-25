@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16.cuh"
+#include "ggml-cuda/gemm-fold.cuh"
 #include "ggml-cuda/cpy-batch.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1712,7 +1713,17 @@ static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0,
 }
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc);
+    ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc);
+
+    // Pascal: fp16 products with fp32 accumulation instead of cuBLAS's whole-K fp16 accumulation
+    if (compute_type == GGML_TYPE_F16) {
+        if (ggml_cuda_gemm_fold_try(ctx, src0, src1, dst)) {
+            return;
+        }
+        if (ggml_cuda_gemm_fold_wants_f32(ctx, src0, src1, dst)) {
+            compute_type = GGML_TYPE_F32;
+        }
+    }
 
     switch (compute_type) {
         case GGML_TYPE_F32:

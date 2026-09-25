@@ -8362,3 +8362,57 @@ byte-identical to mode 3, but 260k 109.4 / 103.5 -> 109.9 / 104.5 ms per cycle, 
 fell 816 -> 638 MiB from the instantiated graphs. An accidental run of the *old* library with mode 4
 (every graph captured, width frozen) showed ~94 ms per cycle, but that was wrong output: the frozen
 width made the verify compute fewer columns (acceptance collapsed). Reverted; mode 3 stays.
+
+## Attempt 221 — prefill GEMM: fp16 products, fp32 accumulation (gemm-fold.cu): kept
+
+Prefill's weight matmuls went to cuBLAS COMPUTE_16F (MMQ is never chosen on sm_60), which
+accumulates each output over the whole of K in fp16. `gemm-fold.cu` replaces that on Pascal:
+128x128 tiles, 256 threads, an 8x8 output tile per thread held as half2 accumulators (lanes =
+even/odd k), and every 128 k2 steps (256 values of K) the two lanes are added (HADD2) and moved
+into fp32 by an integer half->float conversion (arithmetic shift 3 + mask gives value*2^-112; the
+rebias is undone once in the epilogue): 4 instructions per output per fold, where F2F would be
+quarter rate. Chains restart with HMUL2 instead of zeroing. The smem stores are XOR-swizzled
+(the plain [k2][m] layout had a 4-way conflict: -3%). Activations are prescaled per column by a
+power of 2 (exact). Outputs are rounded to f16 (mode 2, default), which keeps the tensor-parallel
+exchange compressed; fp32 outputs (mode 1) measured no more accurate. Matmuls under 1024 rows
+(K/V 512, the GDN 24-row projections) go to fp32 cuBLAS instead: a 128-row tile left most SMs
+idle there (5120x24 went 0.40 -> 0.88 ms per call in the fold kernel, 0.29 in fp32).
+Knobs: `GGML_CUDA_GEMM_FOLD=0|1|2`, `_K2` (16/32/64/128), `_MINROWS`, `_XEXP`.
+
+Harness (p100-handoff/tools/gemm-harness, real q6_K slice 8704x5120, N=1024, vs fp64):
+
+    cuBLAS f16 ALGO6   NMSE 1.17e-5   7.0-7.3 ms
+    cuBLAS f32         NMSE 1.5e-12   12.3-13.1 ms
+    fold every 64      NMSE 6.7e-7    (k2=32)
+    fold every 128     NMSE 1.38e-6   7.67 ms with the swizzle (7.91 without)
+    no fold at all     NMSE 5.0e-5    7.55 ms (the loop itself is ~cuBLAS speed)
+
+Dead ends: a two-level fold (fp16 level-2 accumulator, convert every 8 tiles) is as accurate as
+fold-64 for half the fold instructions, but 255 registers and a spill: 8.34 ms. 128-thread blocks
+(2 per SM) 8.97 ms. A K-contiguous smem layout reading 4 k2 per LDS.128 pinned 255 registers:
+9.1-9.7 ms.
+
+Model level, KLD against an all-fp32 base (fp32 matmuls + `GGML_CUDA_FA_GEMM_PREC=32`, -ub 1024),
+8 chunks x 4096, gate corpus:
+
+    today's f16 (FOLD=0)                         KLD 0.001521   ln PPL ratio +0.000425 +- 0.000494
+    fold every 256 (default)                     KLD 0.001249   +0.000051 +- 0.000453
+    fold every 128, f16 out                      KLD 0.001211   +0.000021 +- 0.000440
+    fold every 64                                KLD 0.001191
+    fold every 128, fp32 out                     KLD 0.001192
+    fp32 matmuls, fp16 attention                 KLD 0.000372
+    all-fp32, -ub 512 (reassociation only)       KLD 0.000967
+    all-fp32, -ub 2048 (reassociation only)      KLD 0.000606
+    fp32 GEMM, weights rounded to f16            KLD 0.001150
+    fp32 GEMM, activations rounded to f16        KLD 0.001101
+    fp32 GEMM, both rounded                      KLD 0.001142
+
+So the accumulation was ~half of the f16 path's distance from fp32 and is gone; what is left is the
+f16 rounding of the *inputs*, which any f16-multiply kernel has (either input alone gives the same
+~0.0011: the model spreads any perturbation at f16 resolution to about that KLD). The prescale
+target made no difference (-1, 3, 8, 12). Exact inputs would need an x_hi + x_lo split: twice the
+math.
+
+Speed, llama-bench pp1024 -ub 1024 (ABBA, warm cards): FOLD=0 397/383 -> fold-256 373/371
+(-6%); fold-128 367/361. pp1024 @ d32768: 234/247 -> 231/224 (-5%, noisy). Decode is untouched
+(mul_mat_vec_q / mmvq-f16). Per op in the model: ffn 5120->8704 6.8 -> 7.9 ms before the swizzle.
