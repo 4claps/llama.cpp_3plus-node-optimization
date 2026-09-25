@@ -8278,3 +8278,20 @@ dim-0 concat kernel (attempt 213) now reads src0's rows through the index when i
 skipped. A registered concat always takes that kernel. The GET_ROWS left the op profile entirely
 (152 ms -> 0 in the same run length; CONCAT unchanged at 161 ms), about -0.37 ms per verify pass
 more. Text byte-identical on and off at 2k and 260k; CONCAT eval 177/177.
+
+## Attempt 215 — fp16 verify matvec for small matrices too: one row per warp, split K below 256 rows: kept
+
+The integer path was slow on the small verify matmuls: the 512-row K/V projections at ~35 us (32 per
+pass) and the 24-row delta-net alpha/beta projections at ~13 us (96 per pass). The fp16 path now
+takes every q6_K matrix of >= 16 rows at 2-5 columns:
+- >= 3072 rows: 2 warps x 4 rows per block, as before;
+- 256..3071 rows: 1 row per warp, for 4x the blocks;
+- < 256 rows: the 4 warps of a block split K over one row (every 4th window each), and warp 0 adds
+  the partials in a fixed order.
+
+Op profile (pp5 @ d2048, per call): 5120x512 35 -> ~22 us, 5120x24 12.9 -> 8.7 us. Split-K over 4
+rows for the 512-row case was worse (23.7). quick.sh (2k verify pass): ~50.5 -> 48.97 ms. q6_K
+eval 54/54 (the m=16 cases now take the split-K kernel).
+
+Also: an SSE2 fill for the single-sequence f16 mask (libllama is built without -march): 122 -> 69 us
+per row at 260k, byte-identical text.
