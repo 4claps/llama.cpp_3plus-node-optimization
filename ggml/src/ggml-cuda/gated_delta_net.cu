@@ -320,6 +320,17 @@ void ggml_cuda_gdn_gather_register(const ggml_tensor * gdn, const float * base, 
     gdn_gathers[gdn] = { base, idx, row };
 }
 
+bool ggml_cuda_gdn_gather_lookup(const ggml_tensor * consumer, const float ** base, const int32_t ** idx, int64_t * row) {
+    auto it = gdn_gathers.find(consumer);
+    if (it == gdn_gathers.end()) {
+        return false;
+    }
+    *base = it->second.base;
+    *idx  = it->second.idx;
+    *row  = it->second.row;
+    return true;
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];

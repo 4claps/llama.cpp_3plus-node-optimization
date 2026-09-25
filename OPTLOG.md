@@ -8272,3 +8272,9 @@ verify pass.
 
 Also: draft temperature 0.7 vs 1.0 at 260k, 12 requests each: 3.19 vs 3.22 tokens per cycle (no
 difference). Kept at 1.0.
+
+Then the conv-state gather as well: its only consumer is the delta-net conv concat, and the flat
+dim-0 concat kernel (attempt 213) now reads src0's rows through the index when its GET_ROWS was
+skipped. A registered concat always takes that kernel. The GET_ROWS left the op profile entirely
+(152 ms -> 0 in the same run length; CONCAT unchanged at 161 ms), about -0.37 ms per verify pass
+more. Text byte-identical on and off at 2k and 260k; CONCAT eval 177/177.

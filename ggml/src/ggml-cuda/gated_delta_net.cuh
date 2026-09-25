@@ -19,3 +19,4 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
 // in place through the row index (on the device, no sync). See ggml_cuda_try_gdn_state_gather.
 void ggml_cuda_gdn_gather_reset();
 void ggml_cuda_gdn_gather_register(const ggml_tensor * gdn, const float * base, const int32_t * idx, int64_t row);
+bool ggml_cuda_gdn_gather_lookup(const ggml_tensor * consumer, const float ** base, const int32_t ** idx, int64_t * row);

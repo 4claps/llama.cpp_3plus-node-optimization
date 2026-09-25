@@ -1,4 +1,5 @@
 #include "concat.cuh"
+#include "gated_delta_net.cuh"
 
 #include <stdint.h>
 #include <limits>
@@ -163,7 +164,8 @@ static __global__ void concat_non_cont_dim0_flat(
         const int64_t ne00, const int64_t ne01, const int64_t ne02,
         const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
         const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
-        const int64_t ne0, const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+        const int64_t ne0, const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3,
+        const int32_t * src0_rows, const uint64_t src0_row_bytes) {
     const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (idx >= n) {
         return;
@@ -173,14 +175,22 @@ static __global__ void concat_non_cont_dim0_flat(
     const int64_t i1 = r % ne01; r /= ne01;
     const int64_t i2 = r % ne02;
     const int64_t i3 = r / ne02;
-    const T * x = i0 < ne00 ? (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00)
+    // src0_rows: src0 was a gather of cache rows (one per i2), read in place (ggml_cuda_try_gdn_state_gather)
+    const char * s0 = src0_rows ? src0 + (int64_t) src0_rows[i2]*src0_row_bytes : src0 + i3*nb03 + i2*nb02;
+    const T * x = i0 < ne00 ? (const T *)(s0 + i1*nb01 + i0*nb00)
                             : (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
     *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
 }
 
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
-    if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+    // src0 gathered in place (its GET_ROWS was skipped): only the flat kernel below handles that
+    const float *   g_base = nullptr;
+    const int32_t * g_idx  = nullptr;
+    int64_t         g_row  = 0;
+    const bool gathered = ggml_cuda_gdn_gather_lookup(dst, &g_base, &g_idx, &g_row);
+    GGML_ASSERT(!gathered || (dim == 0 && dst->ne[0] <= 64));
+    if (!gathered && dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;
@@ -193,7 +203,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                     ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2],
                     ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2], dim, stream);
         }
-    } else if (dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+    } else if (!gathered && dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         const size_t size0 = ggml_nbytes(src0);
         const size_t size1 = ggml_nbytes(src1);
 
@@ -203,11 +213,12 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         const int64_t n = ggml_nelements(dst);
         const int nblk = (int) ((n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE);
         concat_non_cont_dim0_flat<T><<<nblk, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
-            (const char *) src0->data, (const char *) src1->data, (char *) dst->data, n,
+            gathered ? (const char *) g_base : (const char *) src0->data, (const char *) src1->data, (char *) dst->data, n,
             src0->ne[0], dst->ne[1], dst->ne[2],
             src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
             src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
-            dst->ne[0], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            dst->ne[0], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
+            gathered ? g_idx : nullptr, (uint64_t) g_row*sizeof(float));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 

@@ -3739,6 +3739,11 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
             aliases[n_alias++] = n;
             continue;
         }
+        if (n->op == GGML_OP_CONCAT && gdn == nullptr && is_alias(n->src[0]) && !is_alias(n->src[1]) &&
+                ggml_get_op_params_i32(n, 0) == 0 && n->ne[0] <= 64 && n->type == GGML_TYPE_F32) {
+            gdn = n; // the narrow dim-0 concat kernel reads src0 rows through the index (concat.cu)
+            continue;
+        }
         if (n->op == GGML_OP_GATED_DELTA_NET && gdn == nullptr && is_alias(n->src[5])) {
             for (int k = 0; k < 5; ++k) {
                 if (n->src[k] && is_alias(n->src[k])) {
