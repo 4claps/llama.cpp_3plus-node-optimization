@@ -1844,6 +1844,7 @@ private:
 
             if (spec) {
                 slot.spec_dist_rng.seed(common_sampler_get_seed(slot.smpl.get()) ^ 0x9e3779b9u);
+                common_speculative_set_seed(spec.get(), common_sampler_get_seed(slot.smpl.get()) ^ 0x5eed5eedu);
             }
 
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {

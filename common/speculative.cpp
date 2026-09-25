@@ -166,6 +166,10 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
+    // reseed any randomness the draft uses (a sampled draft), so a request's drafts do not depend on
+    // the requests before it
+    virtual void set_seed(uint32_t /*seed*/) {}
+
     virtual bool process(const llama_batch & batch) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
@@ -1375,6 +1379,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return s ? (float) atof(s) : 0.0f;
     }();
     std::mt19937 sample_rng{0x5eed};
+
+    void set_seed(uint32_t seed) override {
+        sample_rng.seed(seed);
+    }
 
     // Also stop drafting once the product of the drafted tokens' top-1 probabilities would fall
     // below a threshold. The draft is well calibrated (OPTLOG 192), so this trims the verify to the
@@ -2931,6 +2939,15 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+void common_speculative_set_seed(common_speculative * spec, uint32_t seed) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->set_seed(seed);
+    }
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {

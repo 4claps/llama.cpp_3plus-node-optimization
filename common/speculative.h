@@ -84,6 +84,9 @@ bool common_speculative_draft_reads_prompt(const common_speculative * spec);
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
 // optionally call once at the beginning of a new generation
+// reseed the draft's own randomness (sampled drafts), e.g. from the request's sampling seed
+void common_speculative_set_seed(common_speculative * spec, uint32_t seed);
+
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context

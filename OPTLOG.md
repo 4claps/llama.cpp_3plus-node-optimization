@@ -8206,3 +8206,21 @@ test-backend-ops, 5 columns, us:
     3072x5120  60.9 ->  59.1   5120x3072  57.2 ->  50.0   6144x5120 97.1 -> 95.9
 
 quick.sh (2k verify pass): 52.75 -> 51.45 ms. q6_K eval 54/54. The arithmetic is unchanged.
+
+## Attempt 211 — reseed the sampled draft's RNG per request: kept (reproducibility)
+
+Two cold runs of the same 260k questions and seeds disagreed in text from the first request.
+Same-binary runs with the same request sequence are byte-identical (checked at 2k and 260k). The
+cause is request history: the MTP draft's sampling RNG was one stream per server. The benchmark
+visits snapshots in manifest order, so a run with more 2k requests first drew different draft
+samples at 260k. The output distribution was never affected (acceptance and residual draws use a
+per-request seed), but tokens per cycle, and so t/s, depended on what ran before.
+`common_speculative_set_seed` now reseeds the draft from the request's sampler seed.
+
+One benign history dependence remains: after a restore, the first request at a new depth can place
+KV cells at different indices, which regroups fp32 sums in attention. Compare runs with identical
+request sequences (as the ABBA runs do).
+
+Cold 260k, 10 requests (5 seeds), before/after the matvec occupancy change (different request
+histories, so this includes draft-sample noise): 29.90 / 28.75 t/s, 109.1 / 108.6 ms per cycle.
+Same run, 2k: 49.22 t/s, 64.3 ms per cycle, 3.16 tokens per cycle.
