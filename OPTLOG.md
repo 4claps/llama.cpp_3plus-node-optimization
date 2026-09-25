@@ -8331,3 +8331,13 @@ cycle, 3.04 tokens per cycle; 10 requests at 2k: 49.39 t/s, 60.1 ms, 2.97.
 Gates on 3ba045898 (full rebuild, cooled cards): tg256 32.02 +- 0.18 t/s (was ~31.3; single-token
 CUDA graphs help plain decode too), perplexity 2.6101 +- 0.0198 (unchanged, in band), FLASH_ATTN_EXT
 eval passes.
+
+## Attempt 218 — depth-scheduled draft cutoff 0.3 -> 0.22: kept
+
+The p_cum rule (attempt 198) was tuned against the old verify cost. With the verify cheaper, a
+wider verify pays at depth. 260k, ABBA, 2 questions x 3 seeds per arm:
+
+    0.3  28.36 t/s  2.98 tok/cycle  105.3 ms     vs 0.22  29.22  3.14  107.1   (warm)
+    0.22 26.20      3.14            119.7        vs 0.15  25.34  3.22  127.0   (hot)
+
+The schedule still ramps from 0 below 16k to its full value at 48k.

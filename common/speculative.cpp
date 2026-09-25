@@ -1389,7 +1389,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // tokens likely to be accepted. It pays only deep in the context, where every extra verify token
     // costs a full pass of attention over the KV cache; at short context a wider verify is nearly
     // free and a shorter draft only loses tokens (OPTLOG 198). So the threshold follows the depth:
-    // 0 below 16k, rising to 0.3 at 48k and beyond. Without a fixed-width verify every change of
+    // 0 below 16k, rising to 0.22 at 48k and beyond. Without a fixed-width verify every change of
     // draft length rebuilds the target graph (~26 ms), so the server enables this together with its
     // padded verify (LLAMA_SPEC_PAD). LLAMA_SPEC_P_CUM=<p> fixes the threshold instead.
     float p_cum_env = [] {
@@ -1406,7 +1406,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return 0.0f;
         }
         const float t = std::clamp((float) (pos - 16384) / (float) (49152 - 16384), 0.0f, 1.0f);
-        return 0.3f*t;
+        // 0.22 at depth (was 0.3): with the cheaper verify of OPTLOG 204-217, a wider verify pays
+        // (260k, 12 requests each: 0.3 28.36, 0.22 29.22, 0.15 below 0.22)
+        return 0.22f*t;
     }
 
 
