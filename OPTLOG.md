@@ -8542,3 +8542,18 @@ streams (acceptance 0.000); the narrow path copies async like the full one.
 Mode 3 plus graphs of up to 8 tokens, keyed by the padded verify's active-token count. Texts
 byte-identical to mode 3, but 2k depth-bench ABBA (75-77 C) mode 3: 59.4/57.5, 58.1/56.3 ms/cycle;
 mode 4: 60.2/58.4, 60.8/60.7, and GPU0 min free 704 -> 578-606 MiB. Slower and costs VRAM: reverted.
+
+## Attempt 228: goal2 merges (ops2 small ops, vattn2 q4p verify attention) and hot results -- 2026-09-26
+
+Merged goal2/ops2 (bit-identical small-op fusions, verify pass 47.5 -> 46.6 ms) and goal2/vattn2
+(q4p verify attention: 260k nb=5 call 2.44 -> 1.93 ms in-server; FA eval 4019/4019; verify-path KLD
+0.001127, was ~0.00117). goal2/mv3 (big-path matvec) was bit-exact but not faster: dropped.
+
+ABBA old (build-sweep0925b) vs new, depth-bench --restore --extra-chars 4100, ms/cycle:
+| arm (temp C) | 2k | 260k | 260k prefill t/s |
+|---|---|---|---|
+| A old (36-43) | 63.5, 61.8 | 100.9, 107.1 | 97.7, 97.2 |
+| B new (58-64) | 56.9, 55.1 | 88.7, 85.4 | 123.4, 122.2 |
+| B new (67-73) | 57.5, 55.8 | 92.8, 92.3 | 120.8, 115.5 |
+| A old (72-77) | 68.6, 69.7 | 116.8, 120.6 | 91.6, 87.7 |
+Hot new build (72-77 C), 2 seeds x 2 questions: 2k avg 48.4 t/s, 260k avg 30.2 t/s, prefill ~105 t/s.
