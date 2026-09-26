@@ -17,9 +17,12 @@ It tracks upstream by merging. The last merge was upstream `f46bc30cb`
 | decode at 229k context, 2026-09-22 build | — | 21.5 t/s plain, 23.2 with MTP |
 | perplexity (gate corpus, `-c 4096`) | — | **2.6101 ± 0.0198** (band 2.6209 ± 0.0199) |
 
-The speed didn't cost accuracy. Measured against an all-fp32 run, this fork's prefill matmuls are
-slightly *closer* to fp32 than upstream's (+0.00343 nats/token against +0.00414). Upstream's
-default cuBLAS algorithm on Pascal is both slower and less accurate.
+The speed didn't cost accuracy. The P100 multiplies in fp16 at twice its fp32 rate, and this fork
+uses that everywhere the work is compute-bound (prefill matmuls, the MTP verify matvec, decode and
+verify attention), but never accumulates long sums in fp16: partial sums move into fp32 every few
+dozen values. Against an all-fp32 run, the prefill path now reads KLD 0.00125 where upstream's fp16
+cuBLAS reads 0.00152, and fp32 itself scatters 0.0006-0.001 just from summing in a different order.
+Perplexity 2.6096, all-fp32 2.6095. [CHANGES.md §11](CHANGES.md) has the method.
 
 ## Documents
 
@@ -40,8 +43,11 @@ default cuBLAS algorithm on Pascal is both slower and less accurate.
   exactly instead of padding it, and fp16 accumulation is folded to fp32 once per tile.
 - **Long-context prefill** uses a cuBLAS-GEMM attention path.
 - **Tensor parallel.** Partials cross PCIe as f16 when that's lossless, on a dedicated copy stream.
-- **Pascal fp16 matmuls** request cuBLAS `ALGO6`, which is 10x more accurate and faster at the
-  common sizes.
+- **fp16 math with fp32 accumulation.** Prefill matmuls (`gemm-fold.cu`), the 2-5 token verify
+  matvec (`mmvq-f16.cu`) and decode/verify attention (`fattn-q4p.cuh`) multiply on the fp16 pipe
+  and fold their sums into fp32, with quantized values entering as exact integers.
+- **MTP speculative decoding** with sampled drafts and the lossless speculative-sampling rule, a
+  fixed-width verify, a draft length that follows the context depth, and a K/V-only catch-up.
 
 ## Caveats
 

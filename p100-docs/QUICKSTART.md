@@ -21,7 +21,8 @@ the model.
 
 **Text only:**
 
-    GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=0 \
+    GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=3 \
+    LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20 \
     llama-server \
       -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
@@ -57,7 +58,8 @@ the model.
 | `-ubd 64` | the draft context's own ubatch. Without it the draft inherits `-ub` and reserves a second copy of the attention mask, which runs out of memory at full context. 64 is also faster than 256 (23.0 against 21.4 t/s) |
 | `-ctkd q4_0 -ctvd q4_0` | q4_0 for the *draft's* KV cache, which is otherwise f16. 151 MB instead of 537, at no measurable cost to acceptance |
 | `GGML_CUDA_P2P=1` | direct copies between the cards. Without it they go through host memory |
-| `GGML_CUDA_GRAPHS_PRE_VOLTA=0` | keeps CUDA graphs off. They work on Pascal, but at full context and `-ub 2048` their instantiation runs VRAM out. Off costs ~1.4% of decode |
+| `GGML_CUDA_GRAPHS_PRE_VOLTA=3` | CUDA graphs for single-token graphs only (the MTP draft steps). Full graphs (`1`) run VRAM out at full context when instantiated for the big verify and prefill graphs; `0` turns them off entirely (OPTLOG 212) |
+| `LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20` | the MTP draft samples from its own top 20 at temperature 1.0, and the verify uses the speculative-sampling rule (accept with min(1, p/q), else draw from the residual). The output distribution is exactly the model card's sampling; only acceptance changes: +15% tokens per cycle at 2k, +8% at 260k (OPTLOG 202) |
 | `--jinja` | use the chat template stored in the gguf. Tool calls need it |
 | `--tools all`, `--mcp-servers-config` | the server's built-in tools, plus MCP servers from that file |
 | `--host 0.0.0.0 --port 8080` | listen on the LAN |
@@ -116,7 +118,8 @@ tokens: `-n 128` is dominated by a 2-3 s first-token cost and reads far too low.
 
 | variable | effect |
 |---|---|
-| `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` | **The accuracy mode.** Prefill matmuls in fp32 instead of fp16. That removes the only measurable gap to an all-fp32 run: perplexity 2.6191 → 2.6095, paired per-token difference from +0.0034 nats (t 7.4) to indistinguishable. Costs ~40% of prefill; decode is unchanged |
+| `GGML_CUDA_GEMM_FOLD=0` | prefill matmuls back on cuBLAS fp16 (whole-K fp16 accumulation). The default since 2026-09-25 is the fold kernel: fp16 products, fp32 accumulation, ~6% slower at short context and 4x more accurate per op; KLD against an all-fp32 run 0.00152 → 0.00125, where fp32 with a different summation order alone gives 0.0006-0.001 (OPTLOG 221). `=1` keeps fp32 outputs (no more accurate, and it turns off the f16 peer exchange) |
+| `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` | prefill matmuls fully in fp32 cuBLAS. Exact, and ~40% slower prefill. Since the fold kernel it no longer buys a measurable difference in perplexity |
 | `GGML_CUDA_FA_GEMM=0` | turns off the cuBLAS-GEMM attention path used for long prefill (on by default at batch ≥ 128 and KV ≥ 4096). The tile kernel is more accurate per op but slower at depth. Perplexity can't tell them apart |
 | `GGML_CUDA_FA_GEMM_PREC=32` | fp32 accumulation inside the GEMM attention path. Slower (-11% to -27% prefill) and buys nothing measurable |
 | `GGML_CUDA_FA_TILE_Q4_0=0` | turns off direct q4_0 dequant in the tile kernel. For A/B testing only |

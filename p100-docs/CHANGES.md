@@ -190,6 +190,35 @@ early at `--spec-draft-p-min 0.2`, so every verify was `n_max + 1` tokens wide, 
 +17% at 260k (24.1 against 20.6 t/s) but −3% at 2k. The draft rule now shortens drafts at depth
 by itself, so `qwen-server` keeps 4.
 
+## 11. fp16 math with an accuracy fix, and the MTP cycle (2026-09-24/25)
+
+The P100 runs fp16 multiply-adds (HFMA2) at twice the fp32 rate, but plain fp16 accumulation is
+noisy. Every kernel here keeps fp16 *products* and moves the running sums into fp32 every few dozen
+values, so the error stops growing with the length of the sum. The half-to-float step is done with
+integer instructions (shift and mask, the rebias folded into a later multiply), because the F2F
+conversion runs at a quarter rate on sm_60. Quantized values enter as exact small integers
+(PRMT builds half 1024 + n, one subtraction leaves n exactly). OPTLOG attempts 201-222.
+
+| commit | change | effect |
+|---|---|---|
+| `5b46e14ca` | serving uses the model card's sampling (`--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0`) | every MTP figure before it was measured at temp 0.3 |
+| `dbe945b03`, `eb1bf26fe` | **sampled MTP drafts, verified with the speculative-sampling rule** (accept with min(1, p/q), else draw from the normalized residual) | lossless: the output distribution is the target's. +15% tokens per cycle at 2k, +8% at 260k |
+| `ef660212c` … `6554f989d` | **fp16 q6_K matvec for the 2-5 token verify** (`mmvq-f16.cu`): exact 6-bit weights, power-of-2 prescaled activations, short HFMA2 chains folded to fp32 | verify pass −7-10%; NMSE vs fp64 4.6e-7, where the q8_1 integer path gave 1.3e-4; verify-path KLD vs fp32 0.00354 → 0.00162 |
+| `25ff35ec5`, `75f93da7b`, `2b511b10f`, `e7a59fb1b` | q4p: the 5-token verify over half the GQA group per block, DPT 8, parallel softmax denominators | 5-token call at 260k 3.55 → ~2.95 ms in the server |
+| `c4742ebe2` | the MTP catch-up pass stores K/V only | −4 ms per cycle at 260k |
+| `5d27ef852` | CUDA graphs for single-token graphs only (`GGML_CUDA_GRAPHS_PRE_VOLTA=3`), the serving default | the draft steps without the VRAM cost of graphing the verify |
+| `4593db3cf`, `2948e24bf`, `463420e47`, `4cb43bf86` | delta-net state and conv-state read in place, a flat concat, batched conv-state snapshots | ~−1.5 ms per verify |
+| `ebc43ddf6`, `3ba045898`, `beee227db`, `b3f30b544` | one sync per split for inputs, async host-input uploads, a one-pass SSE2 mask fill | host time per cycle |
+| `fc1c9056f` | **prefill GEMM with fp16 products and fp32 accumulation** (`gemm-fold.cu`), replacing cuBLAS COMPUTE_16F on Pascal. 128x128 tiles, half2 chains folded every 256 values of K, XOR-swizzled smem. Matmuls under 1024 rows go to fp32 cuBLAS | matmul NMSE vs fp64 1.2e-5 → 1.4e-6. KLD vs an all-fp32 run 0.00152 → 0.00125 (fp32 with only a different summation order: 0.0006-0.001). Perplexity 2.6101 → 2.6096 (all-fp32: 2.6095). pp1024 −6%, less at depth |
+| `0be3a47d9` | **q4p attention in fp16 with fp32 folds** (decode and verify). QK: two KV positions per HFMA2, one chain per 32-dim block folded through the block scale. PV: P as half2, chains over dimension pairs folded every 32 positions | at 262144: 5-token verify 3128 → 2682 µs, 1 token 942 → 835. 260k MTP 25.93 → 27.11 t/s (ABBA, hot cards). Verify-path KLD vs fp32 unchanged (0.00115 → 0.00114) |
+
+**What is left of the distance to fp32.** With accumulation fixed, the remaining difference is
+the fp16 rounding of the *inputs* (weights and activations). Rounding either one alone in an
+otherwise fp32 GEMM gives the same KLD (~0.0011) as the fold kernel: at this model's sensitivity,
+any perturbation at fp16 resolution spreads to about that level, and fp32 with a different
+summation order lands at 0.0006-0.001. Removing input rounding would need a hi/lo split of the
+activations, i.e. twice the math.
+
 ## Known gaps
 
 - **`GGML_CUDA_DEVICES` above the physical GPU count isn't reproducible.** At 3 virtual devices,
@@ -198,13 +227,11 @@ by itself, so `qwen-server` keeps 4.
   attempt 153 §8c has the data.
 - **Deepest prefill is ~10% below its best measurement.** `pp2048` at `-d 262144` measured 95.1
   t/s during tuning and 85.4 later. Possibly thermal; not bisected.
-- **Attention at depth is compute-bound, not bandwidth-bound.** q4p (§10) is that
-  register-resident kernel, and at 262144 it runs the 5-token verify at ~44% of the P100's FFMA
-  peak. It uses 233-255 registers, so one block fits per SM. There may be another 1.5x in it,
-  but not from tuning knobs; attempt 181 swept those. Time attention changes in the server:
-  the op test runs attention alone at 1328 MHz, where the server's power cap holds 1189. The
-  5-token kernel is latency-bound and takes the same time at both clocks, so the op test
-  flatters changes that trade latency for instructions (OPTLOG 190).
+- **Attention at depth is compute-bound, not bandwidth-bound.** q4p (§10, §11) runs the 5-token
+  verify at 262144 in 2.68 ms per call with fp16 products; the cache read alone would take ~0.35.
+  It is at 255 registers and one block per SM, so what is left is latency, not arithmetic. Time
+  attention changes in the server: the op test runs attention alone at 1328 MHz, where the
+  server's power cap holds 1189 (OPTLOG 190).
 - **Prefill attention still accumulates in fp16.** The GEMM path (§3, long-context prefill)
   accumulates QKᵀ over the 256 dimensions in fp16, and PV in fp16 within each 2048-key chunk,
   folded into an fp32 running output. Perplexity can't see it (OPTLOG 152), but it is the one
