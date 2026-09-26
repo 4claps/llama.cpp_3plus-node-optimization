@@ -296,6 +296,869 @@ static __global__ void fattn_gemm_q_to_f16(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Fold path (GGML_CUDA_FA_FOLD, default on for a q4_0 K/V cache): two hand-written GEMM kernels in
+// the style of gemm-fold.cu (fp16 HFMA2 products, half2 chains folded into fp32) replace
+// dequant + cuBLAS QK + softmax + cuBLAS PV + rescale.
+//
+//   fa_fold_qk:  S tile = K Q^T for 128 keys x 128 query columns, k = D. The epilogue applies the
+//                mask, takes the max of the tile per column (m_t), writes P = exp(4S + mask - m_t)
+//                in f16 and the tile's fp32 row sum l_t. S never reaches memory.
+//   fa_fold_pv:  O = O*corr + sum_t exp(m_t - M) * (V P_t), with M the new running max. The fp16
+//                chains restart at every 128-key tile and are folded into fp32 with the tile's
+//                factor, so the rescale costs one FMUL per fold.
+//
+// Precision against the cuBLAS path: QK^T chains are 128 (not 256) long and summed in fp32; P is
+// relative to the tile max instead of the chunk max (more bits); PV accumulates fp16 over 128 keys
+// (not over the 2048-key chunk) and fp32 across tiles.
+namespace fa_fold {
+__device__ unsigned long long fa_dbg_clk[8];
+
+// The KV range is cut into nsplit independent streams of L keys each (own O, m, l), merged at the
+// end: the PV grid is only (DV/128) x (N/128) x heads, 3.4 waves on 56 SMs with one stream.
+// Virtual head z = kv_head*nsplit + split; chunk c of every stream runs in the same launch.
+struct fa_fold_split {
+    int nsplit, L, c, nkv;
+};
+static __device__ __forceinline__ int fa_fold_kv_off(const fa_fold_split & g, const int z) {
+    return (z % g.nsplit)*g.L + g.c;
+}
+static __device__ __forceinline__ int fa_fold_nkv_c(const fa_fold_split & g, const int z, const int C) {
+    const int off = fa_fold_kv_off(g, z);
+    return max(0, min(min(C, g.L - g.c), g.nkv - off));
+}
+
+constexpr int BM  = 128;
+constexpr int BN  = 128;
+constexpr int BK2 = 16;   // k2 steps per smem tile = 32 values of K
+constexpr int TK  = 128;  // keys per softmax tile (= QK BM, and the PV fold period)
+constexpr int MAXTILE = 16; // tiles per chunk: chunk <= 2048 keys
+
+static __device__ __forceinline__ float fold_h(const half2 p) {
+    const half2    s = __hadd2(p, __lowhigh2highlow(p));  // high lane = lo + hi
+    const int32_t  v = ((int32_t) *(const uint32_t *) &s) >> 3;
+    return __int_as_float(v & 0x8FFFE000);                 // = (lo + hi) * 2^-112
+}
+
+// Dequantize one chunk of a q4_0 K and V cache for all KV heads:
+//   K16[h][key][D]              (row per key, D contiguous)
+//   Vp [h][key/2][DV] as half2  (lo lane = even key, hi lane = odd key: the PV A operand)
+// Keys from nkv_c up to the padded chunk are written as zeros (P is zero there too, and 0*garbage
+// could be NaN). Exact nibble values times the block scale, rounded once to half: identical to
+// the generic dequantizer.
+static __global__ void fa_fold_dequant(
+        const char * __restrict__ K, const char * __restrict__ V,
+        half * __restrict__ K16, half2 * __restrict__ Vp,
+        const int64_t nbk1, const int64_t nbk2, const int64_t nbv1, const int64_t nbv2,
+        const int D, const fa_fold_split g, const int C) {
+    const int nb   = D/QK4_0;
+    const int b    = threadIdx.x % nb;          // block within a row
+    const int kp   = blockIdx.x*(blockDim.x/nb) + threadIdx.x/nb;  // key pair
+    const int z    = blockIdx.y;
+    const int h    = z / g.nsplit;
+    if (2*kp >= C) {
+        return;
+    }
+    const int nkv_c  = fa_fold_nkv_c(g, z, C);
+    const int kv_off = fa_fold_kv_off(g, z);
+    half * k16 = K16 + ((int64_t) z*C + 2*kp)*D + b*QK4_0;
+    half2 * vp = Vp  + ((int64_t) z*(C/2) + kp)*D + b*QK4_0;
+    float vlo[QK4_0], vhi[QK4_0];
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        const int key = 2*kp + r;
+        float * vv = r == 0 ? vlo : vhi;
+        if (key < nkv_c) {
+            const block_q4_0 * bk = (const block_q4_0 *) (K + h*nbk2 + (int64_t) (kv_off + key)*nbk1) + b;
+            const block_q4_0 * bv = (const block_q4_0 *) (V + h*nbv2 + (int64_t) (kv_off + key)*nbv1) + b;
+            const float dk = __half2float(bk->d);
+            const float dv = __half2float(bv->d);
+            half kk[QK4_0];
+#pragma unroll
+            for (int j = 0; j < QK4_0/2; j++) {
+                const int qk = bk->qs[j];
+                const int qv = bv->qs[j];
+                kk[j]           = __float2half(dk*(float) ((qk & 0xF) - 8));
+                kk[j + QK4_0/2] = __float2half(dk*(float) ((qk >> 4)  - 8));
+                vv[j]           = dv*(float) ((qv & 0xF) - 8);
+                vv[j + QK4_0/2] = dv*(float) ((qv >> 4)  - 8);
+            }
+#pragma unroll
+            for (int j = 0; j < QK4_0; j += 8) {
+                *(uint4 *) (k16 + r*D + j) = *(const uint4 *) (kk + j);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < QK4_0; j++) {
+                vv[j] = 0.0f;
+            }
+#pragma unroll
+            for (int j = 0; j < QK4_0; j += 8) {
+                *(uint4 *) (k16 + r*D + j) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    }
+    half2 pv[QK4_0];
+#pragma unroll
+    for (int j = 0; j < QK4_0; j++) {
+        pv[j] = __halves2half2(__float2half(vlo[j]), __float2half(vhi[j]));
+    }
+#pragma unroll
+    for (int j = 0; j < QK4_0; j += 4) {
+        *(uint4 *) (vp + j) = *(const uint4 *) (pv + j);
+    }
+}
+
+// The shared GEMM main loop of gemm-fold.cu: C[m][n] = sum_k A[m][k] B[n][k], both operands
+// k-contiguous f16 (A rows are `lda` halves apart, B rows `ldb`), or, with A_PAIRS, A given as
+// half2 k-pairs [k/2][m] (m contiguous, `lda` words per k2 row). fold_k2 half2 steps per fp16
+// chain; at every fold `on_fold(fold_index, acc, h)` moves the chains into fp32.
+template <bool A_PAIRS>
+struct fa_fold_tiles {
+    uint32_t As[2][BK2][BM];
+    uint32_t Bs[2][BK2][BN];
+};
+
+template <bool A_PAIRS, int fold_k2, bool B_BLOCKED = false, typename F>
+static __device__ __forceinline__ void fa_fold_mainloop(
+        fa_fold_tiles<A_PAIRS> & sm,
+        const half * __restrict__ A, const int64_t lda, const int mA,   // valid rows of A (m)
+        const half * __restrict__ B, const int64_t ldb, const int nB,   // valid rows of B (n)
+        const int K, float (&acc)[8][8], F on_fold) {
+    const int t  = threadIdx.x;
+    const int tx = t & 15;
+    const int ty = t >> 4;
+
+    half2 h[8][8];
+    uint4 ra[2];
+    uint4 rb[2];
+    auto gload = [&](const int k0) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int l = t + 256*i;
+            if (A_PAIRS) {
+                const int r = l >> 5;   // k2 row
+                const int c = l & 31;   // uint4 column: m = 4c
+                ra[i] = *(const uint4 *) ((const uint32_t *) A + (int64_t) (k0/2 + r)*lda + c*4);
+            } else {
+                const int r = l >> 2;
+                const int c = l & 3;
+                ra[i] = r < mA ? *(const uint4 *) (A + (int64_t) r*lda + k0 + c*8) : make_uint4(0, 0, 0, 0);
+            }
+            const int r = l >> 2;
+            const int c = l & 3;
+            if (B_BLOCKED) {
+                // [k/32][128 rows][32]: one B tile is one contiguous 8 KiB block
+                rb[i] = *(const uint4 *) (B + (int64_t) (k0/32)*(BN*32) + r*32 + c*8);
+            } else {
+                rb[i] = r < nB ? *(const uint4 *) (B + (int64_t) r*ldb + k0 + c*8) : make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+    auto sstore = [&](const int buf) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int l = t + 256*i;
+            if (A_PAIRS) {
+                const int r  = l >> 5;
+                const int c  = l & 31;
+                const int sw = (r >> 2) << 3;
+                *(uint4 *) &sm.As[buf][r][(c*4) ^ sw] = ra[i];
+            } else {
+                const int r  = l >> 2;
+                const int c  = l & 3;
+                const int rs = r ^ (c << 3);
+                sm.As[buf][c*4 + 0][rs] = ra[i].x; sm.As[buf][c*4 + 1][rs] = ra[i].y;
+                sm.As[buf][c*4 + 2][rs] = ra[i].z; sm.As[buf][c*4 + 3][rs] = ra[i].w;
+            }
+            const int r  = l >> 2;
+            const int c  = l & 3;
+            const int rs = r ^ (c << 3);
+            sm.Bs[buf][c*4 + 0][rs] = rb[i].x; sm.Bs[buf][c*4 + 1][rs] = rb[i].y;
+            sm.Bs[buf][c*4 + 2][rs] = rb[i].z; sm.Bs[buf][c*4 + 3][rs] = rb[i].w;
+        }
+    };
+
+    const int nit = K / (2*BK2);
+    gload(0);
+    sstore(0);
+    __syncthreads();
+
+    for (int it = 0; it < nit; it++) {
+        const int buf = it & 1;
+        if (it + 1 < nit) {
+            gload((it + 1)*2*BK2);
+        }
+        const bool restart = (it*BK2) % fold_k2 == 0;
+#pragma unroll
+        for (int k2 = 0; k2 < BK2; k2++) {
+            const int   sw = (k2 >> 2) << 3;
+            const uint4 a0 = *(const uint4 *) &sm.As[buf][k2][(ty*4) ^ sw];
+            const uint4 a1 = *(const uint4 *) &sm.As[buf][k2][(64 + ty*4) ^ sw];
+            const uint4 b0 = *(const uint4 *) &sm.Bs[buf][k2][(tx*4) ^ sw];
+            const uint4 b1 = *(const uint4 *) &sm.Bs[buf][k2][(64 + tx*4) ^ sw];
+            const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const uint32_t b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const half2 ai = *(const half2 *) &a[i];
+                    const half2 bj = *(const half2 *) &b[j];
+                    h[i][j] = k2 == 0 && restart ? __hmul2(ai, bj) : __hfma2(ai, bj, h[i][j]);
+                }
+            }
+        }
+        if (((it + 1)*BK2) % fold_k2 == 0 || it + 1 == nit) {
+            on_fold(((it + 1)*BK2 - 1) / fold_k2, acc, h);
+        }
+        if (it + 1 < nit) {
+            sstore(buf ^ 1);
+        }
+        __syncthreads();
+    }
+}
+
+// Row (A / m) and column (B / n) of a thread's i-th / j-th output.
+static __device__ __forceinline__ int fa_fold_row(const int i) { return (i < 4 ? 0 : 64) + (threadIdx.x >> 4)*4 + (i & 3); }
+static __device__ __forceinline__ int fa_fold_col(const int j) { return (j < 4 ? 0 : 64) + (threadIdx.x & 15)*4 + (j & 3); }
+
+// grid (C/TK, ceil(N/BN), nhkv)
+template <int fold_k2>
+static __global__ void __launch_bounds__(256, 1) fa_fold_qk(
+        const half * __restrict__ K16, const half * __restrict__ Q16,
+        const half * __restrict__ mask, const float * __restrict__ mask_first, const int64_t s_mask,
+        half * __restrict__ P, float * __restrict__ mt, float * __restrict__ lt,
+        const int D, const int N, const int nt, const int C, const fa_fold_split g, const int dbg) {
+    __shared__ __align__(16) fa_fold_tiles<false> sm;
+    __shared__ float red[16][BN];
+    __shared__ float colv[BN];
+    __shared__ int   colq[BN];   // query row of the column, or -1 if its mask is all zero here
+
+    const int h   = blockIdx.z;   // virtual head (kv head, split)
+    const int m0  = blockIdx.x*TK;
+    const int n0  = blockIdx.y*BN;
+    const int ty  = threadIdx.x >> 4;
+    const int nkv_c  = fa_fold_nkv_c(g, h, C);
+    const int kv_off = fa_fold_kv_off(g, h);
+
+    if (threadIdx.x < BN) {
+        // read before the main loop, so its latency hides behind it (the first sync orders it)
+        const int n  = n0 + threadIdx.x;
+        const int tq = n < N ? n % nt : 0;
+        colq[threadIdx.x] = n < N && (float) (kv_off + m0 + TK) > mask_first[tq] ? tq : -1;
+    }
+
+    const long long t0 = clock64();
+    float acc[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc[i][j] = 0.0f;
+        }
+    }
+    fa_fold_mainloop<false, fold_k2>(sm,
+        K16 + ((int64_t) h*C + m0)*D, D, BM,
+        Q16 + ((int64_t) (h / g.nsplit)*N + n0)*D, D, N - n0,
+        D, acc, [&](int, float (&a)[8][8], half2 (&hh)[8][8]) {
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    a[i][j] += fold_h(hh[i][j]);
+                }
+            }
+        });
+
+    const long long t1 = clock64();
+    if (dbg == 1) {
+        float x = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                x += acc[i][j];
+            }
+        }
+        if (x == 1.2345f) {
+            lt[0] = x;
+        }
+        return;
+    }
+    // logits: 4 * S (Q carried scale/4), + mask; keys past nkv_c are -inf
+    float cmax[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int tq = colq[fa_fold_col(j)];
+        const bool use_mask = tq >= 0 && dbg != 6;
+        float mv[8];
+        if (use_mask) {
+            const half * mr = mask + (int64_t) tq*s_mask + kv_off + m0;
+#pragma unroll
+            for (int ih = 0; ih < 2; ih++) {
+                const int key = ih*64 + ty*4;
+                // 4 contiguous halves; the mask row is 8-byte aligned only if s_mask and kv_off are,
+                // so read them one by one
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    mv[ih*4 + q] = m0 + key + q < nkv_c ? __half2float(mr[key + q]) : 0.0f;
+                }
+            }
+        }
+        cmax[j] = -FLT_MAX/2.0f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float v = acc[i][j] * 0x1p114f;
+            if (use_mask) {
+                v += mv[i];
+            }
+            if (m0 + fa_fold_row(i) >= nkv_c) {
+                v = -INFINITY;
+            }
+            acc[i][j] = v;
+            cmax[j] = fmaxf(cmax[j], v);
+        }
+        red[ty][fa_fold_col(j)] = cmax[j];
+    }
+    const long long ta = clock64();
+    __syncthreads();
+    if (threadIdx.x < BN) {
+        float m = -FLT_MAX/2.0f;
+#pragma unroll
+        for (int r = 0; r < 16; r++) {
+            m = fmaxf(m, red[r][threadIdx.x]);
+        }
+        colv[threadIdx.x] = m + FATTN_KQ_MAX_OFFSET;
+    }
+    __syncthreads();
+    if (dbg == 3) {
+        if (colv[threadIdx.x & 127] == 1.2345f) {
+            lt[0] = 1.0f;
+        }
+        return;
+    }
+    const long long tb = clock64();
+    float csum[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int c = fa_fold_col(j);
+        const float m = colv[c];
+        csum[j] = 0.0f;
+        half pp[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const float v = acc[i][j];
+            const float p = (v <= -FLT_MAX/4.0f || m <= -FLT_MAX/8.0f) ? 0.0f : expf(v - m);
+            pp[i] = __float2half(p);
+            csum[j] += p;
+        }
+        // staged through smem (the GEMM tiles are free now), written out as whole rows below
+        uint2 * Ps = (uint2 *) &sm;
+        Ps[c*32 + ( ty       ^ ((c & 15) << 1))] = *(const uint2 *) (pp + 0);
+        Ps[c*32 + ((16 + ty) ^ ((c & 15) << 1))] = *(const uint2 *) (pp + 4);
+    }
+    const long long tc = clock64();
+    __syncthreads();   // everyone has read colv/red and written Ps
+    {
+        const uint4 * Ps = (const uint4 *) &sm;
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            // P is [h][n/128][key/32][128][32] (see fa_fold_pv): this tile is 4 contiguous 8 KiB blocks
+            const int idx = threadIdx.x + 256*k;
+            const int kb  = idx >> 9;
+            const int r   = (idx >> 2) & 127;
+            const int q   = kb*4 + (idx & 3);
+            *(uint4 *) (P + (((int64_t) (h*gridDim.y + blockIdx.y)*(C/32) + m0/32 + kb)*BN + r)*32 + (idx & 3)*8) =
+                Ps[r*16 + (q ^ (r & 15))];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        red[ty][fa_fold_col(j)] = csum[j];
+    }
+    __syncthreads();
+    if (threadIdx.x < BN) {
+        const int n = n0 + threadIdx.x;
+        float s = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 16; r++) {
+            s += red[r][threadIdx.x];
+        }
+        if (n < N) {
+            const int64_t o = ((int64_t) h*(C/TK) + blockIdx.x)*N + n;
+            mt[o] = colv[threadIdx.x] <= -FLT_MAX/8.0f ? -INFINITY : colv[threadIdx.x];
+            lt[o] = s;
+        }
+    }
+    if ((dbg == 5 || dbg == 6) && threadIdx.x == 0) {
+        const long long t2 = clock64();
+        atomicAdd(&fa_dbg_clk[0], (unsigned long long) (t1 - t0));
+        atomicAdd(&fa_dbg_clk[1], (unsigned long long) (t2 - t1));
+        atomicAdd(&fa_dbg_clk[2], 1ull);
+        atomicAdd(&fa_dbg_clk[3], (unsigned long long) (ta - t1));
+        atomicAdd(&fa_dbg_clk[4], (unsigned long long) (tb - ta));
+        atomicAdd(&fa_dbg_clk[5], (unsigned long long) (tc - tb));
+        atomicAdd(&fa_dbg_clk[6], (unsigned long long) (t2 - tc));
+        int nm = 0;
+        for (int c = 0; c < BN; c++) nm += colq[c] >= 0;
+        atomicAdd(&fa_dbg_clk[7], (unsigned long long) nm);
+    }
+}
+
+// QK + softmax, two CTAs per SM. k = D is short (8 smem tiles at D = 256), so with one CTA per SM
+// the prologue load and the softmax epilogue sat exposed (main loop 72% of peak, epilogue +20%).
+// Here the fp16 chains run over the whole of D (two lanes of D/4 products each, then one fp32
+// fold -- still shorter chains than cuBLAS COMPUTE_16F's single D-long one), so no fp32
+// accumulators live through the loop, and the smem tiles are single-buffered: <= 128 registers
+// and ~17 KiB of smem, and a second CTA covers each one's latency.
+static __global__ void __launch_bounds__(256, 2) fa_fold_qk2(
+        const half * __restrict__ K16, const half * __restrict__ Q16,
+        const half * __restrict__ mask, const float * __restrict__ mask_first, const int64_t s_mask,
+        half * __restrict__ P, float * __restrict__ mt, float * __restrict__ lt,
+        const int D, const int N, const int nt, const int C, const fa_fold_split g) {
+    union smem_t {
+        struct { uint32_t As[BK2][BM]; uint32_t Bs[BK2][BN]; } t;
+        float red[16][BN];
+        uint2 Ps[BN*16];
+    };
+    __shared__ __align__(16) smem_t sm;
+    __shared__ float colv[BN];
+    __shared__ int   colq[BN];
+
+    const int h   = blockIdx.z;
+    const int m0  = blockIdx.x*TK;
+    const int n0  = blockIdx.y*BN;
+    const int t   = threadIdx.x;
+    const int tx  = t & 15;
+    const int ty  = t >> 4;
+    const int nkv_c  = fa_fold_nkv_c(g, h, C);
+    const int kv_off = fa_fold_kv_off(g, h);
+
+    if (t < BN) {
+        const int n  = n0 + t;
+        const int tq = n < N ? n % nt : 0;
+        colq[t] = n < N && (float) (kv_off + m0 + TK) > mask_first[tq] ? tq : -1;
+    }
+
+    const half * A = K16 + ((int64_t) h*C + m0)*D;
+    const half * B = Q16 + ((int64_t) (h / g.nsplit)*N + n0)*D;
+    const int nB = N - n0;
+
+    half2 hh[8][8];
+    uint4 ra[2], rb[2];
+    auto gload = [&](const int k0) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int l = t + 256*i;
+            const int r = l >> 2;
+            const int c = l & 3;
+            ra[i] = *(const uint4 *) (A + (int64_t) r*D + k0 + c*8);
+            rb[i] = r < nB ? *(const uint4 *) (B + (int64_t) r*D + k0 + c*8) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    const int nit = D / (2*BK2);
+    gload(0);
+    for (int it = 0; it < nit; it++) {
+        if (it > 0) {
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int l  = t + 256*i;
+            const int r  = l >> 2;
+            const int c  = l & 3;
+            const int rs = r ^ (c << 3);
+            sm.t.As[c*4 + 0][rs] = ra[i].x; sm.t.As[c*4 + 1][rs] = ra[i].y;
+            sm.t.As[c*4 + 2][rs] = ra[i].z; sm.t.As[c*4 + 3][rs] = ra[i].w;
+            sm.t.Bs[c*4 + 0][rs] = rb[i].x; sm.t.Bs[c*4 + 1][rs] = rb[i].y;
+            sm.t.Bs[c*4 + 2][rs] = rb[i].z; sm.t.Bs[c*4 + 3][rs] = rb[i].w;
+        }
+        __syncthreads();
+        if (it + 1 < nit) {
+            gload((it + 1)*2*BK2);
+        }
+#pragma unroll
+        for (int k2 = 0; k2 < BK2; k2++) {
+            const int   sw = (k2 >> 2) << 3;
+            const uint4 a0 = *(const uint4 *) &sm.t.As[k2][(ty*4) ^ sw];
+            const uint4 a1 = *(const uint4 *) &sm.t.As[k2][(64 + ty*4) ^ sw];
+            const uint4 b0 = *(const uint4 *) &sm.t.Bs[k2][(tx*4) ^ sw];
+            const uint4 b1 = *(const uint4 *) &sm.t.Bs[k2][(64 + tx*4) ^ sw];
+            const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const uint32_t b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const half2 ai = *(const half2 *) &a[i];
+                    const half2 bj = *(const half2 *) &b[j];
+                    hh[i][j] = it == 0 && k2 == 0 ? __hmul2(ai, bj) : __hfma2(ai, bj, hh[i][j]);
+                }
+            }
+        }
+    }
+
+    // logits: 4 * S (Q carried scale/4) + mask, from the one fold; keys past nkv_c are -inf
+    float acc[8][8];
+    float cmax[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int tq = colq[fa_fold_col(j)];
+        cmax[j] = -FLT_MAX/2.0f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int key = fa_fold_row(i);
+            float v = fold_h(hh[i][j]) * 0x1p114f;
+            if (tq >= 0 && m0 + key < nkv_c) {
+                v += __half2float(mask[(int64_t) tq*s_mask + kv_off + m0 + key]);
+            }
+            if (m0 + key >= nkv_c) {
+                v = -INFINITY;
+            }
+            acc[i][j] = v;
+            cmax[j] = fmaxf(cmax[j], v);
+        }
+    }
+    __syncthreads();   // all reads of the tiles are done: red aliases them
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        sm.red[ty][fa_fold_col(j)] = cmax[j];
+    }
+    __syncthreads();
+    if (t < BN) {
+        float m = -FLT_MAX/2.0f;
+#pragma unroll
+        for (int r = 0; r < 16; r++) {
+            m = fmaxf(m, sm.red[r][t]);
+        }
+        colv[t] = m + FATTN_KQ_MAX_OFFSET;
+    }
+    __syncthreads();
+    float csum[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        csum[j] = 0.0f;
+    }
+    // P = exp(v - m_t) in f16, staged through smem in two 64-key halves and written as whole
+    // 8 KiB blocks of the [h][n/128][key/32][128][32] layout that fa_fold_pv reads
+#pragma unroll
+    for (int ih = 0; ih < 2; ih++) {
+        if (ih > 0) {
+            __syncthreads();
+        }
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int c = fa_fold_col(j);
+            const float m = colv[c];
+            half pp[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const float v = acc[ih*4 + q][j];
+                const float p = (v <= -FLT_MAX/4.0f || m <= -FLT_MAX/8.0f) ? 0.0f : expf(v - m);
+                pp[q] = __float2half(p);
+                csum[j] += p;
+            }
+            sm.Ps[c*16 + (ty ^ (((c >> 2) & 7) << 1))] = *(const uint2 *) pp;
+        }
+        __syncthreads();
+        const uint4 * Ps = (const uint4 *) sm.Ps;
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const int idx = t + 256*k;
+            const int kbl = idx >> 9;
+            const int r   = (idx >> 2) & 127;
+            const int q   = kbl*4 + (idx & 3);
+            *(uint4 *) (P + (((int64_t) (h*gridDim.y + blockIdx.y)*(C/32) + m0/32 + ih*2 + kbl)*BN + r)*32 + (idx & 3)*8) =
+                Ps[r*8 + (q ^ ((r >> 2) & 7))];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        sm.red[ty][fa_fold_col(j)] = csum[j];
+    }
+    __syncthreads();
+    if (t < BN) {
+        const int n = n0 + t;
+        float s = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 16; r++) {
+            s += sm.red[r][t];
+        }
+        if (n < N) {
+            const int64_t o = ((int64_t) h*(C/TK) + blockIdx.x)*N + n;
+            mt[o] = colv[t] <= -FLT_MAX/8.0f ? -INFINITY : colv[t];
+            lt[o] = s;
+        }
+    }
+}
+
+// grid (DV/BM, ceil(N/BN), nhkv).  O_out = O_in*corr + sum_t exp(m_t - M) * V P_t
+static __global__ void __launch_bounds__(256, 1) fa_fold_pv(
+        const half2 * __restrict__ Vp, const half * __restrict__ P,
+        const float * __restrict__ mt, const float * __restrict__ lt,
+        const float * __restrict__ m_in, float * __restrict__ m_out, float * __restrict__ l_state,
+        const float * __restrict__ O_in, float * __restrict__ O_out,
+        const int DV, const int N, const int C, const int ntile) {
+    __shared__ __align__(16) fa_fold_tiles<true> sm;
+    __shared__ float Mn[BN];
+    __shared__ float corr[BN];
+    __shared__ float fac[MAXTILE][BN];   // exp(m_t - M) per tile and column
+
+    const int h  = blockIdx.z;
+    const int m0 = blockIdx.x*BM;
+    const int n0 = blockIdx.y*BN;
+    const int ty = threadIdx.x >> 4;
+
+    if (threadIdx.x < BN) {
+        const int n = n0 + threadIdx.x;
+        float M = -INFINITY, c = 0.0f;
+        if (n < N) {
+            const float mo = m_in[(int64_t) h*N + n];
+            M = mo;
+            for (int tt = 0; tt < ntile; tt++) {
+                M = fmaxf(M, mt[((int64_t) h*(C/TK) + tt)*N + n]);
+            }
+            c = mo == -INFINITY ? 0.0f : expf(mo - M);
+            if (blockIdx.x == 0) {
+                float l = l_state[(int64_t) h*N + n]*c;
+                if (M != -INFINITY) {
+                    for (int tt = 0; tt < ntile; tt++) {
+                        const int64_t o = ((int64_t) h*(C/TK) + tt)*N + n;
+                        const float mm = mt[o];
+                        l += mm == -INFINITY ? 0.0f : lt[o]*expf(mm - M);
+                    }
+                }
+                l_state[(int64_t) h*N + n] = l;
+                m_out[(int64_t) h*N + n]   = M;
+            }
+            for (int tt = 0; tt < ntile; tt++) {
+                const float mm = mt[((int64_t) h*(C/TK) + tt)*N + n];
+                fac[tt][threadIdx.x] = (mm == -INFINITY || M == -INFINITY) ? 0.0f : expf(mm - M);
+            }
+        } else {
+            for (int tt = 0; tt < ntile; tt++) {
+                fac[tt][threadIdx.x] = 0.0f;
+            }
+        }
+        Mn[threadIdx.x]   = M;
+        corr[threadIdx.x] = c;
+    }
+    __syncthreads();
+
+    float acc[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc[i][j] = 0.0f;
+        }
+    }
+    fa_fold_mainloop<true, TK/2, true>(sm,
+        (const half *) (Vp + (int64_t) h*(C/2)*DV + m0), DV, BM,
+        P + ((int64_t) h*gridDim.y + blockIdx.y)*C*BN, C, N - n0,
+        ntile*TK, acc, [&](int tt, float (&a)[8][8], half2 (&hh)[8][8]) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float f = fac[tt][fa_fold_col(j)];
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    a[i][j] += fold_h(hh[i][j]) * f;
+                }
+            }
+        });
+
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int c = fa_fold_col(j);
+        const int n = n0 + c;
+        if (n >= N) {
+            continue;
+        }
+        const float cr = corr[c];
+#pragma unroll
+        for (int ih = 0; ih < 2; ih++) {
+            const int64_t o = ((int64_t) h*N + n)*DV + m0 + ih*64 + ty*4;
+            const float4 oi = *(const float4 *) (O_in + o);
+            float4 v;
+            v.x = oi.x*cr + acc[ih*4 + 0][j]*0x1p112f;
+            v.y = oi.y*cr + acc[ih*4 + 1][j]*0x1p112f;
+            v.z = oi.z*cr + acc[ih*4 + 2][j]*0x1p112f;
+            v.w = oi.w*cr + acc[ih*4 + 3][j]*0x1p112f;
+            *(float4 *) (O_out + o) = v;
+        }
+    }
+}
+
+// dst[d, head, t] = sum_split w*O / sum_split w*l, w = exp(m_split - max m): the split merge
+static __global__ void fa_fold_finalize(
+        const float * __restrict__ O, const float * __restrict__ m, const float * __restrict__ l,
+        float * __restrict__ dst, const int DV, const int nt, const int N, const int gqa, const int nsplit,
+        const int64_t dst_s1, const int64_t dst_s2) {
+    const int t   = blockIdx.x;
+    const int hq  = blockIdx.y;
+    const int kvh = blockIdx.z;
+    const int n   = hq*nt + t;
+    float M = -INFINITY;
+    for (int sp = 0; sp < nsplit; sp++) {
+        M = fmaxf(M, m[(int64_t) (kvh*nsplit + sp)*N + n]);
+    }
+    float w[8];
+    float L = 0.0f;
+    for (int sp = 0; sp < nsplit; sp++) {
+        const int64_t o = (int64_t) (kvh*nsplit + sp)*N + n;
+        w[sp] = m[o] == -INFINITY ? 0.0f : expf(m[o] - M);
+        L += w[sp]*l[o];
+    }
+    const float inv = L > 0.0f ? 1.0f/L : 0.0f;
+    float * dh = dst + (int64_t) t*dst_s2 + (int64_t) (kvh*gqa + hq)*dst_s1;
+    for (int d = threadIdx.x; d < DV; d += blockDim.x) {
+        float v = 0.0f;
+        for (int sp = 0; sp < nsplit; sp++) {
+            v += w[sp]*O[((int64_t) (kvh*nsplit + sp)*N + n)*DV + d];
+        }
+        dh[d] = v*inv;
+    }
+}
+
+} // namespace fa_fold
+
+static int ggml_cuda_fa_fold_env(const char * name, int def) {
+    const char * s = getenv(name);
+    return s ? atoi(s) : def;
+}
+
+static bool ggml_cuda_fa_fold_usable(const ggml_tensor * dst) {
+    static const int mode = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD", 1);
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    return mode != 0 && !ggml_cuda_fa_gemm_prec32() &&
+        K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
+        K->ne[0] == V->ne[0] && K->ne[0] % 128 == 0 && K->ne[0] <= 512 &&
+        K->ne[2] == V->ne[2] && Q->ne[1]*(Q->ne[2]/K->ne[2]) <= 65535*fa_fold::BN;
+}
+
+static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    using namespace fa_fold;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int64_t D    = K->ne[0];
+    const int64_t DV   = V->ne[0];
+    const int64_t nt   = Q->ne[1];
+    const int64_t nh   = Q->ne[2];
+    const int64_t nkv  = K->ne[1];
+    const int64_t nhkv = K->ne[2];
+    const int64_t ns   = Q->ne[3];
+    const int64_t gqa  = nh / nhkv;
+    const int64_t N    = nt*gqa;
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    cudaStream_t stream = ctx.stream();
+
+    static const int chunk_env  = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_CHUNK", 1024);
+    static const int nsplit_env = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_SPLIT", 2);
+    const int64_t nsplit = std::max(1, std::min(8, nsplit_env));
+    const int64_t Lsp = ((nkv + nsplit - 1)/nsplit + TK - 1)/TK*TK;   // keys per split
+    const int64_t C = std::max<int64_t>(TK, (std::min<int64_t>(std::min(chunk_env, MAXTILE*TK), Lsp) + TK - 1)/TK*TK);
+    const int64_t nz = nhkv*nsplit;   // virtual heads
+    static const int qk_fold = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_QK", 2);
+    static const int fdbg = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_DBG", 0);
+
+    ggml_cuda_pool & pool = ctx.pool();
+    ggml_cuda_pool_alloc<half>  Qf16(pool, D*N*nhkv);
+    ggml_cuda_pool_alloc<half>  K16(pool, D*C*nz);
+    ggml_cuda_pool_alloc<half2> Vp(pool, DV*(C/2)*nz);
+    ggml_cuda_pool_alloc<half>  P(pool, C*((N + BN - 1)/BN*BN)*nz);
+    ggml_cuda_pool_alloc<float> mt(pool, (C/TK)*N*nz);
+    ggml_cuda_pool_alloc<float> lt(pool, (C/TK)*N*nz);
+    ggml_cuda_pool_alloc<float> O(pool, DV*N*nz);
+    ggml_cuda_pool_alloc<float> O2(pool, DV*N*nz);
+    ggml_cuda_pool_alloc<float> mA(pool, N*nz);
+    ggml_cuda_pool_alloc<float> mB(pool, N*nz);
+    ggml_cuda_pool_alloc<float> l_state(pool, N*nz);
+    ggml_cuda_pool_alloc<float> mask_first(pool, nt);
+
+    const int64_t dst_s1 = dst->nb[1]/sizeof(float);
+    const int64_t dst_s2 = dst->nb[2]/sizeof(float);
+    const int64_t s_mask = mask->nb[1]/sizeof(half);
+
+    fattn_gemm_mask_first_nz<256><<<nt, 256, 0, stream>>>((const half *) mask->data, mask_first.ptr, s_mask, (int) nkv);
+    CUDA_CHECK(cudaGetLastError());
+
+    for (int64_t s = 0; s < ns; ++s) {
+        for (int64_t kvh = 0; kvh < nhkv; ++kvh) {
+            fattn_gemm_q_to_f16<<<dim3(nt, gqa, 1), 256, 0, stream>>>(
+                (const char *) Q->data + s*Q->nb[3], Qf16.ptr + kvh*N*D,
+                D, nt, Q->nb[1], Q->nb[2], kvh*gqa, scale*0.25f);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        float * O_cur = O.ptr;
+        float * O_nxt = O2.ptr;
+        float * m_cur = mA.ptr;
+        float * m_nxt = mB.ptr;
+        CUDA_CHECK(cudaMemsetAsync(O_cur, 0, DV*N*nz*sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(l_state.ptr, 0, N*nz*sizeof(float), stream));
+        fattn_gemm_fill<<<(N*nz + 255)/256, 256, 0, stream>>>(m_cur, -INFINITY, N*nz);
+        CUDA_CHECK(cudaGetLastError());
+
+        for (int64_t c = 0; c < Lsp; c += C) {
+            const fa_fold_split g = {(int) nsplit, (int) Lsp, (int) c, (int) nkv};
+            // the longest stream this chunk (split 0 is always full-length)
+            const int nkv_c = (int) std::min(C, Lsp - c);
+            const int ntile = (nkv_c + TK - 1)/TK;
+            {
+                const int nb  = (int) (D/QK4_0);
+                const int kpb = 256/nb;   // key pairs per block
+                const int npairs = ntile*TK/2;
+                fa_fold_dequant<<<dim3((npairs + kpb - 1)/kpb, nz, 1), kpb*nb, 0, stream>>>(
+                    (const char *) K->data + s*K->nb[3], (const char *) V->data + s*V->nb[3],
+                    K16.ptr, Vp.ptr, K->nb[1], K->nb[2], V->nb[1], V->nb[2], (int) D, g, (int) C);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            {
+                const dim3 grid(ntile, (N + BN - 1)/BN, nz);
+                if (qk_fold == 2) {
+                    fa_fold_qk2<<<grid, 256, 0, stream>>>(K16.ptr, Qf16.ptr, (const half *) mask->data, mask_first.ptr, s_mask,
+                        P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g);
+                } else if (qk_fold == 128) {
+                    fa_fold_qk<128><<<grid, 256, 0, stream>>>(K16.ptr, Qf16.ptr, (const half *) mask->data, mask_first.ptr, s_mask,
+                        P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g, fdbg);
+                } else {
+                    fa_fold_qk<64><<<grid, 256, 0, stream>>>(K16.ptr, Qf16.ptr, (const half *) mask->data, mask_first.ptr, s_mask,
+                        P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g, fdbg);
+                }
+                CUDA_CHECK(cudaGetLastError());
+            }
+            {
+                const dim3 grid(DV/BM, (N + BN - 1)/BN, nz);
+                fa_fold_pv<<<grid, 256, 0, stream>>>(Vp.ptr, P.ptr, mt.ptr, lt.ptr, m_cur, m_nxt, l_state.ptr,
+                    O_cur, O_nxt, (int) DV, (int) N, (int) C, ntile);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            std::swap(O_cur, O_nxt);
+            std::swap(m_cur, m_nxt);
+        }
+
+        if (fdbg == 5 || fdbg == 6) {
+            unsigned long long hc[8];
+            CUDA_CHECK(cudaMemcpyFromSymbol(hc, fa_dbg_clk, sizeof(hc), 0, cudaMemcpyDeviceToHost));
+            fprintf(stderr, "qk clocks per CTA: main %.0f epi %.0f (n %llu)\n", (double) hc[0]/hc[2], (double) hc[1]/hc[2], hc[2]);
+            fprintf(stderr, "  masked cols %llu ", hc[7]); fprintf(stderr, "  cmax %.0f  reduce %.0f  exp %.0f  write %.0f\n", (double) hc[3]/hc[2], (double) hc[4]/hc[2], (double) hc[5]/hc[2], (double) hc[6]/hc[2]);
+        }
+        fa_fold_finalize<<<dim3(nt, gqa, nhkv), 256, 0, stream>>>(
+            O_cur, m_cur, l_state.ptr, (float *) dst->data + s*(dst->nb[3]/sizeof(float)),
+            (int) DV, (int) nt, (int) N, (int) gqa, (int) nsplit, dst_s1, dst_s2);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 bool ggml_cuda_flash_attn_ext_gemm_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
@@ -362,6 +1225,11 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(const ggml_tensor * dst) {
 }
 
 void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_fa_fold_usable(dst)) {
+        ggml_cuda_flash_attn_ext_fold(ctx, dst);
+        return;
+    }
+
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
