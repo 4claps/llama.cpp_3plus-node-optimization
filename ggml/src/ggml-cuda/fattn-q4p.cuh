@@ -92,6 +92,10 @@
 #define Q4P_RS 0
 #endif
 
+// no barrier at the chunk end (1 on, 2 off)
+#ifndef Q4P_NOEB
+#define Q4P_NOEB 1
+#endif
 // P published by every split, one position each (1 on, 2 off)
 #ifndef Q4P_PSPL
 #define Q4P_PSPL 1
@@ -362,6 +366,19 @@ static __global__ void flash_attn_ext_q4p(
     // softmax denominator of row tid, for tid < R: summed once per chunk from P_s, so the PV
     // loop neither spends registers on it nor diverges to add it
     float l_row = 0.0f;
+    auto add_lsum = [&]() {
+        if (tid < R) {
+            float ls = 0.0f;
+#pragma unroll
+            for (int w = 0; w < NT/WARP_SIZE; ++w) {
+                ls += lsum_s[w][tid];
+            }
+            l_row += ls;
+        }
+    };
+    // No barrier at the chunk end: the next chunk's first barrier (the lazy-max vote) already orders
+    // this chunk's P_s reads before the next publish, so warps run ahead into the next QK phase
+    constexpr bool NOEB = Q4P_NOEB == 1;
 
     // this thread's V word: block b, word k of each row
     const int pv_d0 = fattn_q4p_pv_dim<DPT>(dg, 0);
@@ -674,7 +691,15 @@ static __global__ void flash_attn_ext_q4p(
         for (int rl = 0; rl < RQ; ++rl) {
             grow |= lmax[rl] > m_s[qgrp*RQ + rl] + 8.0f;
         }
-        if (__syncthreads_or(grow)) {
+        const bool any_grow = __syncthreads_or(grow);
+        if constexpr (NOEB) {
+            // the previous chunk's denominators: every warp wrote them before this barrier, and
+            // this chunk's are written only after the P barrier below
+            if (k0 != blockIdx.y*C) {
+                add_lsum();
+            }
+        }
+        if (any_grow) {
             // per warp, reduce over the lanes that share a row group (the position-slot bits)
 #pragma unroll
             for (int rl = 0; rl < RQ; ++rl) {
@@ -994,15 +1019,14 @@ static __global__ void flash_attn_ext_q4p(
                 }
             }
         }
-        __syncthreads();
-        if (tid < R) {
-            float ls = 0.0f;
-#pragma unroll
-            for (int w = 0; w < NT/WARP_SIZE; ++w) {
-                ls += lsum_s[w][tid];
-            }
-            l_row += ls;
+        if constexpr (!NOEB) {
+            __syncthreads();
+            add_lsum();
         }
+    }
+    if constexpr (NOEB) {
+        __syncthreads();
+        add_lsum();
     }
 
     // ---- reduce the NPG partial outputs and the partial denominators ----
