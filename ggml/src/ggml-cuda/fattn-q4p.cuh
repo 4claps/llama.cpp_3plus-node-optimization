@@ -92,6 +92,10 @@
 #define Q4P_RS 0
 #endif
 
+// P published by every split, one position each (1 on, 2 off)
+#ifndef Q4P_PSPL
+#define Q4P_PSPL 1
+#endif
 // fp16 -> fp32 of the fp16 chains: 1 = conversion instruction (exact, subnormals kept),
 // 2 = integer conversion below
 #ifndef Q4P_CVT
@@ -705,11 +709,24 @@ static __global__ void flash_attn_ext_q4p(
             }
         }
 
-        // P for this chunk, published by the first thread of each position
-        if (qsplit == 0) {
+        // P for this chunk, published by the first thread of each position; with as many splits as
+        // positions per thread, split j publishes position j (the reduction left S in both)
+        constexpr bool PSPL = NSPLIT == PT && Q4P_PSPL == 1;
+        if (PSPL || qsplit == 0) {
+            if constexpr (PSPL) {
 #pragma unroll
-            for (int pt = 0; pt < PT; ++pt) {
-                float * Pp = P_s + (qslot + NQP*pt)*PSTR + qgrp*(cfg::PPK ? RQP/2 : RQP);
+                for (int r = 0; r < RQ; ++r) {
+#pragma unroll
+                    for (int pt = 1; pt < PT; ++pt) {
+                        if (qsplit == pt) {
+                            S[0][r] = S[pt][r];
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int pt = 0; pt < (PSPL ? 1 : PT); ++pt) {
+                float * Pp = P_s + (qslot + NQP*(PSPL ? qsplit : pt))*PSTR + qgrp*(cfg::PPK ? RQP/2 : RQP);
 #pragma unroll
                 for (int rq = 0; rq < RQP/4; ++rq) {
                     float pv[4];
