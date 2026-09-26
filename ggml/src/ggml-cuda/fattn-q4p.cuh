@@ -84,7 +84,7 @@
 // partials are converted and reduce-scattered across them by shuffles, so a thread keeps RQ fp32
 // accumulators (one output dim) instead of RQ*DPT. Q4P_RSON 2 turns it off everywhere; per width
 // (Q4P_RS 1 on, 2 off) it is on at 15 and 18 rows (kv 262144: 2520 -> 2430 us, 2290 -> 1676), off at
-// 6 and 12 (805 -> 827, 1071 -> 1087).
+// 12 (1071 -> 1087). At 6 rows it is on with two blocks per SM (805 -> 741; alone it lost, 805 -> 827).
 #ifndef Q4P_RSON
 #define Q4P_RSON 1
 #endif
@@ -100,7 +100,8 @@ static __device__ __forceinline__ float fattn_q4p_lo_f(const uint32_t x) {
     return __int_as_float((int32_t(x << 16) >> 3) & 0x8FFFE000);
 }
 
-template <int R>
+// OLD = the configuration before the PV reduce-scatter (GGML_CUDA_Q4P_OLD=1), kept for in-model A/B
+template <int R, bool OLD = false>
 struct fattn_q4p_cfg {
     static constexpr int NT     = 256;                    // threads per block
     static constexpr int RG     = Q4P_KNOB(RG, 1);        // row groups
@@ -129,7 +130,7 @@ struct fattn_q4p_cfg {
     static constexpr bool FOLD  = RQ <= DPT;
     // L2 prefetch of the chunk's V rows and the next chunk's K rows (1 = on, 2 = off)
     // (off at 15 rows since the PV reduce-scatter: 2476 -> 2356 us at kv 262144)
-    static constexpr bool PREFETCH = Q4P_KNOB(PF, R == 15 ? 2 : 1) == 1;
+    static constexpr bool PREFETCH = Q4P_KNOB(PF, (!OLD && R == 15) ? 2 : 1) == 1;
     // QK over the BPS blocks of a split: rolled (1) keeps the kernel inside the instruction cache,
     // unrolled (2) holds the whole split's words in registers
     static constexpr bool ROLL = Q4P_KNOB(ROLL, 2) == 1;
@@ -138,7 +139,10 @@ struct fattn_q4p_cfg {
     static constexpr bool KPF  = !ROLL && Q4P_KNOB(KPF, R == 24 ? 2 : 1) == 1;
     static constexpr bool H16QK = Q4P_H16QK == 1 && PT == 2 && BLOCK_T && !ROLL;
     static constexpr bool H16PV = Q4P_H16PV == 1 && (DPT == 4 || DPT == 8);
-    static constexpr bool RS    = Q4P_RSON == 1 && Q4P_KNOB(RS, (R == 15 || R == 18) ? 1 : 2) == 1 && H16PV && DPT == 8 && RG == 1 && NPG == 8 && C/NPG <= Q4P_PVF;
+    static constexpr bool RS    = !OLD && Q4P_RSON == 1 && Q4P_KNOB(RS, (R == 6 || R == 15 || R == 18) ? 1 : 2) == 1 &&
+                                  H16PV && DPT == 8 && RG == 1 && NPG == 8 && C/NPG <= Q4P_PVF;
+    // blocks per SM: 6 rows with RS fit 128 registers without spilling (kv 262144: 816 -> 741 us)
+    static constexpr int  MINB  = R == Q4P_TUNE_R ? Q4P_MINB : ((RS && R == 6) ? 2 : 1);
     // P_s floats per position; with RS a warp reads 8 positions at once, so PSTR/4 is kept odd
     static constexpr int PSTR   = RG*RQP + ((RS && (RG*RQP/4) % 2 == 0) ? 4 : 0);
     static constexpr int NACC   = RS ? 1 : DPT;           // fp32 accumulators per row
@@ -179,8 +183,8 @@ static __device__ __forceinline__ int fattn_q4p_pv_dim(const int dg, const int j
     }
 }
 
-template <int ncols1, int ncols2>
-__launch_bounds__(256, (ncols1*ncols2 == Q4P_TUNE_R) ? Q4P_MINB : 1)
+template <int ncols1, int ncols2, bool OLD>
+__launch_bounds__(256, (fattn_q4p_cfg<ncols1*ncols2, OLD>::MINB))
 static __global__ void flash_attn_ext_q4p(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -207,7 +211,7 @@ static __global__ void flash_attn_ext_q4p(
 #if defined(FLASH_ATTN_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     constexpr int D = FATTN_Q4P_D;
     constexpr int R = ncols1*ncols2;
-    using cfg = fattn_q4p_cfg<R>;
+    using cfg = fattn_q4p_cfg<R, OLD>;
     constexpr int NT = cfg::NT, RG = cfg::RG, RQ = cfg::RQ, RQP = cfg::RQP, C = cfg::C, PT = cfg::PT;
     constexpr int NSPLIT = cfg::NSPLIT, NQP = cfg::NQP, BPS = cfg::BPS, DPS = cfg::DPS, QREG = cfg::QREG;
     constexpr int DPT = cfg::DPT, NDG = cfg::NDG, NPG = cfg::NPG, PSTR = cfg::PSTR, NACC = cfg::NACC;
@@ -985,11 +989,20 @@ static bool ggml_cuda_fattn_q4p_supported(const ggml_tensor * dst) {
     return true;
 }
 
+static bool q4p_old() {
+    static const bool v = [] { const char * s = getenv("GGML_CUDA_Q4P_OLD"); return s && atoi(s) != 0; }();
+    return v;
+}
+
 template <int ncols1, int ncols2 = 6>
 static void ggml_cuda_flash_attn_ext_q4p_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    fattn_kernel_t kernel = flash_attn_ext_q4p<ncols1, ncols2>;
-    launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, kernel, 256/WARP_SIZE, 0,
-        fattn_q4p_cfg<ncols1*ncols2>::C, false, false, false, false);
+    if (q4p_old()) {
+        launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, true>, 256/WARP_SIZE, 0,
+            fattn_q4p_cfg<ncols1*ncols2, true>::C, false, false, false, false);
+    } else {
+        launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false>, 256/WARP_SIZE, 0,
+            fattn_q4p_cfg<ncols1*ncols2, false>::C, false, false, false, false);
+    }
 }
 
 // GGML_CUDA_Q4P_NC2=6 runs the 5-token case over the whole GQA group per block (the old default)
