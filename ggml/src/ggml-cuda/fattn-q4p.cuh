@@ -92,6 +92,19 @@
 #define Q4P_RS 0
 #endif
 
+// no barrier at the chunk end (1 on, 2 off)
+#ifndef Q4P_NOEB
+#define Q4P_NOEB 1
+#endif
+// P published by every split, one position each (1 on, 2 off)
+#ifndef Q4P_PSPL
+#define Q4P_PSPL 1
+#endif
+// fp16 -> fp32 of the fp16 chains: 1 = conversion instruction (exact, subnormals kept),
+// 2 = integer conversion below
+#ifndef Q4P_CVT
+#define Q4P_CVT 1
+#endif
 // fp32 value * 2^-112 of the half in the high / low lane (integer conversion; subnormals flush)
 static __device__ __forceinline__ float fattn_q4p_hi_f(const uint32_t x) {
     return __int_as_float((int32_t(x) >> 3) & 0x8FFFE000);
@@ -138,13 +151,24 @@ struct fattn_q4p_cfg {
     // R=24 has none)
     static constexpr bool KPF  = !ROLL && Q4P_KNOB(KPF, R == 24 ? 2 : 1) == 1;
     static constexpr bool H16QK = Q4P_H16QK == 1 && PT == 2 && BLOCK_T && !ROLL;
+    // fp16 QK with two rows per Q_s word (HFMA2 takes each half broadcast): one LDS.128 per 8 rows
+#ifndef Q4P_QPK
+#define Q4P_QPK 1
+#endif
+    static constexpr bool QPK   = H16QK && Q4P_QPK == 1 && RQP % 8 == 0;
     static constexpr bool H16PV = Q4P_H16PV == 1 && (DPT == 4 || DPT == 8);
     static constexpr bool RS    = !OLD && Q4P_RSON == 1 && Q4P_KNOB(RS, (R == 6 || R == 15 || R == 18) ? 1 : 2) == 1 &&
                                   H16PV && DPT == 8 && RG == 1 && NPG == 8 && C/NPG <= Q4P_PVF;
     // blocks per SM: 6 rows with RS fit 128 registers without spilling (kv 262144: 816 -> 741 us)
     static constexpr int  MINB  = R == Q4P_TUNE_R ? Q4P_MINB : ((RS && R == 6) ? 2 : 1);
     // P_s floats per position; with RS a warp reads 8 positions at once, so PSTR/4 is kept odd
-    static constexpr int PSTR   = RG*RQP + ((RS && (RG*RQP/4) % 2 == 0) ? 4 : 0);
+    // fp16 P with two rows per word (PV takes each half broadcast): half the P_s reads
+#ifndef Q4P_PPK
+#define Q4P_PPK 1
+#endif
+    static constexpr bool PPK   = Q4P_PPK == 1 && RS && RQP % 8 == 0;
+    static constexpr int PW     = PPK ? RG*RQP/2 : RG*RQP; // P_s words per position
+    static constexpr int PSTR   = PW + ((RS && (PW/4) % 2 == 0) ? 4 : 0);
     static constexpr int NACC   = RS ? 1 : DPT;           // fp32 accumulators per row
 
     static_assert(R % RG == 0, "bad RG");
@@ -256,7 +280,9 @@ static __global__ void flash_attn_ext_q4p(
         if (rl < RQ && ic0 + t < n_tok) {
             q = ((const float *) (Q + nb03*sequence + int64_t(nb02)*(head0 + g) + int64_t(nb01)*(ic0 + t)))[dim]*qscale;
         }
-        if constexpr (cfg::H16QK) {
+        if constexpr (cfg::QPK) {
+            ((half *) (Q_s + ((dim / DPS)*RG + rgi)*QREG + (dim % DPS)*(RQP/2)))[rl] = __float2half_rn(q);
+        } else if constexpr (cfg::H16QK) {
             const half2 qq = __float2half2_rn(q);
             Q_s[((dim / DPS)*RG + rgi)*QREG + (dim % DPS)*RQP + rl] = __int_as_float(*(const int *) &qq);
         } else {
@@ -299,19 +325,22 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll
                 for (int h = 0; h < NH; ++h) {
                     const uint32_t ab = *(const uint32_t *) &acc2s[r][h];
-                    x[2*h + 0][r] = 0x1p112f*fattn_q4p_lo_f(ab);
-                    x[2*h + 1][r] = 0x1p112f*fattn_q4p_hi_f(ab);
+                    if constexpr (Q4P_CVT == 1) {
+                        x[2*h + 0][r] = __low2float(acc2s[r][h]);
+                        x[2*h + 1][r] = __high2float(acc2s[r][h]);
+                    } else {
+                        x[2*h + 0][r] = 0x1p112f*fattn_q4p_lo_f(ab);
+                        x[2*h + 1][r] = 0x1p112f*fattn_q4p_hi_f(ab);
+                    }
                 }
             }
-            const bool b4 = pg & 4, b2 = pg & 2, b1 = pg & 1;
+            // x[i] is element i ^ pg (see rs_sh): the partner's x[i + 4] is the same element as x[i]
             float y4[4][RQ];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
 #pragma unroll
                 for (int r = 0; r < RQ; ++r) {
-                    const float keep = b4 ? x[j + 4][r] : x[j][r];
-                    const float send = b4 ? x[j][r] : x[j + 4][r];
-                    y4[j][r] = keep + __shfl_xor_sync(0xFFFFFFFF, send, 4, WARP_SIZE);
+                    y4[j][r] = x[j][r] + __shfl_xor_sync(0xFFFFFFFF, x[j + 4][r], 4, WARP_SIZE);
                 }
             }
             float y2[2][RQ];
@@ -319,22 +348,37 @@ static __global__ void flash_attn_ext_q4p(
             for (int j = 0; j < 2; ++j) {
 #pragma unroll
                 for (int r = 0; r < RQ; ++r) {
-                    const float keep = b2 ? y4[j + 2][r] : y4[j][r];
-                    const float send = b2 ? y4[j][r] : y4[j + 2][r];
-                    y2[j][r] = keep + __shfl_xor_sync(0xFFFFFFFF, send, 2, WARP_SIZE);
+                    y2[j][r] = y4[j][r] + __shfl_xor_sync(0xFFFFFFFF, y4[j + 2][r], 2, WARP_SIZE);
                 }
             }
 #pragma unroll
             for (int r = 0; r < RQ; ++r) {
-                const float keep = b1 ? y2[1][r] : y2[0][r];
-                const float send = b1 ? y2[0][r] : y2[1][r];
-                acc[r][0] += keep + __shfl_xor_sync(0xFFFFFFFF, send, 1, WARP_SIZE);
+                acc[r][0] += y2[0][r] + __shfl_xor_sync(0xFFFFFFFF, y2[1][r], 1, WARP_SIZE);
             }
         }
     };
+    // RS lane permutation: pg bit 2 swaps the low/high nibbles, bit 1 the byte pairs, bit 0 the
+    // bytes within a pair, so this lane's PV element i is element i ^ pg of the plain order
+    const int      rs_sh = 4*((pg >> 2) & 1);
+    const uint32_t rs_e0 = ((pg >> 1) & 1)*2 + (pg & 1), rs_e1 = rs_e0 ^ 1;
+    const uint32_t rs_sa = 0x4040u | rs_e0 | (rs_e1 << 8);
+    const uint32_t rs_sb = 0x4040u | (rs_e0 ^ 2) | ((rs_e1 ^ 2) << 8);
     // softmax denominator of row tid, for tid < R: summed once per chunk from P_s, so the PV
     // loop neither spends registers on it nor diverges to add it
     float l_row = 0.0f;
+    auto add_lsum = [&]() {
+        if (tid < R) {
+            float ls = 0.0f;
+#pragma unroll
+            for (int w = 0; w < NT/WARP_SIZE; ++w) {
+                ls += lsum_s[w][tid];
+            }
+            l_row += ls;
+        }
+    };
+    // No barrier at the chunk end: the next chunk's first barrier (the lazy-max vote) already orders
+    // this chunk's P_s reads before the next publish, so warps run ahead into the next QK phase
+    constexpr bool NOEB = Q4P_NOEB == 1;
 
     // this thread's V word: block b, word k of each row
     const int pv_d0 = fattn_q4p_pv_dim<DPT>(dg, 0);
@@ -350,6 +394,24 @@ static __global__ void flash_attn_ext_q4p(
 
     constexpr int NW = cfg::ROLL ? 1 : 9*BPS/2; // aligned words per split of a row
     uint32_t un[PT][NW]; // with KPF: the K words of the chunk about to start
+    // The mask halves of a chunk's positions, one per token (RG == 1: a thread's rows cover the
+    // tokens in order). Loaded with the K words, ahead of the QK math: loaded where they are added,
+    // after it, their latency sat in front of the chunk's first barrier.
+    constexpr bool MPRE = RG == 1;
+    uint32_t mraw[MPRE ? PT : 1][MPRE ? ncols1 : 1];
+    auto load_mask = [&](const int kc) {
+        if constexpr (MPRE) {
+#pragma unroll
+            for (int pt = 0; pt < PT; ++pt) {
+                const int pos = kc + qslot + NQP*pt;
+#pragma unroll
+                for (int t = 0; t < ncols1; ++t) {
+                    mraw[pt][t] = Mb && pos < ne11 && ic0 + t < n_tok ?
+                        __ldg((const unsigned short *) (Mb + int64_t(nb31)*t) + pos) : 0;
+                }
+            }
+        }
+    };
     auto load_k = [&](const int kc) {
 #pragma unroll
         for (int pt = 0; pt < PT; ++pt) {
@@ -360,6 +422,7 @@ static __global__ void flash_attn_ext_q4p(
                 un[pt][j] = __ldg(sp + j);
             }
         }
+        load_mask(kc);
     };
     if constexpr (cfg::KPF) {
         load_k(blockIdx.y*C);
@@ -367,6 +430,9 @@ static __global__ void flash_attn_ext_q4p(
 
     for (int k0 = blockIdx.y*C; k0 < ne11; k0 += gridDim.y*C) {
         const int p_end = min(C, ne11 - k0);
+        if constexpr (!cfg::KPF) {
+            load_mask(k0);
+        }
 
         // Start this chunk's V rows toward L2 now, so the PV phase does not wait on DRAM: one
         // prefetch per 128-byte line of the chunk's rows.
@@ -467,6 +533,23 @@ static __global__ void flash_attn_ext_q4p(
                         for (int e = 0; e < 4; ++e) {
                             const uint32_t yb = __byte_perm(e < 2 ? i01 : i23, 0x64646464u, (e & 1) ? 0x4342 : 0x4140);
                             const half2 y2 = __hsub2(*(const half2 *) &yb, off);
+                            if constexpr (cfg::QPK) {
+                                const uint4 * q4 = (const uint4 *) (Qt + (32*bl + 4*k + e + 16*hh)*(RQP/2));
+#pragma unroll
+                                for (int rq = 0; rq < RQP/8; ++rq) {
+                                    const uint4 q = q4[rq];
+                                    const uint32_t qv[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+                                    for (int c = 0; c < 8; ++c) {
+                                        if (8*rq + c < RQ) {
+                                            const half2 qh = *(const half2 *) &qv[c/2];
+                                            const half2 qb = (c & 1) ? __high2half2(qh) : __low2half2(qh);
+                                            t2[8*rq + c] = __hfma2(qb, y2, t2[8*rq + c]);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                             const uint4 * q4 = (const uint4 *) (Qt + (32*bl + 4*k + e + 16*hh)*RQP);
 #pragma unroll
                             for (int rq = 0; rq < RQP/4; ++rq) {
@@ -485,8 +568,13 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll
                 for (int r = 0; r < RQ; ++r) {
                     const uint32_t tb = *(const uint32_t *) &t2[r];
-                    S[0][r] = fmaf(d[0], fattn_q4p_lo_f(tb), S[0][r]);
-                    S[1][r] = fmaf(d[1], fattn_q4p_hi_f(tb), S[1][r]);
+                    if constexpr (Q4P_CVT == 1) {
+                        S[0][r] = fmaf(d[0], __low2float(t2[r]),  S[0][r]);
+                        S[1][r] = fmaf(d[1], __high2float(t2[r]), S[1][r]);
+                    } else {
+                        S[0][r] = fmaf(d[0], fattn_q4p_lo_f(tb), S[0][r]);
+                        S[1][r] = fmaf(d[1], fattn_q4p_hi_f(tb), S[1][r]);
+                    }
                 }
                 continue;
             }
@@ -554,7 +642,7 @@ static __global__ void flash_attn_ext_q4p(
             }
         }
 
-        if constexpr (cfg::H16QK) {
+        if constexpr (cfg::H16QK && Q4P_CVT != 1) {
 #pragma unroll
             for (int pt = 0; pt < PT; ++pt) {
 #pragma unroll
@@ -587,6 +675,8 @@ static __global__ void flash_attn_ext_q4p(
                 float mv = 0.0f;
                 if (!kvalid[pt]) {
                     mv = -INFINITY;
+                } else if constexpr (MPRE) {
+                    mv = __half2float(__ushort_as_half((unsigned short) mraw[pt][t]))*LOG2E;
                 } else if (Mb && ic0 + t < n_tok) {
                     mv = __half2float(((const half *) (Mb + int64_t(nb31)*t))[pos])*LOG2E;
                 }
@@ -601,7 +691,15 @@ static __global__ void flash_attn_ext_q4p(
         for (int rl = 0; rl < RQ; ++rl) {
             grow |= lmax[rl] > m_s[qgrp*RQ + rl] + 8.0f;
         }
-        if (__syncthreads_or(grow)) {
+        const bool any_grow = __syncthreads_or(grow);
+        if constexpr (NOEB) {
+            // the previous chunk's denominators: every warp wrote them before this barrier, and
+            // this chunk's are written only after the P barrier below
+            if (k0 != blockIdx.y*C) {
+                add_lsum();
+            }
+        }
+        if (any_grow) {
             // per warp, reduce over the lanes that share a row group (the position-slot bits)
 #pragma unroll
             for (int rl = 0; rl < RQ; ++rl) {
@@ -636,11 +734,24 @@ static __global__ void flash_attn_ext_q4p(
             }
         }
 
-        // P for this chunk, published by the first thread of each position
-        if (qsplit == 0) {
+        // P for this chunk, published by the first thread of each position; with as many splits as
+        // positions per thread, split j publishes position j (the reduction left S in both)
+        constexpr bool PSPL = NSPLIT == PT && Q4P_PSPL == 1;
+        if (PSPL || qsplit == 0) {
+            if constexpr (PSPL) {
 #pragma unroll
-            for (int pt = 0; pt < PT; ++pt) {
-                float * Pp = P_s + (qslot + NQP*pt)*PSTR + qgrp*RQP;
+                for (int r = 0; r < RQ; ++r) {
+#pragma unroll
+                    for (int pt = 1; pt < PT; ++pt) {
+                        if (qsplit == pt) {
+                            S[0][r] = S[pt][r];
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int pt = 0; pt < (PSPL ? 1 : PT); ++pt) {
+                float * Pp = P_s + (qslot + NQP*(PSPL ? qsplit : pt))*PSTR + qgrp*(cfg::PPK ? RQP/2 : RQP);
 #pragma unroll
                 for (int rq = 0; rq < RQP/4; ++rq) {
                     float pv[4];
@@ -649,7 +760,11 @@ static __global__ void flash_attn_ext_q4p(
                         const int rl = 4*rq + c;
                         pv[c] = rl < RQ ? exp2f(S[pt][rl] - m_s[qgrp*RQ + rl]) : 0.0f;
                     }
-                    if constexpr (cfg::H16PV) {
+                    if constexpr (cfg::PPK) {
+                        const half2 h01 = __floats2half2_rn(pv[0], pv[1]);
+                        const half2 h23 = __floats2half2_rn(pv[2], pv[3]);
+                        ((uint2 *) Pp)[rq] = make_uint2(*(const uint32_t *) &h01, *(const uint32_t *) &h23);
+                    } else if constexpr (cfg::H16PV) {
                         uint32_t hb[4];
 #pragma unroll
                         for (int c = 0; c < 4; ++c) {
@@ -688,7 +803,10 @@ static __global__ void flash_attn_ext_q4p(
                 for (int j = 0; j < LPPS; ++j) {
                     const int p = seg*LPPS + j;
                     if (p < p_end) {
-                        if constexpr (cfg::H16PV) {
+                        if constexpr (cfg::PPK) {
+                            // the rounded p the numerator uses
+                            ls += __half2float(((const half *) &P_s[p*PSTR])[off]);
+                        } else if constexpr (cfg::H16PV) {
                             // the rounded p the numerator uses
                             ls += __low2float(*(const half2 *) &P_s[p*PSTR + off]);
                         } else {
@@ -735,8 +853,13 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll
                         for (int h = 0; h < NH; ++h) {
                             const uint32_t ab = *(const uint32_t *) &acc2[r][h];
-                            acc[r][2*h + 0] = fmaf(0x1p112f, fattn_q4p_lo_f(ab), acc[r][2*h + 0]);
-                            acc[r][2*h + 1] = fmaf(0x1p112f, fattn_q4p_hi_f(ab), acc[r][2*h + 1]);
+                            if constexpr (Q4P_CVT == 1) {
+                                acc[r][2*h + 0] += __low2float(acc2[r][h]);
+                                acc[r][2*h + 1] += __high2float(acc2[r][h]);
+                            } else {
+                                acc[r][2*h + 0] = fmaf(0x1p112f, fattn_q4p_lo_f(ab), acc[r][2*h + 0]);
+                                acc[r][2*h + 1] = fmaf(0x1p112f, fattn_q4p_hi_f(ab), acc[r][2*h + 1]);
+                            }
                             acc2[r][h] = make_half2(0.0f, 0.0f);
                         }
                     }
@@ -746,11 +869,16 @@ static __global__ void flash_attn_ext_q4p(
             // V words two positions ahead: a quarter of the fp32 path's work per position no
             // longer covers an L2 round trip
             uint32_t nd2, nw02, nw12;
+            // row offsets within the chunk in 32 bits, advanced by one step and clamped to the last
+            // row (the 64-bit row products cost ~20 instructions per position)
+            const char * vcd = Vb + int64_t(k0)*nb21 + 18*pv_b;
+            const char * vcw = Vb + int64_t(k0)*nb21 + pv_oa;
+            const int vstep = NPG*nb21, vlast = (p_end - 1)*nb21;
+            int vo = min(pg + NPG, p_end - 1)*nb21;
             {
-                const char * vrow = Vb + int64_t(k0 + min(pg + NPG, p_end - 1))*nb21;
-                nd2  = fattn_q4p_ld16(vrow + 18*pv_b);
-                nw02 = __ldg((const uint32_t *) (vrow + pv_oa));
-                nw12 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+                nd2  = fattn_q4p_ld16(vcd + vo);
+                nw02 = __ldg((const uint32_t *) (vcw + vo));
+                nw12 = __ldg((const uint32_t *) (vcw + vo + 4));
             }
 #pragma unroll 2
             for (int p = pg; p < p_end; p += NPG) {
@@ -758,21 +886,49 @@ static __global__ void flash_attn_ext_q4p(
                 const uint32_t wv  = __byte_perm(nw0, nw1, pv_sel);
                 nd = nd2; nw0 = nw02; nw1 = nw12;
                 {
-                    const char * vrow = Vb + int64_t(k0 + min(p + 2*NPG, p_end - 1))*nb21;
-                    nd2  = fattn_q4p_ld16(vrow + 18*pv_b);
-                    nw02 = __ldg((const uint32_t *) (vrow + pv_oa));
-                    nw12 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+                    vo = min(vo + vstep, vlast); // row min(p + 2*NPG, p_end - 1)
+                    nd2  = fattn_q4p_ld16(vcd + vo);
+                    nw02 = __ldg((const uint32_t *) (vcw + vo));
+                    nw12 = __ldg((const uint32_t *) (vcw + vo + 4));
                 }
                 // DPT 4: this thread's nibble half of the word; DPT 8: low nibbles (dims 0-3), then high
                 half2 y[NH];
 #pragma unroll
                 for (int h2 = 0; h2 < NH/2; ++h2) {
-                    const uint32_t nb = (DPT == 8 ? h2 : (dg & 1)) ? ((wv >> 4) & 0x0F0F0F0Fu) : (wv & 0x0F0F0F0Fu);
-                    const uint32_t ya = __byte_perm(nb, 0x64646464u, 0x4140); // bytes 0, 1 as 1024 + n
-                    const uint32_t yb = __byte_perm(nb, 0x64646464u, 0x4342); // bytes 2, 3
+                    uint32_t nb, ya, yb;
+                    if constexpr (cfg::RS) {
+                        // element i of this lane is element i ^ pg of the plain order, so that fold_rs
+                        // keeps and sends fixed registers (no selects)
+                        nb = (wv >> (h2 ? 4 - rs_sh : rs_sh)) & 0x0F0F0F0Fu;
+                        ya = __byte_perm(nb, 0x64646464u, rs_sa);
+                        yb = __byte_perm(nb, 0x64646464u, rs_sb);
+                    } else {
+                        nb = (DPT == 8 ? h2 : (dg & 1)) ? ((wv >> 4) & 0x0F0F0F0Fu) : (wv & 0x0F0F0F0Fu);
+                        ya = __byte_perm(nb, 0x64646464u, 0x4140); // bytes 0, 1 as 1024 + n
+                        yb = __byte_perm(nb, 0x64646464u, 0x4342); // bytes 2, 3
+                    }
                     y[2*h2 + 0] = __hmul2(__hsub2(*(const half2 *) &ya, off), dv2);
                     y[2*h2 + 1] = __hmul2(__hsub2(*(const half2 *) &yb, off), dv2);
                 }
+                if constexpr (cfg::PPK) {
+                    const uint4 * pq = (const uint4 *) (P_s + p*PSTR);
+#pragma unroll
+                    for (int rq = 0; rq < RQP/8; ++rq) {
+                        const uint4 q = pq[rq];
+                        const uint32_t pv[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+                        for (int c = 0; c < 8; ++c) {
+                            if (8*rq + c < RQ) {
+                                const half2 ph = *(const half2 *) &pv[c/2];
+                                const half2 pb = (c & 1) ? __high2half2(ph) : __low2half2(ph);
+#pragma unroll
+                                for (int h = 0; h < NH; ++h) {
+                                    acc2[8*rq + c][h] = __hfma2(pb, y[h], acc2[8*rq + c][h]);
+                                }
+                            }
+                        }
+                    }
+                } else {
                 const uint4 * pq = (const uint4 *) (P_s + p*PSTR + vgrp*RQP);
 #pragma unroll
                 for (int rq = 0; rq < RQP/4; ++rq) {
@@ -787,6 +943,7 @@ static __global__ void flash_attn_ext_q4p(
                             }
                         }
                     }
+                }
                 }
                 if constexpr (!cfg::RS) {
                     if (++np == Q4P_PVF) {
@@ -862,15 +1019,14 @@ static __global__ void flash_attn_ext_q4p(
                 }
             }
         }
-        __syncthreads();
-        if (tid < R) {
-            float ls = 0.0f;
-#pragma unroll
-            for (int w = 0; w < NT/WARP_SIZE; ++w) {
-                ls += lsum_s[w][tid];
-            }
-            l_row += ls;
+        if constexpr (!NOEB) {
+            __syncthreads();
+            add_lsum();
         }
+    }
+    if constexpr (NOEB) {
+        __syncthreads();
+        add_lsum();
     }
 
     // ---- reduce the NPG partial outputs and the partial denominators ----
