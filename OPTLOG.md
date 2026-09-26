@@ -8481,3 +8481,25 @@ changes. GGML_CUDA_Q4P_OLD=1 selects the old configuration at run time.
 Ablation on the way (15 rows, op test): QK-only 1505 us, PV-only 1466 of 2476. SASS shows the mask
 loads issued after the QK math, right before the chunk barrier (a fix is in the worktree, uncommitted).
 Tried and lost: 2 blocks/SM at 15 rows via NSPLIT 4 (2775-3000 us), R=30 at DPT 8 (4149).
+
+## Attempt 225 — fold-path prefill attention (fattn-gemm.cu, GGML_CUDA_FA_FOLD): kept, default on
+
+Two hand-written kernels replace the cuBLAS QK^T / softmax / PV sequence for a q4_0 cache:
+`fa_fold_qk2` computes QK^T with the softmax in its epilogue (S never reaches memory; writes f16 P
+in the PV kernel's layout, 2 CTAs/SM), `fa_fold_pv` accumulates fp16 over 128 keys and fp32 across
+them, with the O rescale fused. KV split over 2 streams, 2048-key chunks. Knobs: GGML_CUDA_FA_FOLD
+(=0 old cuBLAS path), _CHUNK (2048; 1024 saves ~50 MB scratch/GPU for ~2%), _SPLIT (2).
+Op, kv=262144 nb=1024 causal (GPU1, ABBA): ~318 -> ~270 ms (the last commit, P layout, is on
+goal/pfattn 6ba2952d5 and not yet merged). Old path breakdown: QK 121, PV 123, softmax 64 ms.
+Accuracy: KLD vs fp32 base (8x4096, -ub 1024) 0.001211 (fold) vs 0.001249 (cuBLAS path), FA eval
+4019/4019. Scratch per GPU ~165 MB at -ub 1024 (old ~71 MB); GPU0 min free at 262k 696-702 MiB.
+
+End to end, 2026-09-25 23:30-23:40, depth-bench --restore --extra-chars 4100 (1479 new tokens),
+merged build (attempts 223-225) B then old build A (build-sweep0925b), 2 questions x 2 seeds:
+
+    2k    decode   B 50.0 t/s  60.0 ms/cycle     A 42.6 t/s  71.7 ms/cycle
+    260k  decode   B 33.8 t/s 101.4 ms/cycle     A 26.9 t/s 123.7 ms/cycle
+    260k  prefill  B 122.5 t/s                   A 84.8 t/s
+
+B ran first (cards 62-66 C at start), A second (72-77 C), so A carries more heat penalty; a hot B
+rerun follows. Verify-path KLD on the merged build (-ub 5, 3 chunks): 0.001172 (was ~0.00114).

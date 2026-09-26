@@ -109,6 +109,9 @@ def main():
     ap.add_argument("--server-prefix", default="", help="command prefix for the server, e.g. an nsys profile invocation")
     ap.add_argument("--seed-offset", type=int, default=0, help="restore mode: first seed index (to draw new seeds)")
     ap.add_argument("--seeds", type=int, default=1, help="restore mode: repeat each question with this many seeds")
+    ap.add_argument("--extra-chars", type=int, default=0,
+                    help="restore mode: insert this many characters of corpus text before the question, "
+                         "to time prefill at the snapshot's depth (~4100 chars is ~1k tokens)")
     ap.add_argument("--graphs", default="3", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 3, single-token graphs only)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--fill", metavar="DIR")
@@ -167,12 +170,16 @@ def main():
             manifest = json.load(open(manifest_path))
             want = set(depths) if a.depths_given else None
             nmaxs = [int(x) for x in a.n_max.split(",")] if a.n_max else [None]
+            extra = ""
+            if a.extra_chars:
+                t = open(CORPUS, encoding="utf-8", errors="ignore").read()[:a.extra_chars]
+                extra = t[:t.rfind("\n\n") + 2] if "\n\n" in t else t + "\n\n"
             for ent in manifest:
                 if want and not any(abs(ent["n_tokens"] - d) < 4096 for d in want):
                     continue
                 for nm, si, (qi, q) in [(nm, si, qq) for nm in nmaxs for si in range(a.seed_offset, a.seed_offset + a.seeds) for qq in enumerate(QUESTIONS)]:
                         post(f"/slots/0?action=restore", {"filename": ent["file"]})
-                        full = open(os.path.join(slot_dir, ent["prompt_file"]), encoding="utf-8").read() + q
+                        full = open(os.path.join(slot_dir, ent["prompt_file"]), encoding="utf-8").read() + extra + q
                         full = render_tail(full, ent)
                         body = {"prompt": full, "n_predict": a.n_predict, "cache_prompt": True, "seed": 1234 + qi + 1000 * si}
                         if nm is not None:
