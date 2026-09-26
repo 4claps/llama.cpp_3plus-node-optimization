@@ -80,6 +80,17 @@
 #ifndef Q4P_PVF
 #define Q4P_PVF 32
 #endif
+// PV at DPT 8: the 8 position groups of a dimension group sit in one warp, and each chunk's fp16
+// partials are converted and reduce-scattered across them by shuffles, so a thread keeps RQ fp32
+// accumulators (one output dim) instead of RQ*DPT. Q4P_RSON 2 turns it off everywhere; per width
+// (Q4P_RS 1 on, 2 off) it is on at 15 and 18 rows (kv 262144: 2520 -> 2430 us, 2290 -> 1676), off at
+// 6 and 12 (805 -> 827, 1071 -> 1087).
+#ifndef Q4P_RSON
+#define Q4P_RSON 1
+#endif
+#ifndef Q4P_RS
+#define Q4P_RS 0
+#endif
 
 // fp32 value * 2^-112 of the half in the high / low lane (integer conversion; subnormals flush)
 static __device__ __forceinline__ float fattn_q4p_hi_f(const uint32_t x) {
@@ -116,9 +127,9 @@ struct fattn_q4p_cfg {
     static constexpr int NPG    = NT/(NDG*RG);
     // Fold the V block scale into P (RQ multiplies per position) or into V (DPT multiplies).
     static constexpr bool FOLD  = RQ <= DPT;
-    static constexpr int PSTR   = RG*RQP;                 // P_s floats per position
     // L2 prefetch of the chunk's V rows and the next chunk's K rows (1 = on, 2 = off)
-    static constexpr bool PREFETCH = Q4P_KNOB(PF, 1) == 1;
+    // (off at 15 rows since the PV reduce-scatter: 2476 -> 2356 us at kv 262144)
+    static constexpr bool PREFETCH = Q4P_KNOB(PF, R == 15 ? 2 : 1) == 1;
     // QK over the BPS blocks of a split: rolled (1) keeps the kernel inside the instruction cache,
     // unrolled (2) holds the whole split's words in registers
     static constexpr bool ROLL = Q4P_KNOB(ROLL, 2) == 1;
@@ -127,6 +138,10 @@ struct fattn_q4p_cfg {
     static constexpr bool KPF  = !ROLL && Q4P_KNOB(KPF, R == 24 ? 2 : 1) == 1;
     static constexpr bool H16QK = Q4P_H16QK == 1 && PT == 2 && BLOCK_T && !ROLL;
     static constexpr bool H16PV = Q4P_H16PV == 1 && (DPT == 4 || DPT == 8);
+    static constexpr bool RS    = Q4P_RSON == 1 && Q4P_KNOB(RS, (R == 15 || R == 18) ? 1 : 2) == 1 && H16PV && DPT == 8 && RG == 1 && NPG == 8 && C/NPG <= Q4P_PVF;
+    // P_s floats per position; with RS a warp reads 8 positions at once, so PSTR/4 is kept odd
+    static constexpr int PSTR   = RG*RQP + ((RS && (RG*RQP/4) % 2 == 0) ? 4 : 0);
+    static constexpr int NACC   = RS ? 1 : DPT;           // fp32 accumulators per row
 
     static_assert(R % RG == 0, "bad RG");
     static_assert(NT % (NDG*RG) == 0 && NPG >= 1, "bad DPT");
@@ -195,7 +210,7 @@ static __global__ void flash_attn_ext_q4p(
     using cfg = fattn_q4p_cfg<R>;
     constexpr int NT = cfg::NT, RG = cfg::RG, RQ = cfg::RQ, RQP = cfg::RQP, C = cfg::C, PT = cfg::PT;
     constexpr int NSPLIT = cfg::NSPLIT, NQP = cfg::NQP, BPS = cfg::BPS, DPS = cfg::DPS, QREG = cfg::QREG;
-    constexpr int DPT = cfg::DPT, NDG = cfg::NDG, NPG = cfg::NPG, PSTR = cfg::PSTR;
+    constexpr int DPT = cfg::DPT, NDG = cfg::NDG, NPG = cfg::NPG, PSTR = cfg::PSTR, NACC = cfg::NACC;
     constexpr float LOG2E = 1.4426950408889634f;
     constexpr float LN2   = 0.6931471805599453f;
 
@@ -255,18 +270,64 @@ static __global__ void flash_attn_ext_q4p(
     const float * Qt = Q_s + (qsplit*RG + qgrp)*QREG;
 
     // PV role: dim group (fastest), row group, position group
-    const int dg   = tid % NDG;
-    const int vgrp = (tid / NDG) % RG;
-    const int pg   = tid / (NDG*RG);
+    // (RS: position group fastest, so a warp holds all 8 groups of 4 dim groups)
+    const int dg   = cfg::RS ? tid / NPG : tid % NDG;
+    const int vgrp = cfg::RS ? 0 : (tid / NDG) % RG;
+    const int pg   = cfg::RS ? tid % NPG : tid / (NDG*RG);
 
-    float acc[RQ][DPT];
+    float acc[RQ][NACC];   // RS: dim fattn_q4p_pv_dim(dg, pg) of each row
 #pragma unroll
     for (int r = 0; r < RQ; ++r) {
 #pragma unroll
-        for (int j = 0; j < DPT; ++j) {
+        for (int j = 0; j < NACC; ++j) {
             acc[r][j] = 0.0f;
         }
     }
+    // RS: fold_rs converts (exact) and scales each of a chunk's fp16 PV partials, then halves the
+    // set 3 times across the position groups (lane bits 2, 1, 0): lane pg ends with element j = pg
+    // of every row, added to its fp32 accumulators
+    auto fold_rs = [&](auto & acc2s) {
+        if constexpr (cfg::RS) {
+            constexpr int NH = DPT/2;
+            float x[DPT][RQ];
+#pragma unroll
+            for (int r = 0; r < RQ; ++r) {
+#pragma unroll
+                for (int h = 0; h < NH; ++h) {
+                    const uint32_t ab = *(const uint32_t *) &acc2s[r][h];
+                    x[2*h + 0][r] = 0x1p112f*fattn_q4p_lo_f(ab);
+                    x[2*h + 1][r] = 0x1p112f*fattn_q4p_hi_f(ab);
+                }
+            }
+            const bool b4 = pg & 4, b2 = pg & 2, b1 = pg & 1;
+            float y4[4][RQ];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+                    const float keep = b4 ? x[j + 4][r] : x[j][r];
+                    const float send = b4 ? x[j][r] : x[j + 4][r];
+                    y4[j][r] = keep + __shfl_xor_sync(0xFFFFFFFF, send, 4, WARP_SIZE);
+                }
+            }
+            float y2[2][RQ];
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+                    const float keep = b2 ? y4[j + 2][r] : y4[j][r];
+                    const float send = b2 ? y4[j][r] : y4[j + 2][r];
+                    y2[j][r] = keep + __shfl_xor_sync(0xFFFFFFFF, send, 2, WARP_SIZE);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < RQ; ++r) {
+                const float keep = b1 ? y2[1][r] : y2[0][r];
+                const float send = b1 ? y2[0][r] : y2[1][r];
+                acc[r][0] += keep + __shfl_xor_sync(0xFFFFFFFF, send, 1, WARP_SIZE);
+            }
+        }
+    };
     // softmax denominator of row tid, for tid < R: summed once per chunk from P_s, so the PV
     // loop neither spends registers on it nor diverges to add it
     float l_row = 0.0f;
@@ -565,7 +626,7 @@ static __global__ void flash_attn_ext_q4p(
             for (int rl = 0; rl < RQ; ++rl) {
                 const float a = a_s[vgrp*RQ + rl];
 #pragma unroll
-                for (int j = 0; j < DPT; ++j) {
+                for (int j = 0; j < NACC; ++j) {
                     acc[rl][j] *= a;
                 }
             }
@@ -664,14 +725,16 @@ static __global__ void flash_attn_ext_q4p(
             }
             const half2 off = make_half2(1032.0f, 1032.0f);
             auto fold = [&]() {
+                if constexpr (!cfg::RS) {
 #pragma unroll
-                for (int r = 0; r < RQ; ++r) {
+                    for (int r = 0; r < RQ; ++r) {
 #pragma unroll
-                    for (int h = 0; h < NH; ++h) {
-                        const uint32_t ab = *(const uint32_t *) &acc2[r][h];
-                        acc[r][2*h + 0] = fmaf(0x1p112f, fattn_q4p_lo_f(ab), acc[r][2*h + 0]);
-                        acc[r][2*h + 1] = fmaf(0x1p112f, fattn_q4p_hi_f(ab), acc[r][2*h + 1]);
-                        acc2[r][h] = make_half2(0.0f, 0.0f);
+                        for (int h = 0; h < NH; ++h) {
+                            const uint32_t ab = *(const uint32_t *) &acc2[r][h];
+                            acc[r][2*h + 0] = fmaf(0x1p112f, fattn_q4p_lo_f(ab), acc[r][2*h + 0]);
+                            acc[r][2*h + 1] = fmaf(0x1p112f, fattn_q4p_hi_f(ab), acc[r][2*h + 1]);
+                            acc2[r][h] = make_half2(0.0f, 0.0f);
+                        }
                     }
                 }
             };
@@ -721,12 +784,18 @@ static __global__ void flash_attn_ext_q4p(
                         }
                     }
                 }
-                if (++np == Q4P_PVF) {
-                    np = 0;
-                    fold();
+                if constexpr (!cfg::RS) {
+                    if (++np == Q4P_PVF) {
+                        np = 0;
+                        fold();
+                    }
                 }
             }
-            fold();
+            if constexpr (cfg::RS) {
+                fold_rs(acc2);
+            } else {
+                fold();
+            }
         } else
 #pragma unroll 2
         for (int p = pg; p < p_end; p += NPG) {
@@ -809,19 +878,27 @@ static __global__ void flash_attn_ext_q4p(
         }
     }
     float * O_s = Q_s;
+    if constexpr (cfg::RS) {
 #pragma unroll
-    for (int g0 = 0; g0 < NPG; ++g0) {
-        if (pg == g0) {
-#pragma unroll
-            for (int r = 0; r < RQ; ++r) {
-#pragma unroll
-                for (int j = 0; j < DPT; ++j) {
-                    float & o = O_s[(vgrp*RQ + r)*D + fattn_q4p_pv_dim<DPT>(dg, j)];
-                    o = g0 == 0 ? acc[r][j] : o + acc[r][j];
-                }
-            }
+        for (int r = 0; r < RQ; ++r) {
+            O_s[r*D + fattn_q4p_pv_dim<DPT>(dg, pg)] = acc[r][0];
         }
         __syncthreads();
+    } else {
+#pragma unroll
+        for (int g0 = 0; g0 < NPG; ++g0) {
+            if (pg == g0) {
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+#pragma unroll
+                    for (int j = 0; j < DPT; ++j) {
+                        float & o = O_s[(vgrp*RQ + r)*D + fattn_q4p_pv_dim<DPT>(dg, j)];
+                        o = g0 == 0 ? acc[r][j] : o + acc[r][j];
+                    }
+                }
+            }
+            __syncthreads();
+        }
     }
 
     for (int idx = tid; idx < R*D; idx += NT) {

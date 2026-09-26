@@ -7858,6 +7858,16 @@ struct test_flash_attn_ext : public test_case {
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
+                } else if (getenv("GGML_TEST_FA_CAUSAL")) {
+                    // the model's mask: query i of the batch sees keys 0 .. kv - nb + i, i.e. a
+                    // prefill batch at the end of the context (zeros, then -inf)
+                    std::vector<ggml_fp16_t> d(ggml_nelements(t));
+                    for (int64_t i = 0; i < ggml_nelements(t); i++) {
+                        const int64_t j = i % t->ne[0];
+                        const int64_t q = (i / t->ne[0]) % t->ne[1];
+                        d[i] = ggml_fp32_to_fp16(j <= kv - nb + q ? 0.0f : -INFINITY);
+                    }
+                    ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(ggml_fp16_t));
                 } else {
                     init_tensor_kq_mask(t);
                 }
@@ -11399,7 +11409,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // minutes llama-bench spends rebuilding 262144 tokens of context to time one batch.
     // nb=2048 is a prefill batch; nb=1 is decode, which takes the VEC kernel instead.
     for (int kv : {32768, 65536, 131072, 262144}) {
-        for (int nb : {2048, 512, 16, 8, 7, 6, 5, 4, 3, 2, 1}) {
+        for (int nb : {2048, 1024, 512, 16, 8, 7, 6, 5, 4, 3, 2, 1}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
         }
     }
