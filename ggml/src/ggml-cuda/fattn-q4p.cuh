@@ -303,15 +303,13 @@ static __global__ void flash_attn_ext_q4p(
                     x[2*h + 1][r] = 0x1p112f*fattn_q4p_hi_f(ab);
                 }
             }
-            const bool b4 = pg & 4, b2 = pg & 2, b1 = pg & 1;
+            // x[i] is element i ^ pg (see rs_sh): the partner's x[i + 4] is the same element as x[i]
             float y4[4][RQ];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
 #pragma unroll
                 for (int r = 0; r < RQ; ++r) {
-                    const float keep = b4 ? x[j + 4][r] : x[j][r];
-                    const float send = b4 ? x[j][r] : x[j + 4][r];
-                    y4[j][r] = keep + __shfl_xor_sync(0xFFFFFFFF, send, 4, WARP_SIZE);
+                    y4[j][r] = x[j][r] + __shfl_xor_sync(0xFFFFFFFF, x[j + 4][r], 4, WARP_SIZE);
                 }
             }
             float y2[2][RQ];
@@ -319,19 +317,21 @@ static __global__ void flash_attn_ext_q4p(
             for (int j = 0; j < 2; ++j) {
 #pragma unroll
                 for (int r = 0; r < RQ; ++r) {
-                    const float keep = b2 ? y4[j + 2][r] : y4[j][r];
-                    const float send = b2 ? y4[j][r] : y4[j + 2][r];
-                    y2[j][r] = keep + __shfl_xor_sync(0xFFFFFFFF, send, 2, WARP_SIZE);
+                    y2[j][r] = y4[j][r] + __shfl_xor_sync(0xFFFFFFFF, y4[j + 2][r], 2, WARP_SIZE);
                 }
             }
 #pragma unroll
             for (int r = 0; r < RQ; ++r) {
-                const float keep = b1 ? y2[1][r] : y2[0][r];
-                const float send = b1 ? y2[0][r] : y2[1][r];
-                acc[r][0] += keep + __shfl_xor_sync(0xFFFFFFFF, send, 1, WARP_SIZE);
+                acc[r][0] += y2[0][r] + __shfl_xor_sync(0xFFFFFFFF, y2[1][r], 1, WARP_SIZE);
             }
         }
     };
+    // RS lane permutation: pg bit 2 swaps the low/high nibbles, bit 1 the byte pairs, bit 0 the
+    // bytes within a pair, so this lane's PV element i is element i ^ pg of the plain order
+    const int      rs_sh = 4*((pg >> 2) & 1);
+    const uint32_t rs_e0 = ((pg >> 1) & 1)*2 + (pg & 1), rs_e1 = rs_e0 ^ 1;
+    const uint32_t rs_sa = 0x4040u | rs_e0 | (rs_e1 << 8);
+    const uint32_t rs_sb = 0x4040u | (rs_e0 ^ 2) | ((rs_e1 ^ 2) << 8);
     // softmax denominator of row tid, for tid < R: summed once per chunk from P_s, so the PV
     // loop neither spends registers on it nor diverges to add it
     float l_row = 0.0f;
@@ -350,6 +350,24 @@ static __global__ void flash_attn_ext_q4p(
 
     constexpr int NW = cfg::ROLL ? 1 : 9*BPS/2; // aligned words per split of a row
     uint32_t un[PT][NW]; // with KPF: the K words of the chunk about to start
+    // The mask halves of a chunk's positions, one per token (RG == 1: a thread's rows cover the
+    // tokens in order). Loaded with the K words, ahead of the QK math: loaded where they are added,
+    // after it, their latency sat in front of the chunk's first barrier.
+    constexpr bool MPRE = RG == 1;
+    uint32_t mraw[MPRE ? PT : 1][MPRE ? ncols1 : 1];
+    auto load_mask = [&](const int kc) {
+        if constexpr (MPRE) {
+#pragma unroll
+            for (int pt = 0; pt < PT; ++pt) {
+                const int pos = kc + qslot + NQP*pt;
+#pragma unroll
+                for (int t = 0; t < ncols1; ++t) {
+                    mraw[pt][t] = Mb && pos < ne11 && ic0 + t < n_tok ?
+                        __ldg((const unsigned short *) (Mb + int64_t(nb31)*t) + pos) : 0;
+                }
+            }
+        }
+    };
     auto load_k = [&](const int kc) {
 #pragma unroll
         for (int pt = 0; pt < PT; ++pt) {
@@ -360,6 +378,7 @@ static __global__ void flash_attn_ext_q4p(
                 un[pt][j] = __ldg(sp + j);
             }
         }
+        load_mask(kc);
     };
     if constexpr (cfg::KPF) {
         load_k(blockIdx.y*C);
@@ -367,6 +386,9 @@ static __global__ void flash_attn_ext_q4p(
 
     for (int k0 = blockIdx.y*C; k0 < ne11; k0 += gridDim.y*C) {
         const int p_end = min(C, ne11 - k0);
+        if constexpr (!cfg::KPF) {
+            load_mask(k0);
+        }
 
         // Start this chunk's V rows toward L2 now, so the PV phase does not wait on DRAM: one
         // prefetch per 128-byte line of the chunk's rows.
@@ -587,6 +609,8 @@ static __global__ void flash_attn_ext_q4p(
                 float mv = 0.0f;
                 if (!kvalid[pt]) {
                     mv = -INFINITY;
+                } else if constexpr (MPRE) {
+                    mv = __half2float(__ushort_as_half((unsigned short) mraw[pt][t]))*LOG2E;
                 } else if (Mb && ic0 + t < n_tok) {
                     mv = __half2float(((const half *) (Mb + int64_t(nb31)*t))[pos])*LOG2E;
                 }
@@ -767,9 +791,18 @@ static __global__ void flash_attn_ext_q4p(
                 half2 y[NH];
 #pragma unroll
                 for (int h2 = 0; h2 < NH/2; ++h2) {
-                    const uint32_t nb = (DPT == 8 ? h2 : (dg & 1)) ? ((wv >> 4) & 0x0F0F0F0Fu) : (wv & 0x0F0F0F0Fu);
-                    const uint32_t ya = __byte_perm(nb, 0x64646464u, 0x4140); // bytes 0, 1 as 1024 + n
-                    const uint32_t yb = __byte_perm(nb, 0x64646464u, 0x4342); // bytes 2, 3
+                    uint32_t nb, ya, yb;
+                    if constexpr (cfg::RS) {
+                        // element i of this lane is element i ^ pg of the plain order, so that fold_rs
+                        // keeps and sends fixed registers (no selects)
+                        nb = (wv >> (h2 ? 4 - rs_sh : rs_sh)) & 0x0F0F0F0Fu;
+                        ya = __byte_perm(nb, 0x64646464u, rs_sa);
+                        yb = __byte_perm(nb, 0x64646464u, rs_sb);
+                    } else {
+                        nb = (DPT == 8 ? h2 : (dg & 1)) ? ((wv >> 4) & 0x0F0F0F0Fu) : (wv & 0x0F0F0F0Fu);
+                        ya = __byte_perm(nb, 0x64646464u, 0x4140); // bytes 0, 1 as 1024 + n
+                        yb = __byte_perm(nb, 0x64646464u, 0x4342); // bytes 2, 3
+                    }
                     y[2*h2 + 0] = __hmul2(__hsub2(*(const half2 *) &ya, off), dv2);
                     y[2*h2 + 1] = __hmul2(__hsub2(*(const half2 *) &yb, off), dv2);
                 }
