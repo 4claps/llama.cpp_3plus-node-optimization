@@ -92,6 +92,11 @@
 #define Q4P_RS 0
 #endif
 
+// fp16 -> fp32 of the fp16 chains: 1 = conversion instruction (exact, subnormals kept),
+// 2 = integer conversion below
+#ifndef Q4P_CVT
+#define Q4P_CVT 1
+#endif
 // fp32 value * 2^-112 of the half in the high / low lane (integer conversion; subnormals flush)
 static __device__ __forceinline__ float fattn_q4p_hi_f(const uint32_t x) {
     return __int_as_float((int32_t(x) >> 3) & 0x8FFFE000);
@@ -299,8 +304,13 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll
                 for (int h = 0; h < NH; ++h) {
                     const uint32_t ab = *(const uint32_t *) &acc2s[r][h];
-                    x[2*h + 0][r] = 0x1p112f*fattn_q4p_lo_f(ab);
-                    x[2*h + 1][r] = 0x1p112f*fattn_q4p_hi_f(ab);
+                    if constexpr (Q4P_CVT == 1) {
+                        x[2*h + 0][r] = __low2float(acc2s[r][h]);
+                        x[2*h + 1][r] = __high2float(acc2s[r][h]);
+                    } else {
+                        x[2*h + 0][r] = 0x1p112f*fattn_q4p_lo_f(ab);
+                        x[2*h + 1][r] = 0x1p112f*fattn_q4p_hi_f(ab);
+                    }
                 }
             }
             // x[i] is element i ^ pg (see rs_sh): the partner's x[i + 4] is the same element as x[i]
@@ -507,8 +517,13 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll
                 for (int r = 0; r < RQ; ++r) {
                     const uint32_t tb = *(const uint32_t *) &t2[r];
-                    S[0][r] = fmaf(d[0], fattn_q4p_lo_f(tb), S[0][r]);
-                    S[1][r] = fmaf(d[1], fattn_q4p_hi_f(tb), S[1][r]);
+                    if constexpr (Q4P_CVT == 1) {
+                        S[0][r] = fmaf(d[0], __low2float(t2[r]),  S[0][r]);
+                        S[1][r] = fmaf(d[1], __high2float(t2[r]), S[1][r]);
+                    } else {
+                        S[0][r] = fmaf(d[0], fattn_q4p_lo_f(tb), S[0][r]);
+                        S[1][r] = fmaf(d[1], fattn_q4p_hi_f(tb), S[1][r]);
+                    }
                 }
                 continue;
             }
@@ -576,7 +591,7 @@ static __global__ void flash_attn_ext_q4p(
             }
         }
 
-        if constexpr (cfg::H16QK) {
+        if constexpr (cfg::H16QK && Q4P_CVT != 1) {
 #pragma unroll
             for (int pt = 0; pt < PT; ++pt) {
 #pragma unroll
@@ -759,8 +774,13 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll
                         for (int h = 0; h < NH; ++h) {
                             const uint32_t ab = *(const uint32_t *) &acc2[r][h];
-                            acc[r][2*h + 0] = fmaf(0x1p112f, fattn_q4p_lo_f(ab), acc[r][2*h + 0]);
-                            acc[r][2*h + 1] = fmaf(0x1p112f, fattn_q4p_hi_f(ab), acc[r][2*h + 1]);
+                            if constexpr (Q4P_CVT == 1) {
+                                acc[r][2*h + 0] += __low2float(acc2[r][h]);
+                                acc[r][2*h + 1] += __high2float(acc2[r][h]);
+                            } else {
+                                acc[r][2*h + 0] = fmaf(0x1p112f, fattn_q4p_lo_f(ab), acc[r][2*h + 0]);
+                                acc[r][2*h + 1] = fmaf(0x1p112f, fattn_q4p_hi_f(ab), acc[r][2*h + 1]);
+                            }
                             acc2[r][h] = make_half2(0.0f, 0.0f);
                         }
                     }
