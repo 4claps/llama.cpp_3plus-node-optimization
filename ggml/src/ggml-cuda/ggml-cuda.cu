@@ -3969,6 +3969,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // residual ADD -> RMS_NORM -> MUL (the next pre-norm). The sum stays a graph output of its own
+    // (it is the next residual), so this is not a plain chain for ggml_can_fuse: the norm and the
+    // multiply must be its only consumers of the intermediate norm. GGML_CUDA_FUSE_ADD_NORM=0 disables.
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        static const bool add_norm_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_ADD_NORM");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        ggml_tensor * rms = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        if (add_norm_on && rms->op == GGML_OP_RMS_NORM && rms->src[0] == node &&
+                mul->op == GGML_OP_MUL && (mul->src[0] == rms || mul->src[1] == rms) &&
+                (rms->flags & GGML_TENSOR_FLAG_COMPUTE) && (mul->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                !(rms->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                !(i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_ADD &&
+                  (cgraph->nodes[i + 3]->src[0] == mul || cgraph->nodes[i + 3]->src[1] == mul)) &&
+                ggml_cuda_op_add_rms_norm_mul(*cuda_ctx, node, rms, mul)) {
+            return 2;
+        }
+    }
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;
