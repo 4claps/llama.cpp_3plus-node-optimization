@@ -8507,3 +8507,32 @@ Hot rerun of B right after (cards 79 C, 1 seed): 2k 38.6 t/s 75.0 ms/cycle; 260k
 126.2 ms/cycle; 260k prefill 101.7 t/s. So the decode gap in the table above is mostly heat order:
 at equal heat the decode gains are the per-kernel ones (verify pass -3% at 2k, q4p verify call
 -10.7% / draft call -5% at 260k, ~5 ms/cycle), not +15-25%. The prefill gain holds hot (+20%).
+
+## Attempt 226: MTP draft head over the first 81920 tokens, in q4_0 (kept) -- 2026-09-26
+
+The draft's vocab projection (5120 x 248320 q6_K, ~1.0 ms per draft step, 4 steps per cycle) now
+uses its own copy of output rows 0..81919, requantized to q4_0 at load and split over both GPUs like
+output. The other logits are -inf. Token ids follow BPE merge order: in 24k tokens of this model's
+generated text, ids < 81920 cover 98.2% (< 98304: 99.95%; the rest are special tokens). Verification
+still uses the full output with the speculative-sampling rule, so the emitted distribution is the
+target's; only the draft proposals change. `LLAMA_MTP_DRAFT_VOCAB=N` (0 = off),
+`LLAMA_MTP_DRAFT_VOCAB_TYPE=same` keeps q6_K.
+
+| 2k, depth-bench --restore, LLAMA_SPEC_PROFILE | draft step | GPU0 min free |
+|---|---|---|
+| off (full q6_K head) | 2.01 / 2.10 ms | 820 MiB |
+| 98304 rows q6_K | 1.61 / 1.66 ms | 620 MiB |
+| 98304 rows q4_0 | 1.59 ms | 682 MiB |
+| 81920 rows q4_0 (default) | 1.33 / 1.45 ms | 704 MiB |
+
+260k, 98304 q6_K: draft step 3.23 -> 2.68 ms. Acceptance unchanged within text noise (98304 q6_K
+gave identical accepted counts at 2k: 344/662, 355/606).
+
+To pay for the VRAM (~112 MiB per GPU), the fold prefill attention chunk (attempt 225) goes
+2048 -> 1024 keys: at 262k with a 1479-token prefill GPU0 min free 590 -> 644 MiB (with the draft
+head), prefill 123.0/126.9 -> 119.6/123.6 t/s (-2.5%). Prefill KLD vs the fp32 base (8x4096,
+-ub 1024): 0.001215 (chunk 1024) vs 0.001217 (2048).
+Before this attempt: GPU0 min free at 262k with prefill was 696-702 MiB; now ~644.
+
+Bug found on the way: a plain ggml_backend_tensor_get on the logits does not wait for the compute
+streams (acceptance 0.000); the narrow path copies async like the full one.

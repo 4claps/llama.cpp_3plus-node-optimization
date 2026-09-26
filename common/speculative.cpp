@@ -1758,7 +1758,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                if (tl) { llama_synchronize(ctx_dft); fprintf(stderr, "TL S1s %lld\n", (long long) ggml_time_us()); }
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                if (tl) { fprintf(stderr, "TL S2 %lld\n", (long long) ggml_time_us()); }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
