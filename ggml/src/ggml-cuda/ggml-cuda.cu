@@ -120,21 +120,34 @@ static int ggml_cuda_get_physical_device(int device) {
 
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
+// The calling thread's current physical device, as last set through ggml_cuda_set_device (-1: unknown).
+// Host cost: one host thread drives both GPUs under -sm tensor and switches device at every subgraph,
+// every peer copy and every launch's device query; cudaGetDevice there was ~4% of the enqueue time.
+// Every cudaSetDevice outside ggml_cuda_set_device runs inside ggml_cuda_init, which completes before
+// this cache is first written (ggml_cuda_set_device reaches ggml_cuda_info() first).
+static thread_local int ggml_cuda_cur_device = -1;
+
 void ggml_cuda_set_device(int device) {
     // translate the (possibly virtual) device id to the physical CUDA device that backs it
     const int physical_device = ggml_cuda_get_physical_device(device);
 
-    int current_device;
-    CUDA_CHECK(cudaGetDevice(&current_device));
-
-    if (physical_device == current_device) {
+    if (physical_device == ggml_cuda_cur_device) {
         return;
     }
 
-    CUDA_CHECK(cudaSetDevice(physical_device));
+    int current_device;
+    CUDA_CHECK(cudaGetDevice(&current_device));
+
+    if (physical_device != current_device) {
+        CUDA_CHECK(cudaSetDevice(physical_device));
+    }
+    ggml_cuda_cur_device = physical_device;
 }
 
 int ggml_cuda_get_device() {
+    if (ggml_cuda_cur_device >= 0) {
+        return ggml_cuda_cur_device;
+    }
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
     return id;
@@ -2798,6 +2811,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
         for (int i = 0; i < cgraph->n_nodes; i++) {
             const ggml_tensor * node = cgraph->nodes[i];
+            // The K/V Hadamard rotation is a MUL_MAT over all heads (src1 ne[1] = n_head * n_tokens),
+            // so it is not a token count: judge the attention subgraph by FLASH_ATTN_EXT below.
+            // Without this, every single-token attention subgraph ran eagerly.
+            if (node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                continue;
+            }
             if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1] && node->src[1]->ne[1] > 1) {
                 return false;
             }
@@ -4748,6 +4767,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 CUDA_CHECK(cudaEventRecord(P->g0, cuda_ctx->stream()));
             }
+            // Host cost: ggml_cuda_try_fuse walks ~40 fusion patterns per node, and was ~1/3 of the
+            // enqueue time of a tensor-parallel verify pass. A graph with the same uid is the same
+            // split and allocation (the scheduler renews the uid on every split, the meta backend on
+            // every subgraph rebuild), so a node that matched no pattern last time matches none now.
+            // Remember those per (graph, uid) and skip their pattern walk. Fused nodes are
+            // re-checked every time, so the fused kernels and their side effects are unchanged.
+            // GGML_CUDA_FUSE_CACHE=0 disables it.
+            struct fuse_cache_entry { const void * ctx; uint64_t uid; std::vector<uint8_t> no_fuse; };
+            static thread_local std::unordered_map<const ggml_cgraph *, fuse_cache_entry> fuse_cache;
+            static const bool fuse_cache_on = [] {
+                const char * s = getenv("GGML_CUDA_FUSE_CACHE");
+                return s == nullptr || atoi(s) != 0;
+            }();
+            fuse_cache_entry * fce = nullptr;
+            bool fce_valid = false;
+            if (fuse_cache_on && cgraph->uid != 0 && stream_ctx.concurrent_events.empty()) {
+                fce = &fuse_cache[cgraph];
+                fce_valid = fce->ctx == cuda_ctx && fce->uid == cgraph->uid && (int) fce->no_fuse.size() == cgraph->n_nodes;
+                if (!fce_valid) {
+                    fce->ctx = cuda_ctx;
+                    fce->uid = cgraph->uid;
+                    fce->no_fuse.assign(cgraph->n_nodes, 0);
+                }
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4798,11 +4841,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     CUDA_CHECK(cudaEventRecord(prof_e0, cuda_ctx->stream()));
                 }
 
-                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cgraph, i)) {
+                const bool known_no_fuse = fce_valid && fce->no_fuse[i];
+
+                if (!known_no_fuse && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cgraph, i)) {
                     continue; // the gated delta net reads the rows in place
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = known_no_fuse ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (fce != nullptr && !fce_valid && nodes_to_skip == 0) {
+                    fce->no_fuse[i] = 1;
+                }
 
                 if (prof && nodes_to_skip != 0) {
                     cudaEvent_t e1 = prof->ev();
