@@ -23,3 +23,6 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // ADD -> RMS_NORM(ADD) -> MUL in one kernel (bit-identical); false if the tensors don't qualify
 bool ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms, ggml_tensor * mul);
+
+bool ggml_cuda_op_rms_norm_mul_silu_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms, ggml_tensor * mul,
+                                         const ggml_tensor * gate, ggml_tensor * out, bool check_only);

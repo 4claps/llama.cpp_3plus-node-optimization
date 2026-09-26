@@ -4121,6 +4121,36 @@ struct test_concat_cpy : public test_case {
     }
 };
 
+// qwen35's gated norm: RMS_NORM -> MUL(w), then MUL_MAT(z) -> SILU -> MUL (one norm launch on CUDA)
+struct test_norm_gate : public test_case {
+    const int64_t d, h, t;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(d, h, t);
+    }
+
+    test_norm_gate(int64_t d = 128, int64_t h = 24, int64_t t = 5) : d(d), h(h), t(t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, h, t);
+        ggml_tensor * w  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
+        ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, d*h);
+        ggml_tensor * a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, t);
+        ggml_tensor * nrm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * z   = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wz, a), d, h, t);
+        ggml_tensor * out = ggml_mul(ctx, nrm, ggml_silu(ctx, z));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // the gated delta net's l2 norm: RMS_NORM -> SCALE (fused on CUDA)
 struct test_rms_norm_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -9985,6 +10015,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t r : {1, 5, 300}) {
         test_cases.emplace_back(new test_add_softplus_mul({24, r}));
         test_cases.emplace_back(new test_add_softplus_mul({48, r}));
+    }
+    for (int64_t t : {1, 5, 7}) {
+        test_cases.emplace_back(new test_norm_gate(128, 24, t));
+        test_cases.emplace_back(new test_norm_gate(64, 3, t));
     }
     for (int64_t nt : {1, 3, 5, 8}) {
         test_cases.emplace_back(new test_concat_cpy(3, nt, 512));
