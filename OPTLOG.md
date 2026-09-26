@@ -8536,3 +8536,9 @@ Before this attempt: GPU0 min free at 262k with prefill was 696-702 MiB; now ~64
 
 Bug found on the way: a plain ggml_backend_tensor_get on the logits does not wait for the compute
 streams (acceptance 0.000); the narrow path copies async like the full one.
+
+## Attempt 227: CUDA graphs for the 5-token verify (GGML_CUDA_GRAPHS_PRE_VOLTA=4) (reverted) -- 2026-09-26
+
+Mode 3 plus graphs of up to 8 tokens, keyed by the padded verify's active-token count. Texts
+byte-identical to mode 3, but 2k depth-bench ABBA (75-77 C) mode 3: 59.4/57.5, 58.1/56.3 ms/cycle;
+mode 4: 60.2/58.4, 60.8/60.7, and GPU0 min free 704 -> 578-606 MiB. Slower and costs VRAM: reverted.
