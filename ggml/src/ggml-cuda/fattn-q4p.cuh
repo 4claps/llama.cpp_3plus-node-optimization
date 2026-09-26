@@ -154,7 +154,13 @@ struct fattn_q4p_cfg {
     // blocks per SM: 6 rows with RS fit 128 registers without spilling (kv 262144: 816 -> 741 us)
     static constexpr int  MINB  = R == Q4P_TUNE_R ? Q4P_MINB : ((RS && R == 6) ? 2 : 1);
     // P_s floats per position; with RS a warp reads 8 positions at once, so PSTR/4 is kept odd
-    static constexpr int PSTR   = RG*RQP + ((RS && (RG*RQP/4) % 2 == 0) ? 4 : 0);
+    // fp16 P with two rows per word (PV takes each half broadcast): half the P_s reads
+#ifndef Q4P_PPK
+#define Q4P_PPK 1
+#endif
+    static constexpr bool PPK   = Q4P_PPK == 1 && RS && RQP % 8 == 0;
+    static constexpr int PW     = PPK ? RG*RQP/2 : RG*RQP; // P_s words per position
+    static constexpr int PSTR   = PW + ((RS && (PW/4) % 2 == 0) ? 4 : 0);
     static constexpr int NACC   = RS ? 1 : DPT;           // fp32 accumulators per row
 
     static_assert(R % RG == 0, "bad RG");
@@ -703,7 +709,7 @@ static __global__ void flash_attn_ext_q4p(
         if (qsplit == 0) {
 #pragma unroll
             for (int pt = 0; pt < PT; ++pt) {
-                float * Pp = P_s + (qslot + NQP*pt)*PSTR + qgrp*RQP;
+                float * Pp = P_s + (qslot + NQP*pt)*PSTR + qgrp*(cfg::PPK ? RQP/2 : RQP);
 #pragma unroll
                 for (int rq = 0; rq < RQP/4; ++rq) {
                     float pv[4];
@@ -712,7 +718,11 @@ static __global__ void flash_attn_ext_q4p(
                         const int rl = 4*rq + c;
                         pv[c] = rl < RQ ? exp2f(S[pt][rl] - m_s[qgrp*RQ + rl]) : 0.0f;
                     }
-                    if constexpr (cfg::H16PV) {
+                    if constexpr (cfg::PPK) {
+                        const half2 h01 = __floats2half2_rn(pv[0], pv[1]);
+                        const half2 h23 = __floats2half2_rn(pv[2], pv[3]);
+                        ((uint2 *) Pp)[rq] = make_uint2(*(const uint32_t *) &h01, *(const uint32_t *) &h23);
+                    } else if constexpr (cfg::H16PV) {
                         uint32_t hb[4];
 #pragma unroll
                         for (int c = 0; c < 4; ++c) {
@@ -751,7 +761,10 @@ static __global__ void flash_attn_ext_q4p(
                 for (int j = 0; j < LPPS; ++j) {
                     const int p = seg*LPPS + j;
                     if (p < p_end) {
-                        if constexpr (cfg::H16PV) {
+                        if constexpr (cfg::PPK) {
+                            // the rounded p the numerator uses
+                            ls += __half2float(((const half *) &P_s[p*PSTR])[off]);
+                        } else if constexpr (cfg::H16PV) {
                             // the rounded p the numerator uses
                             ls += __low2float(*(const half2 *) &P_s[p*PSTR + off]);
                         } else {
@@ -855,6 +868,25 @@ static __global__ void flash_attn_ext_q4p(
                     y[2*h2 + 0] = __hmul2(__hsub2(*(const half2 *) &ya, off), dv2);
                     y[2*h2 + 1] = __hmul2(__hsub2(*(const half2 *) &yb, off), dv2);
                 }
+                if constexpr (cfg::PPK) {
+                    const uint4 * pq = (const uint4 *) (P_s + p*PSTR);
+#pragma unroll
+                    for (int rq = 0; rq < RQP/8; ++rq) {
+                        const uint4 q = pq[rq];
+                        const uint32_t pv[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+                        for (int c = 0; c < 8; ++c) {
+                            if (8*rq + c < RQ) {
+                                const half2 ph = *(const half2 *) &pv[c/2];
+                                const half2 pb = (c & 1) ? __high2half2(ph) : __low2half2(ph);
+#pragma unroll
+                                for (int h = 0; h < NH; ++h) {
+                                    acc2[8*rq + c][h] = __hfma2(pb, y[h], acc2[8*rq + c][h]);
+                                }
+                            }
+                        }
+                    }
+                } else {
                 const uint4 * pq = (const uint4 *) (P_s + p*PSTR + vgrp*RQP);
 #pragma unroll
                 for (int rq = 0; rq < RQP/4; ++rq) {
@@ -869,6 +901,7 @@ static __global__ void flash_attn_ext_q4p(
                             }
                         }
                     }
+                }
                 }
                 if constexpr (!cfg::RS) {
                     if (++np == Q4P_PVF) {
