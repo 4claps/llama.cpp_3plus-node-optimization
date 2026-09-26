@@ -770,11 +770,16 @@ static __global__ void flash_attn_ext_q4p(
             // V words two positions ahead: a quarter of the fp32 path's work per position no
             // longer covers an L2 round trip
             uint32_t nd2, nw02, nw12;
+            // row offsets within the chunk in 32 bits, advanced by one step and clamped to the last
+            // row (the 64-bit row products cost ~20 instructions per position)
+            const char * vcd = Vb + int64_t(k0)*nb21 + 18*pv_b;
+            const char * vcw = Vb + int64_t(k0)*nb21 + pv_oa;
+            const int vstep = NPG*nb21, vlast = (p_end - 1)*nb21;
+            int vo = min(pg + NPG, p_end - 1)*nb21;
             {
-                const char * vrow = Vb + int64_t(k0 + min(pg + NPG, p_end - 1))*nb21;
-                nd2  = fattn_q4p_ld16(vrow + 18*pv_b);
-                nw02 = __ldg((const uint32_t *) (vrow + pv_oa));
-                nw12 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+                nd2  = fattn_q4p_ld16(vcd + vo);
+                nw02 = __ldg((const uint32_t *) (vcw + vo));
+                nw12 = __ldg((const uint32_t *) (vcw + vo + 4));
             }
 #pragma unroll 2
             for (int p = pg; p < p_end; p += NPG) {
@@ -782,10 +787,10 @@ static __global__ void flash_attn_ext_q4p(
                 const uint32_t wv  = __byte_perm(nw0, nw1, pv_sel);
                 nd = nd2; nw0 = nw02; nw1 = nw12;
                 {
-                    const char * vrow = Vb + int64_t(k0 + min(p + 2*NPG, p_end - 1))*nb21;
-                    nd2  = fattn_q4p_ld16(vrow + 18*pv_b);
-                    nw02 = __ldg((const uint32_t *) (vrow + pv_oa));
-                    nw12 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+                    vo = min(vo + vstep, vlast); // row min(p + 2*NPG, p_end - 1)
+                    nd2  = fattn_q4p_ld16(vcd + vo);
+                    nw02 = __ldg((const uint32_t *) (vcw + vo));
+                    nw12 = __ldg((const uint32_t *) (vcw + vo + 4));
                 }
                 // DPT 4: this thread's nibble half of the word; DPT 8: low nibbles (dims 0-3), then high
                 half2 y[NH];
