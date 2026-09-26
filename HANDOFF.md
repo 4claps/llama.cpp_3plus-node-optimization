@@ -135,3 +135,18 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
 - Correctness harnesses and proofs are in `p100-handoff/tools/` (bit-exactness replays for the
   fastdiv, DP4A, q4_0 dequant and norm changes). `p100-handoff/VERIFICATION.md` is the numerical
   audit.
+
+## Paused 2026-09-25 evening (resume here)
+
+- Committed today: `fc1c9056f` prefill GEMM fp16 products + fp32 accumulation (OPTLOG 221),
+  `0be3a47d9` q4p attention fp16 with folds (OPTLOG 222), `4a3a96ba3` docs (WIP).
+- User decision: keep the fold prefill kernel ON by default (costs ~6% prefill cold at short
+  context, maybe ~9% hot at 32k; `GGML_CUDA_GEMM_FOLD=0` restores cuBLAS fp16).
+- Finding: sustained runs lose ~25% prefill to the 175 W power cap as the cards heat
+  (SW Power Capping counter ~2.8 h on GPU0, no thermal slowdown). Yesterday's build: 313 cold ->
+  236 hot at pp1024 @ d32768. The morning-vs-evening depth sweeps differ mostly by this.
+- Evening sweep (new build, hot): /mnt/fast/p100-scratch/build-sweep0925b/sweep.log; morning:
+  build-sweep0925/sweep.log.
+- TODO for the push: update the README results table (tg256 cold on the new build read 30.97,
+  vs 32.02 on 3ba045898; not investigated, user did not want tg256 chased), then HANDOFF state,
+  then the full gate suite and the release refresh.
