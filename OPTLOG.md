@@ -8466,3 +8466,18 @@ Four bit-exact changes (depth-bench texts byte-identical in every A/B). quick ve
 - host: fusion-check cache (GGML_CUDA_FUSE_CACHE=0 off), device cache, graph mode 3 captures the
   1-token attention subgraph: draft enqueue 0.61 -> 0.45 ms, end to end a tie.
 The fp16 matvec is ~90% issue-bound (L2-resident weights: -9%; pinned activations: 0%).
+
+## Attempt 224 — q4p: PV reduce-scatter across position groups, 2 blocks/SM at 1 token (kept)
+
+At DPT 8 each thread held RQ*8 fp32 PV accumulators (120 at 15 rows) for the whole kernel. Now the 8
+position groups of a dim group share a warp, and at each chunk end the fp16 partials are converted
+(exact), scaled, and reduce-scattered by shuffles (3 stages), so a thread keeps RQ fp32 values (one
+output dim). Registers: 15 rows 255 + 104 B stack -> 207; 18 rows 272 B stack -> 234; 6 rows 199 -> 128,
+which lets the 1-token kernel run two blocks per SM. L2 prefetch off at 15 rows. Only fp32 sum order
+changes. GGML_CUDA_Q4P_OLD=1 selects the old configuration at run time.
+
+    op test kv 262144 (GPU0):  nb=5 2521 -> 2370 us   nb=3 2275 -> 1700   nb=1 805 -> 745
+    server 260k, op profile:   nb=5 2702 -> 2414 us   nb=1 962 -> 914
+Ablation on the way (15 rows, op test): QK-only 1505 us, PV-only 1466 of 2476. SASS shows the mask
+loads issued after the QK math, right before the chunk barrier (a fix is in the worktree, uncommitted).
+Tried and lost: 2 blocks/SM at 15 rows via NSPLIT 4 (2775-3000 us), R=30 at DPT 8 (4149).
