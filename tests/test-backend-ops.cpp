@@ -10876,6 +10876,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, n, k, {1, 1}, {1, 1}));
         }
     }
+    // below 3072 rows (wk/wv at 512 rows, the delta-net alpha/beta at 24); 300 and 20 rows leave
+    // partial blocks
+    for (int m : {512, 300, 24, 20}) {
+        for (int n : {2, 3, 5}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 5, 8704, {1, 1}, {1, 1}));
+    }
 
     // the fp16-product / fp32-accumulation prefill GEMM on Pascal (gemm-fold.cu) takes >= 1024 rows
     // past the mmvq widths; 1028 rows and 130 columns leave partial tiles
@@ -11420,7 +11428,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     // The q6_K matvecs of one decode/verify pass on each GPU under -sm tensor (m rows x k), by width.
-    for (auto mk : std::vector<std::pair<int, int>>{{8704, 5120}, {5120, 8704}, {5120, 5120}, {3072, 5120}, {5120, 3072}, {6144, 5120}}) {
+    for (auto mk : std::vector<std::pair<int, int>>{{8704, 5120}, {5120, 8704}, {5120, 5120}, {3072, 5120}, {5120, 3072}, {6144, 5120}, {512, 5120}, {24, 5120}}) {
         for (int n : {1, 2, 3, 4, 5, 6}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
         }
