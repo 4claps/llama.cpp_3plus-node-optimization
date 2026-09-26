@@ -4061,6 +4061,96 @@ struct test_gdn_gate : public test_case {
     }
 };
 
+// the gated delta net's q and k l2 norms, two views of one tensor (one launch on CUDA)
+struct test_rms_norm_scale2 : public test_case {
+    const int64_t d, h, t;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE2";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(d, h, t);
+    }
+
+    test_rms_norm_scale2(int64_t d = 128, int64_t h = 8, int64_t t = 5) : d(d), h(h), t(t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d*h*3, t); // q, k, v per token
+        const float sc = 1.0f/sqrtf((float) d);
+        ggml_tensor * q = ggml_view_3d(ctx, x, d, h, t, d*sizeof(float), x->nb[1], 0);
+        ggml_tensor * k = ggml_view_3d(ctx, x, d, h, t, d*sizeof(float), x->nb[1], d*h*sizeof(float));
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f/d), sc);
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f/d), sc);
+        ggml_tensor * out = ggml_add(ctx, q, k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// the conv state update: CONCAT(state, x^T) along dim 0, CPY of its last columns (fused on CUDA)
+struct test_concat_cpy : public test_case {
+    const int64_t kc, nt, ch;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_CPY";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(kc, nt, ch);
+    }
+
+    test_concat_cpy(int64_t kc = 3, int64_t nt = 5, int64_t ch = 512) : kc(kc), nt(nt), ch(ch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * st = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kc, ch, 1);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ch, nt);
+        ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kc*ch, 1);
+        ggml_tensor * conc = ggml_concat(ctx, st, ggml_transpose(ctx, x), 0);
+        ggml_tensor * last = ggml_view_3d(ctx, conc, kc, ch, 1, conc->nb[1], conc->nb[2], ggml_row_size(conc->type, nt));
+        ggml_tensor * t = ggml_cpy(ctx, last, c);
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, t, kc*ch), ggml_reshape_1d(ctx, conc, (kc + nt)*ch), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// qwen35's gated norm: RMS_NORM -> MUL(w), then MUL_MAT(z) -> SILU -> MUL (one norm launch on CUDA)
+struct test_norm_gate : public test_case {
+    const int64_t d, h, t;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(d, h, t);
+    }
+
+    test_norm_gate(int64_t d = 128, int64_t h = 24, int64_t t = 5) : d(d), h(h), t(t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, h, t);
+        ggml_tensor * w  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
+        ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, d*h);
+        ggml_tensor * a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, t);
+        ggml_tensor * nrm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * z   = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wz, a), d, h, t);
+        ggml_tensor * out = ggml_mul(ctx, nrm, ggml_silu(ctx, z));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // the gated delta net's l2 norm: RMS_NORM -> SCALE (fused on CUDA)
 struct test_rms_norm_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -9925,6 +10015,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t r : {1, 5, 300}) {
         test_cases.emplace_back(new test_add_softplus_mul({24, r}));
         test_cases.emplace_back(new test_add_softplus_mul({48, r}));
+    }
+    for (int64_t t : {1, 5, 7}) {
+        test_cases.emplace_back(new test_norm_gate(128, 24, t));
+        test_cases.emplace_back(new test_norm_gate(64, 3, t));
+    }
+    for (int64_t nt : {1, 3, 5, 8}) {
+        test_cases.emplace_back(new test_concat_cpy(3, nt, 512));
+    }
+    for (int64_t t : {1, 5, 7}) {
+        test_cases.emplace_back(new test_rms_norm_scale2(128, 8, t));
+        test_cases.emplace_back(new test_rms_norm_scale2(64, 3, t));
     }
     for (int64_t n : {64, 128, 1000}) {
         test_cases.emplace_back(new test_rms_norm_scale({n, 8, 5, 1}));

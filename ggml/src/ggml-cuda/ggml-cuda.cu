@@ -4542,6 +4542,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // RMS_NORM -> MUL(w), then MUL_MAT(z) -> SILU -> MUL(norm): run the matmul first, then the norm
+    // with the silu gate in its epilogue (qwen35's gated norm). GGML_CUDA_FUSE_NORM_GATE=0 disables.
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        static const bool ng_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_NORM_GATE");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        const int n = cgraph->n_nodes;
+        auto next = [&](int j) {
+            for (++j; j < n; ++j) {
+                if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                    return j;
+                }
+            }
+            return -1;
+        };
+        ggml_tensor * mulw = cgraph->nodes[i + 1];
+        const int jm = ng_on ? next(i + 1) : -1, js = jm < 0 ? -1 : next(jm), jo = js < 0 ? -1 : next(js);
+        if (jo > 0) {
+            ggml_tensor * mm = cgraph->nodes[jm], * sl = cgraph->nodes[js], * mo = cgraph->nodes[jo];
+            auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+            if (mm->op == GGML_OP_MUL_MAT && sl->op == GGML_OP_UNARY && ggml_get_unary_op(sl) == GGML_UNARY_OP_SILU &&
+                    mo->op == GGML_OP_MUL && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) && (sl->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    (mo->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    base(sl->src[0]) == mm && sl->src[0]->view_offs == 0 && ggml_is_contiguous(sl->src[0]) &&
+                    ((mo->src[0] == sl && mo->src[1] == mulw) || (mo->src[1] == sl && mo->src[0] == mulw)) &&
+                    base(mm->src[0]) != node && base(mm->src[1]) != node && base(mm->src[0]) != mulw && base(mm->src[1]) != mulw &&
+                    ggml_node_get_use_count(cgraph, i + 1) == 1 && ggml_node_get_use_count(cgraph, js) == 1 &&
+                    !(mulw->flags & GGML_TENSOR_FLAG_OUTPUT) && !(sl->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    ggml_cuda_op_rms_norm_mul_silu_gate(*cuda_ctx, node, mulw, sl->src[0], mo, true)) {
+                GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, mm));
+                ggml_cuda_op_rms_norm_mul_silu_gate(*cuda_ctx, node, mulw, sl->src[0], mo, false);
+                return jo - i;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
@@ -4614,6 +4651,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // CONCAT -> CPY of its tail (the conv state update, views between): one launch.
+    // GGML_CUDA_FUSE_CONCAT_CPY=0 disables.
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool cc_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_CONCAT_CPY");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        if (cc_on && j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_CPY && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                ggml_cuda_op_concat_cpy(*cuda_ctx, node, cgraph->nodes[j])) {
+            return j - i;
+        }
+    }
+
     // ADD (row bias) -> SOFTPLUS -> MUL (row scale): the delta net's gate. GGML_CUDA_FUSE_GATE=0 disables.
     if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
             cgraph->nodes[i + 2]->op == GGML_OP_MUL) {
@@ -4635,6 +4689,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return s == nullptr || atoi(s) != 0;
         }();
         const enum ggml_op ops_ns[2] = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+        // the q and k l2 norms back to back (views between them): one launch for both
+        if (norm_scale_on && ggml_can_fuse(cgraph, i, ops_ns, 2)) {
+            int j = i + 2;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                ++j;
+            }
+            if (j + 1 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM && cgraph->nodes[j + 1]->op == GGML_OP_SCALE &&
+                    cgraph->nodes[j]->src[0] != cgraph->nodes[i + 1] && cgraph->nodes[j]->src[0]->view_src != cgraph->nodes[i + 1] &&
+                    ggml_can_fuse(cgraph, j, ops_ns, 2) &&
+                    ggml_cuda_op_rms_norm_scale2(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1])) {
+                return j + 1 - i;
+            }
+        }
         if (norm_scale_on && ggml_can_fuse(cgraph, i, ops_ns, 2) &&
                 ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1])) {
             return 1;

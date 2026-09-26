@@ -165,7 +165,8 @@ static __global__ void concat_non_cont_dim0_flat(
         const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
         const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
         const int64_t ne0, const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3,
-        const int32_t * src0_rows, const uint64_t src0_row_bytes) {
+        const int32_t * src0_rows, const uint64_t src0_row_bytes,
+        char * tail, const int64_t tail_i0, const int64_t tail_ne0, const uint64_t tail_nb2) {
     const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (idx >= n) {
         return;
@@ -180,17 +181,26 @@ static __global__ void concat_non_cont_dim0_flat(
     const T * x = i0 < ne00 ? (const T *)(s0 + i1*nb01 + i0*nb00)
                             : (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
     *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+    // tail: the fused CPY of columns [tail_i0, tail_i0 + tail_ne0) (all from src1) to a contiguous
+    // [tail_ne0, ne01] block per i2. Thread k writes column k's slot after it read src0 column k, the
+    // only element that slot may alias when src0 is the state the tail updates in place.
+    if (tail && i0 < tail_ne0) {
+        const int64_t j0 = tail_i0 + i0 - ne00;
+        *(T *)(tail + i2*tail_nb2 + (i1*tail_ne0 + i0)*sizeof(T)) = *(const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + j0*nb10);
+    }
 }
 
 template <typename T>
-static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream,
+                        const ggml_tensor * tail = nullptr) {
     // src0 gathered in place (its GET_ROWS was skipped): only the flat kernel below handles that
     const float *   g_base = nullptr;
     const int32_t * g_idx  = nullptr;
     int64_t         g_row  = 0;
     const bool gathered = ggml_cuda_gdn_gather_lookup(dst, &g_base, &g_idx, &g_row);
     GGML_ASSERT(!gathered || (dim == 0 && dst->ne[0] <= 64));
-    if (!gathered && dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+    GGML_ASSERT(!tail || (dim == 0 && dst->ne[0] <= 64));
+    if (!tail && !gathered && dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;
@@ -203,7 +213,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                     ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2],
                     ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2], dim, stream);
         }
-    } else if (!gathered && dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+    } else if (!tail && !gathered && dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         const size_t size0 = ggml_nbytes(src0);
         const size_t size1 = ggml_nbytes(src1);
 
@@ -218,7 +228,9 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
             src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
             src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
             dst->ne[0], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
-            gathered ? g_idx : nullptr, (uint64_t) g_row*sizeof(float));
+            gathered ? g_idx : nullptr, (uint64_t) g_row*sizeof(float),
+            tail ? (char *) tail->data : nullptr, tail ? tail->src[0]->view_offs/dst->nb[0] : 0, tail ? tail->src[0]->ne[0] : 0,
+            tail ? tail->nb[1] : 0);
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
@@ -298,4 +310,21 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 break;
         }
     }
+}
+
+// CONCAT (dim 0, narrow) -> CPY of its last columns (the conv state update): one launch, the same copies
+bool ggml_cuda_op_concat_cpy(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * cpy) {
+    const ggml_tensor * src0 = dst->src[0], * src1 = dst->src[1], * v = cpy->src[0], * cd = cpy->src[1];
+    const int32_t dim = ((int32_t *) dst->op_params)[0];
+    if (dim != 0 || dst->ne[0] > 64 || dst->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+            v->view_src != dst || v->type != dst->type || cpy->type != dst->type || cd->type != dst->type ||
+            dst->ne[3] != 1 || v->nb[1] != dst->nb[1] || v->nb[2] != dst->nb[2] || v->nb[0] != dst->nb[0] ||
+            dst->nb[0] != sizeof(float) || v->ne[1] != dst->ne[1] || v->ne[2] != dst->ne[2] || v->ne[3] != 1 ||
+            v->view_offs % dst->nb[1] + v->ne[0]*dst->nb[0] != (size_t) dst->ne[0]*dst->nb[0] || v->view_offs >= dst->nb[1] ||
+            (int64_t) (v->view_offs/dst->nb[0]) < src0->ne[0] || v->ne[0] > src0->ne[0] ||
+            cpy->ne[0] != v->ne[0]*v->ne[1] || cpy->ne[1] != v->ne[2] || cpy->nb[0] != sizeof(float) || cpy->ne[2] != 1 || cpy->ne[3] != 1) {
+        return false;
+    }
+    concat_cuda<uint32_t>(src0, src1, dst, 0, ctx.stream(), cpy);
+    return true;
 }
