@@ -168,6 +168,8 @@ Not done / next:
 1. **Measure decode fairly first**: strict ABBA old/new at one temperature (or pre-heat both
    arms), several seeds. depth-bench.py now has `--extra-chars N` for prefill at a snapshot's depth.
 2. Not merged: goal/pfattn `6ba2952d5` (P layout; FA eval 4019/4019, not measured end to end).
+   It also appends its own "Attempt 223" to OPTLOG.md; on merge, drop that hunk (attempt 225
+   already covers the fold prefill work) and add the P-layout step to 225.
    Not committed: vattn's SEL-free reduce-scatter + mask preload, `wt-vattn/vt/q4p-c6.cuh`
    (op test nb=5 2405 -> 2278 us; needs FA eval + in-server profile).
 3. Decode ideas from the dec agent, unstarted: fuse the delta-net prologue (~190 launches/pass,
