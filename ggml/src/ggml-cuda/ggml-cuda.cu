@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16.cuh"
+#include "ggml-cuda/active-tokens.cuh"
 #include "ggml-cuda/gemm-fold.cuh"
 #include "ggml-cuda/cpy-batch.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -4544,6 +4545,100 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // The delta net's alpha/beta matvecs and what follows them, in one launch:
+    //   MUL_MAT(alpha) -> ADD(dt) -> SOFTPLUS -> MUL(a) = gate,  MUL_MAT(beta) -> SIGMOID = beta
+    // (views between them allowed). Every intermediate must be consumed only inside the group.
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_Q6_K && node->ne[0] < 256) {
+        const int n = cgraph->n_nodes;
+        auto next = [&](int j) {
+            for (++j; j < n; ++j) {
+                if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                    return j;
+                }
+            }
+            return -1;
+        };
+        auto same_mem = [](const ggml_tensor * v, const ggml_tensor * t) { // v: t, or a contiguous view of all of t
+            return v == t || (v->data == t->data && ggml_is_contiguous(v) && ggml_nelements(v) == ggml_nelements(t) &&
+                              v->type == t->type);
+        };
+        const int ja = next(i), jsp = ja < 0 ? -1 : next(ja), jm = jsp < 0 ? -1 : next(jsp), jb = jm < 0 ? -1 : next(jm),
+                  js = jb < 0 ? -1 : next(jb);
+        if (js > 0) {
+            ggml_tensor * add = cgraph->nodes[ja], * sp = cgraph->nodes[jsp], * mul = cgraph->nodes[jm];
+            ggml_tensor * mmb = cgraph->nodes[jb], * sg = cgraph->nodes[js];
+            if (add->op == GGML_OP_ADD && sp->op == GGML_OP_UNARY && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS &&
+                    mul->op == GGML_OP_MUL && mmb->op == GGML_OP_MUL_MAT && sg->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(sg) == GGML_UNARY_OP_SIGMOID && sp->src[0] == add &&
+                    (mul->src[0] == sp || mul->src[1] == sp) && same_mem(sg->src[0], mmb) &&
+                    (same_mem(add->src[0], node) || same_mem(add->src[1], node))) {
+                const ggml_tensor * bvec = same_mem(add->src[0], node) ? add->src[1] : add->src[0];
+                const ggml_tensor * mvec = mul->src[0] == sp ? mul->src[1] : mul->src[0];
+                // intermediates (and their views) consumed only within (i, js], never outputs
+                const ggml_tensor * inter[4] = { node, add, sp, mmb };
+                auto is_inter = [&](const ggml_tensor * t) {
+                    for (; t; t = t->view_src) {
+                        for (const ggml_tensor * x : inter) {
+                            if (t == x) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                };
+                bool ok = ggml_are_same_shape(add, sp) && ggml_are_same_shape(sp, mul) && ggml_nelements(add) == ggml_nelements(node);
+                for (int j = 0; j < n && ok; ++j) {
+                    const ggml_tensor * t = cgraph->nodes[j];
+                    if (j >= i && j <= js && t != mul && t != sg && is_inter(t) && (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                        ok = false;
+                    }
+                    if (j > i && j <= js) {
+                        continue;
+                    }
+                    for (int k = 0; k < GGML_MAX_SRC && ok; ++k) {
+                        if (t->src[k] && is_inter(t->src[k])) {
+                            ok = false;
+                        }
+                    }
+                    if (t->view_src && is_inter(t->view_src) && j > js) {
+                        ok = false;
+                    }
+                }
+                if (ok && ggml_cuda_mmvq_f16_gdn_gate(*cuda_ctx, node, mmb, bvec, mvec, mul, sg,
+                                                      ggml_cuda_active_cols(node->src[1]->ne[1]))) {
+                    return js - i;
+                }
+            }
+        }
+    }
+
+    // ADD (row bias) -> SOFTPLUS -> MUL (row scale): the delta net's gate. GGML_CUDA_FUSE_GATE=0 disables.
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL) {
+        static const bool gate_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_GATE");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        const enum ggml_op ops_g[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+        if (gate_on && ggml_can_fuse(cgraph, i, ops_g, 3) &&
+                ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            return 2;
+        }
+    }
+
+    // RMS_NORM -> SCALE (the gated delta net's l2 norm of q and k). GGML_CUDA_FUSE_NORM_SCALE=0 disables.
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_SCALE) {
+        static const bool norm_scale_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_NORM_SCALE");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        const enum ggml_op ops_ns[2] = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+        if (norm_scale_on && ggml_can_fuse(cgraph, i, ops_ns, 2) &&
+                ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            return 1;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
