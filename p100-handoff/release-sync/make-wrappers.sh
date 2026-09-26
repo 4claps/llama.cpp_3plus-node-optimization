@@ -50,10 +50,13 @@ cat > "$BIN/qwen-server" <<'EOF'
 #     ub    prefill      decode     acceptance   min gpu0 free
 #     256  119.46 t/s  26.13 t/s     0.98058       2205 MiB
 #     2048 137.43 t/s  25.53 t/s     0.98058        757 MiB
-# +15% prefill for identical acceptance and decode. The margin is the thing to watch: 757 MiB is
-# 3.8x the watchdog floor, but run163 died from a 136 MiB swing in other GPU use. If anything
-# else shares GPU0, drop to -ub 1024 (~1560 MiB) or -ub 256 (~2205 MiB); both cost only prefill.
-# See OPTLOG attempts 165, 169 and 171.
+# +15% prefill for identical acceptance and decode at the time. The margin is the thing to watch:
+# run163 died from a 136 MiB swing in other GPU use.
+# -ub 1024 since 2026-09-26: the fold prefill attention's scratch (OPTLOG 225) and the MTP draft
+# head copy (OPTLOG 226, ~112 MiB per GPU) no longer fit at -ub 2048 -- at 262k with --mmproj,
+# GPU0 fell to 162 MiB free. At -ub 1024 GPU0 keeps 620-646 MiB free at 262k with --mmproj, and
+# all of that day's measurements (260k prefill ~100-108 t/s hot) use it.
+# See OPTLOG attempts 165, 169, 171 and 229.
 # -ubd 64 is strictly faster than 256 (23.03 vs 21.43). -ctkd/-ctvd q4_0 put the draft KV cache
 # at 151 MB instead of 537 and cost nothing measurable: acceptance 0.58170 vs 0.58361 for f16.
 # See OPTLOG attempts 126, 143, 158 and 163.
@@ -87,7 +90,7 @@ LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" export LD_LIBRARY_
 exec "$BUILD/llama-server" \
   -m "$MODEL" \
   -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-  -c 262144 -b 32768 -ub 2048 -np 1 \
+  -c 262144 -b 32768 -ub 1024 -np 1 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
   -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
   --jinja --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 \

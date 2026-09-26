@@ -8557,3 +8557,24 @@ ABBA old (build-sweep0925b) vs new, depth-bench --restore --extra-chars 4100, ms
 | B new (67-73) | 57.5, 55.8 | 92.8, 92.3 | 120.8, 115.5 |
 | A old (72-77) | 68.6, 69.7 | 116.8, 120.6 | 91.6, 87.7 |
 Hot new build (72-77 C), 2 seeds x 2 questions: 2k avg 48.4 t/s, 260k avg 30.2 t/s, prefill ~105 t/s.
+
+## Attempt 229: release ubatch 2048 -> 1024 (kept) -- 2026-09-26
+
+qwen-server's -ub 2048 no longer fits with the fold prefill scratch (225) and the MTP draft head
+copy (226): depth-bench at 262k with --mmproj, -ub 2048, 2.9k-token prefill: GPU0 fell to 162 MiB
+free and the watchdog killed the server (Sunshine unaffected). At -ub 1024 (every measurement of
+226-228 and the 09-26 sweep): 620-646 MiB. make-wrappers.sh and QUICKSTART now use -ub 1024.
+
+Sweep on this build (depth-bench, incremental fill, 2 questions per depth, cards warm to hot):
+| depth | prefill (30k chunk) | decode |
+|---|---|---|
+| 2k | 316 t/s | 51.6 t/s |
+| 32k | 342 | 55.5 |
+| 62k | 257 | 46.1 |
+| 92k | 194 | 38.2 |
+| 122k | 162 | 34.9 |
+| 152k | 141 | 29.7 |
+| 182k | 125 | 30.6 |
+| 212k | 118 | 33.0 |
+| 242k | 108 | 28.1 |
+| 260k | 100 (19k chunk) | 34.1 (27.1 and 41.1) |

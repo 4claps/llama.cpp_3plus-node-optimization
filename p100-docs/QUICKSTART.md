@@ -26,7 +26,7 @@ the model.
     llama-server \
       -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-      -c 262144 -b 32768 -ub 2048 -np 1 \
+      -c 262144 -b 32768 -ub 1024 -np 1 \
       --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
       -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
       --jinja \
@@ -34,10 +34,9 @@ the model.
       --tools all \
       --mcp-servers-config ~/mcp-servers.json
 
-**With vision:** add the projector and halve the ubatch.
+**With vision:** add the projector.
 
       --mmproj /mnt/fast/models/mmproj-Qwen3.8-27B-Q8_0.gguf
-      -ub 1024                     # instead of 2048
 
 `qwen-server` also passes the model card's sampling, `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0`. The gguf carries the first three itself, but not min-p, so without the flag llama.cpp's 0.05 applies. Don't change these: other values make the model loop.
 
@@ -51,7 +50,7 @@ the model.
 | `-c 262144` | the model's full context. Allocating it costs nothing on decode. Only filling it does |
 | `-np 1` | one server slot. Each slot allocates its own full KV cache, and without this the server sizes several and fails at startup |
 | `-b 32768` | the most tokens one decode call may take. **Needed for MTP at long context:** with `-b 262144` the whole prompt becomes one batch, and on a 259k-token prompt draft acceptance falls to 0 and decode to 5.4 t/s. At 32768 the same prompt gives 0.98 acceptance and 26.1 t/s |
-| `-ub 2048` | tokens per GPU pass. It sets prefill speed and VRAM use; see below |
+| `-ub 1024` | tokens per GPU pass. It sets prefill speed and VRAM use; see below |
 | `--spec-type draft-mtp` | speculative decoding with the model's built-in MTP head. MTP isn't a separate model: the `*-MTP-ONLY` gguf doesn't load on its own |
 | `--spec-draft-n-max 4 --spec-draft-p-min 0.2` | draft up to 4 tokens, and stop drafting below 20% confidence. See below for 3 vs 4 |
 | `-ngld 99` | the draft layer on the GPU |
@@ -73,20 +72,17 @@ VRAM use grows as the context fills. The attention mask is sized to the *used* p
 times the ubatch, so a short prompt says nothing about a full one. At full depth these
 configurations bottom out at:
 
-| configuration | GPU0 free at the low point of a 259k-token prefill |
+| configuration | GPU0 free at the low point, 262k context |
 |---|---|
-| text, `-ub 2048` | 757 MiB |
-| vision, `-ub 1024` | 731 MiB |
+| vision, `-ub 1024` (2026-09-26 build) | 620-646 MiB |
+| vision, `-ub 2048` (2026-09-26 build) | 162 MiB: does not fit |
 
-`-ub` is the lever. Each unit costs ~0.74 MiB on GPU0, and lowering it costs only prefill speed:
+Text only (no projector) has more room than the vision figure. Since 2026-09-26 the MTP draft
+head keeps its own q4_0 copy of the common vocabulary (~112 MiB per card), which is why `-ub 2048`
+no longer fits; `LLAMA_MTP_DRAFT_VOCAB=0` turns that off.
 
-| text `-ub` | prefill at full depth | GPU0 low point |
-|---|---|---|
-| 2048 | 137.4 t/s | 757 MiB |
-| 256 | 119.5 t/s | 2205 MiB |
-
-If anything else shares GPU0, like a browser or a second display client, drop one step: text to
-`-ub 1024`, vision to `-ub 512`. Vision at `-ub 2048` fails during load.
+`-ub` is the lever, and lowering it costs only prefill speed. If anything else shares GPU0, like
+a browser or a second display client, drop to `-ub 512`.
 
 ### Draft length: 3 or 4
 

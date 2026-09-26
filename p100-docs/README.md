@@ -11,16 +11,17 @@ It tracks upstream by merging. The last merge was upstream `f46bc30cb`
 
 | | upstream at the fork point | this fork |
 |---|---|---|
-| decode, `tg256` | 17.51 t/s | **31.3 t/s** |
+| decode, `tg256` | 17.51 t/s | **31.2 t/s** |
 | prefill, `pp2048` at `-ub 512` | 222.6 t/s | **380.4 t/s** (before the 2026-09-22 merge) |
-| MTP decode through `qwen-server`, real sampling (`depth-bench.py`, 2 questions x 2 seeds) | — | **42 t/s** at 2k, 35 at 64k, 32 at 128k, **25-26 at 260k** |
+| MTP decode through `qwen-server`, real sampling (`depth-bench.py`, 2026-09-26 sweep) | — | **52 t/s** at 2k, 56 at 32k, 46 at 62k, 35 at 122k, 31 at 182k, **28-34 at 260k** (hot cards: 49 at 2k, ~30 at 260k) |
+| prefill at depth, `qwen-server` (30k-token chunks, 2026-09-26) | — | 316 t/s at 2k, 257 at 62k, 162 at 122k, 125 at 182k, **100-108 at 260k** |
 | decode at 229k context, 2026-09-22 build | — | 21.5 t/s plain, 23.2 with MTP |
-| perplexity (gate corpus, `-c 4096`) | — | **2.6101 ± 0.0198** (band 2.6209 ± 0.0199) |
+| perplexity (gate corpus, `-c 4096`) | — | **2.6096 ± 0.0198** (band 2.6209 ± 0.0199) |
 
 The speed didn't cost accuracy. The P100 multiplies in fp16 at twice its fp32 rate, and this fork
 uses that everywhere the work is compute-bound (prefill matmuls, the MTP verify matvec, decode and
 verify attention), but never accumulates long sums in fp16: partial sums move into fp32 every few
-dozen values. Against an all-fp32 run, the prefill path now reads KLD 0.00125 where upstream's fp16
+dozen values. Against an all-fp32 run, the prefill path now reads KLD 0.00122 where upstream's fp16
 cuBLAS reads 0.00152, and fp32 itself scatters 0.0006-0.001 just from summing in a different order.
 Perplexity 2.6096, all-fp32 2.6095. [CHANGES.md §11](CHANGES.md) has the method.
 

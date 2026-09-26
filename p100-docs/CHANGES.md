@@ -219,6 +219,24 @@ any perturbation at fp16 resolution spreads to about that level, and fp32 with a
 summation order lands at 0.0006-0.001. Removing input rounding would need a hi/lo split of the
 activations, i.e. twice the math.
 
+## 12. Decode and prefill at depth, round 2 (2026-09-25/26)
+
+Goal: 260k prefill 95-100 t/s, MTP decode 50 t/s at 2k and 30 t/s at 260k on hot cards, with no
+loss of accuracy. OPTLOG 223-228.
+
+| change | effect |
+|---|---|
+| fold-path prefill attention for a q4_0 cache (`fattn-gemm.cu`, fp16 HFMA2 with exact folds into fp32) | 262k x 1024 op 318 -> 270 ms; 260k prefill ~85 -> 100-108 t/s hot. KLD vs fp32 0.00125 -> 0.00122. `GGML_CUDA_FA_FOLD=0` = cuBLAS path |
+| q4p verify/draft attention: PV reduce-scatter, select-free shuffles, mask preload, packed Q/P smem rows, no chunk-end barrier (`fattn-q4p.cuh`) | 260k verify call 2.70 -> 1.93 ms per layer; draft call 0.96 -> ~0.8 ms. Verify KLD 0.00113 |
+| MTP draft head over the first 81920 tokens, q4_0 copy made at load (`LLAMA_MTP_DRAFT_VOCAB`, 0 = off) | draft step 2.05 -> ~1.4 ms. Lossless: every token is still verified against the full output |
+| fp16 q6_K verify matvec: scales once per warp, 7 blocks/SM when it saves a wave, 1 warp x 2 rows for 256-3071 rows | bit-identical; verify pass ~-2 ms |
+| launch fusions: residual ADD into RMS_NORM+MUL, delta-net gate and l2 norms, alpha/beta matvec epilogues, conv-state CONCAT+CPY, gated norm | bit-identical; ~330 fewer launches per verify pass |
+| host: fusion-check cache, 1-token attention inside the single-token CUDA graphs | draft-step enqueue 0.61 -> 0.45 ms |
+
+`qwen-server` now uses `-ub 1024`: with the draft head and the fold scratch, `-ub 2048` leaves
+GPU0 162 MiB at 262k with the vision projector. Tried and reverted: CUDA graphs for the verify
+(slower, +100 MiB), register prefetch in the big matvec (slower).
+
 ## Known gaps
 
 - **`GGML_CUDA_DEVICES` above the physical GPU count isn't reproducible.** At 3 virtual devices,
