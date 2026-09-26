@@ -39,6 +39,12 @@ for f in BUILD FINDINGS QUICKSTART; do
     echo "    docs/$f.md"
 done
 install -Dm644 "$HERE/docs/AUDIT-2026-09-12.md" "$REL/docs/AUDIT-2026-09-12.md"
+# The repo docs are generic (/path/to/...). The bundle is this machine's copy, so fill in the real
+# paths here. MODELS defaults to where this machine keeps its ggufs.
+MODELS="${MODELS:-/mnt/fast/models}"
+sed -i -e "s|/path/to/p100-llamacpp-release|$REL|g" -e "s|/path/to/Qwen3.8|$MODELS/Qwen3.8|g" \
+       -e "s|/path/to/mmproj-|$MODELS/mmproj-|g" \
+       "$REL/README.md" "$REL/docs/BUILD.md" "$REL/docs/QUICKSTART.md"
 
 echo "==> gate script and corpus"
 install -Dm755 "$REPO/tools/gate.sh"                "$REL/tools/gate.sh"

@@ -15,8 +15,8 @@ The build includes upstream llama.cpp up to `f46bc30cb` (2026-09-22).
 
 Put `bin/` on PATH, then run `qwen-server`:
 
-    export PATH="/mnt/fast/p100-llamacpp-release/bin:$PATH"
-    qwen-server
+    export PATH="/path/to/p100-llamacpp-release/bin:$PATH"
+    QWEN_MODEL=/path/to/Qwen3.8-27B-Q6_K.gguf qwen-server
 
 `docs/QUICKSTART.md` explains every flag, the VRAM budget, and the vision variant.
 

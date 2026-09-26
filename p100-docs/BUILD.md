@@ -9,8 +9,8 @@ The release bundle also carries the fork as one diff against the upstream commit
 `diffs/all-code.diff`, with the base SHA in `diffs/UPSTREAM-BASE-SHA.txt`. To apply it to a
 clean upstream checkout:
 
-    git checkout $(cat /mnt/fast/p100-llamacpp-release/diffs/UPSTREAM-BASE-SHA.txt)
-    git apply /mnt/fast/p100-llamacpp-release/diffs/all-code.diff
+    git checkout $(cat /path/to/p100-llamacpp-release/diffs/UPSTREAM-BASE-SHA.txt)
+    git apply /path/to/p100-llamacpp-release/diffs/all-code.diff
 
 ## Configure and build
 

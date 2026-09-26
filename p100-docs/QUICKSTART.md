@@ -4,7 +4,7 @@ The binaries are built for sm_60 only.
 
 ## Put it on PATH
 
-    export PATH="/mnt/fast/p100-llamacpp-release/bin:$PATH"
+    export PATH="/path/to/p100-llamacpp-release/bin:$PATH"
 
 `bin/` holds a small wrapper for every program in `build/`, plus `qwen-server`. Use the
 wrappers, not `build/` directly. Each wrapper sets `LD_LIBRARY_PATH` to the bundle. The real
@@ -16,27 +16,29 @@ quietly load a different build's `libggml-cuda.so`. To check which one is live:
 ## Serving
 
 `qwen-server` runs the configuration below. Extra arguments are appended and override the
-defaults, so `qwen-server --port 9000` works, and `QWEN_MODEL=/path/to.gguf qwen-server` swaps
-the model.
+defaults, so `qwen-server --port 9000` works. Point it at your model with
+`QWEN_MODEL=/path/to/Qwen3.8-27B-Q6_K.gguf qwen-server`. If `~/mcp-servers.json` exists it is
+passed as `--mcp-servers-config`; otherwise that flag is left out.
 
-**Text only:**
+**Text only** (`-ub 2048`, faster prefill):
 
     GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=3 \
     LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20 \
     llama-server \
-      -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
+      -m /path/to/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-      -c 262144 -b 32768 -ub 1024 -np 1 \
+      -c 262144 -b 32768 -ub 2048 -np 1 \
       --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
       -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
       --jinja \
       --host 0.0.0.0 --port 8080 \
-      --tools all \
-      --mcp-servers-config ~/mcp-servers.json
+      --tools all
 
-**With vision:** add the projector.
+**With vision** (`-ub 1024`, more VRAM headroom): add the projector and drop the ubatch to 1024.
 
-      --mmproj /mnt/fast/models/mmproj-Qwen3.8-27B-Q8_0.gguf
+      --mmproj /path/to/mmproj-Qwen3.8-27B-Q8_0.gguf -ub 1024
+
+`qwen-server` does this for you: pass `--mmproj <file>` and it switches to `-ub 1024`.
 
 `qwen-server` also passes the model card's sampling, `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0`. The gguf carries the first three itself, but not min-p, so without the flag llama.cpp's 0.05 applies. Don't change these: other values make the model loop.
 
@@ -50,7 +52,7 @@ the model.
 | `-c 262144` | the model's full context. Allocating it costs nothing on decode. Only filling it does |
 | `-np 1` | one server slot. Each slot allocates its own full KV cache, and without this the server sizes several and fails at startup |
 | `-b 32768` | the most tokens one decode call may take. **Needed for MTP at long context:** with `-b 262144` the whole prompt becomes one batch, and on a 259k-token prompt draft acceptance falls to 0 and decode to 5.4 t/s. At 32768 the same prompt gives 0.98 acceptance and 26.1 t/s |
-| `-ub 1024` | tokens per GPU pass. It sets prefill speed and VRAM use; see below |
+| `-ub 2048` / `-ub 1024` | tokens per GPU pass. 2048 for text only (faster prefill), 1024 with vision (the projector takes ~600 MiB on GPU0, so it needs the headroom); see below |
 | `--spec-type draft-mtp` | speculative decoding with the model's built-in MTP head. MTP isn't a separate model: the `*-MTP-ONLY` gguf doesn't load on its own |
 | `--spec-draft-n-max 4 --spec-draft-p-min 0.2` | draft up to 4 tokens, and stop drafting below 20% confidence. See below for 3 vs 4 |
 | `-ngld 99` | the draft layer on the GPU |
@@ -60,13 +62,13 @@ the model.
 | `GGML_CUDA_GRAPHS_PRE_VOLTA=3` | CUDA graphs for single-token graphs only (the MTP draft steps). Full graphs (`1`) run VRAM out at full context when instantiated for the big verify and prefill graphs; `0` turns them off entirely (OPTLOG 212) |
 | `LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20` | the MTP draft samples from its own top 20 at temperature 1.0, and the verify uses the speculative-sampling rule (accept with min(1, p/q), else draw from the residual). The output distribution is exactly the model card's sampling; only acceptance changes: +15% tokens per cycle at 2k, +8% at 260k (OPTLOG 202) |
 | `--jinja` | use the chat template stored in the gguf. Tool calls need it |
-| `--tools all`, `--mcp-servers-config` | the server's built-in tools, plus MCP servers from that file |
+| `--tools all` | the server's built-in tools. Add `--mcp-servers-config <file>` for MCP servers |
 | `--host 0.0.0.0 --port 8080` | listen on the LAN |
 
 ### VRAM
 
-All figures are **per card**. GPU0 is the one to watch: it also carries the desktop (Sunshine
-holds ~392 MiB there), and the vision projector loads onto it whole.
+All figures are **per card**. GPU0 is the one to watch: the vision projector loads onto it
+whole, and if it also drives a display, that takes memory too.
 
 VRAM use grows as the context fills. The attention mask is sized to the *used* part of the cache
 times the ubatch, so a short prompt says nothing about a full one. At full depth these
@@ -74,15 +76,16 @@ configurations bottom out at:
 
 | configuration | GPU0 free at the low point, 262k context |
 |---|---|
-| vision, `-ub 1024` (2026-09-26 build) | 620-646 MiB |
-| vision, `-ub 2048` (2026-09-26 build) | 162 MiB: does not fit |
+| text only, `-ub 2048` | ~750 MiB (the vision figure plus the projector's ~600 MiB) |
+| vision, `-ub 1024` | 620-646 MiB |
+| vision, `-ub 2048` | 162 MiB: does not fit |
 
-Text only (no projector) has more room than the vision figure. Since 2026-09-26 the MTP draft
-head keeps its own q4_0 copy of the common vocabulary (~112 MiB per card), which is why `-ub 2048`
-no longer fits; `LLAMA_MTP_DRAFT_VOCAB=0` turns that off.
+These were measured on a machine where GPU0 also drives a display (~400 MiB), so a headless GPU0
+has that much more. The MTP draft head keeps its own q4_0 copy of the common vocabulary (~112 MiB
+per card); `LLAMA_MTP_DRAFT_VOCAB=0` turns that off.
 
-`-ub` is the lever, and lowering it costs only prefill speed. If anything else shares GPU0, like
-a browser or a second display client, drop to `-ub 512`.
+`-ub` is the lever, and lowering it costs only prefill speed. If GPU0 runs short (other programs
+on it, a busier display), drop one step: 2048 → 1024 → 512.
 
 ### Draft length: 3 or 4
 
@@ -104,7 +107,7 @@ MTP through the server, 2026-09-23 build, `--temp 0.3 --top-k 20`: 38-50 t/s at 
 
 ## Benchmarking decode
 
-    GGML_CUDA_P2P=1 llama-bench -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
+    GGML_CUDA_P2P=1 llama-bench -m /path/to/Qwen3.8-27B-Q6_K.gguf \
       -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -p 0 -n 256 -r 5
 
 Leave `GGML_CUDA_GRAPHS_PRE_VOLTA` unset here. At long context, time at least 512 generated
@@ -122,7 +125,7 @@ tokens: `-n 128` is dominated by a 2-3 s first-token cost and reads far too low.
 
 ## Checking a build
 
-    /mnt/fast/p100-llamacpp-release/tools/gate.sh
+    /path/to/p100-llamacpp-release/tools/gate.sh
 
 It runs the decode benchmark, then perplexity on the right corpus, then the flash-attention op
 tests. Expect perplexity near 2.6101 ± 0.0198. The gate band is 2.6209 ± 0.0199. Use the script rather

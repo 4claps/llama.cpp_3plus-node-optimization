@@ -233,8 +233,8 @@ loss of accuracy. OPTLOG 223-228.
 | launch fusions: residual ADD into RMS_NORM+MUL, delta-net gate and l2 norms, alpha/beta matvec epilogues, conv-state CONCAT+CPY, gated norm | bit-identical; ~330 fewer launches per verify pass |
 | host: fusion-check cache, 1-token attention inside the single-token CUDA graphs | draft-step enqueue 0.61 -> 0.45 ms |
 
-`qwen-server` now uses `-ub 1024`: with the draft head and the fold scratch, `-ub 2048` leaves
-GPU0 162 MiB at 262k with the vision projector. Tried and reverted: CUDA graphs for the verify
+`qwen-server` keeps `-ub 2048` for text only and switches to `-ub 1024` with `--mmproj`: with the
+draft head and the fold scratch, `-ub 2048` plus the vision projector leaves GPU0 162 MiB at 262k. Tried and reverted: CUDA graphs for the verify
 (slower, +100 MiB), register prefetch in the big matvec (slower).
 
 ## Known gaps
