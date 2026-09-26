@@ -8454,3 +8454,15 @@ Real-world MTP at 260k (`depth-bench.py --restore`, 2 questions x 5 seeds per ar
 +4.6% (-5.7 ms per cycle), acceptance unchanged. Gates on this build: perplexity 2.6096 (in band;
 all-fp32 reads 2.6095), FLASH_ATTN_EXT eval passes; tg256 read 27.0 +- 3.1 on 71 C cards (not
 valid, rerun cold). Kept.
+
+## Attempt 223 — MTP cycle overhead: matvec scale staging, occupancy by waves, ADD+norm fusion, host trims: kept
+
+Four bit-exact changes (depth-bench texts byte-identical in every A/B). quick verify pass at 2k:
+49.8 -> ~48.2 ms. Details and per-change ABBA numbers in /mnt/fast/p100-scratch/goal-dec.md.
+- fp16 q6_K matvec: block scales computed once per warp into shared memory: 49.82 -> 48.60 ms/pass,
+  depth-bench 2k 62.4 -> 60.9 ms/cycle.
+- 7 blocks/SM when it saves a wave (3072/6144/8704 rows): 48.88 -> 48.45 ms/pass.
+- residual ADD fused into the next RMS_NORM+MUL (GGML_CUDA_FUSE_ADD_NORM=0 off): ~-0.3 ms/pass.
+- host: fusion-check cache (GGML_CUDA_FUSE_CACHE=0 off), device cache, graph mode 3 captures the
+  1-token attention subgraph: draft enqueue 0.61 -> 0.45 ms, end to end a tie.
+The fp16 matvec is ~90% issue-bound (L2-resident weights: -9%; pinned activations: 0%).
