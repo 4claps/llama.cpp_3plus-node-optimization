@@ -3956,6 +3956,100 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL, the sum also an output (the residual stream; fused
+// on CUDA by add_rms_norm_mul_f32)
+struct test_add_rms_norm_mul : public test_case {
+    const std::array<int64_t, 2> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    test_add_rms_norm_mul(std::array<int64_t, 2> ne = {5120, 5}, float eps = 1e-6f) : ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(w, "w");
+        ggml_tensor * sum = ggml_add(ctx, a, b);
+        ggml_set_name(sum, "sum");
+        ggml_set_output(sum);
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, sum, eps), w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// the gated delta net's gate: softplus(x + dt) * a, dt and a row vectors (fused on CUDA)
+struct test_add_softplus_mul : public test_case {
+    const std::array<int64_t, 2> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SOFTPLUS_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_add_softplus_mul(std::array<int64_t, 2> ne = {24, 5}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * a  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * out = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, x, dt)), a);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -30.f, 30.f); // both softplus branches
+        }
+    }
+};
+
+// the gated delta net's l2 norm: RMS_NORM -> SCALE (fused on CUDA)
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, scale);
+    }
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 8, 5, 1}, float scale = 0.0883883f) : ne(ne), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, x, 1e-6f/ne[0]), scale);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -9782,6 +9876,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
     }
+    for (int64_t n : {1024, 5120, 5121, 8192}) {
+        for (int64_t r : {1, 5, 7}) {
+            test_cases.emplace_back(new test_add_rms_norm_mul({n, r}));
+        }
+    }
+    for (int64_t r : {1, 5, 300}) {
+        test_cases.emplace_back(new test_add_softplus_mul({24, r}));
+        test_cases.emplace_back(new test_add_softplus_mul({48, r}));
+    }
+    for (int64_t n : {64, 128, 1000}) {
+        test_cases.emplace_back(new test_rms_norm_scale({n, 8, 5, 1}));
+        test_cases.emplace_back(new test_rms_norm_scale({n, 3, 2, 2}, 2.0f));
+    }
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
@@ -11428,6 +11535,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     // The q6_K matvecs of one decode/verify pass on each GPU under -sm tensor (m rows x k), by width.
+    for (int64_t r : {1, 2, 5}) {
+        test_cases.emplace_back(new test_add_rms_norm_mul({5120, r}));
+    }
     for (auto mk : std::vector<std::pair<int, int>>{{8704, 5120}, {5120, 8704}, {5120, 5120}, {3072, 5120}, {5120, 3072}, {6144, 5120}, {512, 5120}, {24, 5120}}) {
         for (int n : {1, 2, 3, 4, 5, 6}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));

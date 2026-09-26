@@ -4546,6 +4546,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // ADD (row bias) -> SOFTPLUS -> MUL (row scale): the delta net's gate. GGML_CUDA_FUSE_GATE=0 disables.
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL) {
+        static const bool gate_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_GATE");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        const enum ggml_op ops_g[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+        if (gate_on && ggml_can_fuse(cgraph, i, ops_g, 3) &&
+                ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            return 2;
+        }
+    }
+
+    // RMS_NORM -> SCALE (the gated delta net's l2 norm of q and k). GGML_CUDA_FUSE_NORM_SCALE=0 disables.
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_SCALE) {
+        static const bool norm_scale_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_NORM_SCALE");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        const enum ggml_op ops_ns[2] = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+        if (norm_scale_on && ggml_can_fuse(cgraph, i, ops_ns, 2) &&
+                ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            return 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
