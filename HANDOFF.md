@@ -157,7 +157,10 @@ Gates on this build: tg256 31.17 t/s, PPL 2.6096, FA eval OK (full suite not run
 
 Next: the 177 TP exchange ADDs per verify pass (fold into the next fused add+norm across meta
 subgraphs); the q6_K 5-col matvec (~36 of ~46 ms/pass) is still the bulk and resisted two attempts.
-Worktrees wt-{dec,vattn,mv3,pfattn} and goal/goal2 branches can be removed.
+Cleaned up 09-26: goal worktrees removed, merged goal*/ branches deleted. Kept: branch goal/pfattn
+(6ba2952d5, P layout for the fold prefill, op ~276 -> 270 ms, FA eval OK, not measured end to end;
+drop its OPTLOG hunk if merged) and stash@{0} (its old WIP). qwen-server now runs -ub 1024
+(OPTLOG 229: -ub 2048 no longer fits at 262k with the draft head).
 
 ## Paused 2026-09-25 late (resume here)
 
