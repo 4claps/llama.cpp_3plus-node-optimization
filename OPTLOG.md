@@ -8578,3 +8578,9 @@ Sweep on this build (depth-bench, incremental fill, 2 questions per depth, cards
 | 212k | 118 | 33.0 |
 | 242k | 108 | 28.1 |
 | 260k | 100 (19k chunk) | 34.1 (27.1 and 41.1) |
+
+Full op suite (09-26, after 229): found an illegal memory access in GDN_GATE on CUDA1 -- the fp16
+matvec's activation cache was keyed by the context address, and CUDA1's context reused CUDA0's freed
+address, inheriting a CUDA0 buffer. The cache now records its device and reallocates on a mismatch.
+Serving never recreates contexts, so no measurement was affected. Rerun: 16316/16316 on CUDA0 and
+CUDA1, 3/3 backends. Gates on this build: tg256 32.09 t/s (cool cards), PPL 2.6096.
