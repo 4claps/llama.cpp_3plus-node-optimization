@@ -4024,6 +4024,43 @@ struct test_add_softplus_mul : public test_case {
     }
 };
 
+// the gated delta net's alpha/beta projections and gates (one launch on Pascal, mmvq-f16.cu):
+// gate = softplus(W_a x + dt) * a, beta = sigmoid(W_b x)
+struct test_gdn_gate : public test_case {
+    const int64_t rows, n, k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(rows, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_gdn_gate(int64_t rows = 24, int64_t n = 5, int64_t k = 5120) : rows(rows), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, GGML_TYPE_Q6_K, k, rows);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_Q6_K, k, rows);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rows);
+        ggml_tensor * a  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rows);
+        ggml_tensor * alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wa, x), rows, n, 1);
+        ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        ggml_tensor * beta  = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wb, x), rows, n, 1));
+        ggml_tensor * out = ggml_concat(ctx, gate, beta, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // the gated delta net's l2 norm: RMS_NORM -> SCALE (fused on CUDA)
 struct test_rms_norm_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -9880,6 +9917,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t r : {1, 5, 7}) {
             test_cases.emplace_back(new test_add_rms_norm_mul({n, r}));
         }
+    }
+    for (int64_t n : {1, 2, 3, 5}) {
+        test_cases.emplace_back(new test_gdn_gate(24, n, 5120));
+        test_cases.emplace_back(new test_gdn_gate(20, n, 3072));
     }
     for (int64_t r : {1, 5, 300}) {
         test_cases.emplace_back(new test_add_softplus_mul({24, r}));

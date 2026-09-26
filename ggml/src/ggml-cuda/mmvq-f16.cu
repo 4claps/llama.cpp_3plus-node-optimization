@@ -151,16 +151,44 @@ static __device__ __forceinline__ void mmvq_f16_scales(const uint32_t * const * 
     }
 }
 
-template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT>
+// The gated delta net's gate and beta in one launch (GATE): rows [0, rows1) are alpha's (W, Y),
+// giving softplus(alpha + b) * m; the rest are beta's (W2, Y2), giving sigmoid(beta). The epilogues
+// are the unfused ADD, SOFTPLUS, MUL and SIGMOID kernels' operations, so results are bit-identical.
+struct mmvq_f16_gate {
+    const uint8_t * W2;
+    float *         Y2;
+    const float *   b;
+    const float *   m;
+    int             rows1;
+};
+
+static __device__ __forceinline__ float mmvq_f16_softplus(const float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x)); // op_softplus (unary.cu)
+}
+
+template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT, bool GATE = false>
 __launch_bounds__(NWT*WARP_SIZE, MINB) // 12/NWT: 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
 static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XS,
                                      const float * __restrict__ S, float * __restrict__ Y, const int64_t sy,
-                                     const int rows, const int K) {
+                                     int rows, const int K, const mmvq_f16_gate gate = {}) {
+    static_assert(!GATE || (KS && RPW == 1), "GATE: split-K, one row per block");
     constexpr int RPB = NWT*RPW, WB = MMVQ_F16_NBF*210, NU = (WB + 15 + 15)/16;
     const int lane = threadIdx.x, wid = threadIdx.y;
     const int nb = K/256, nw = (nb + MMVQ_F16_NBF - 1)/MMVQ_F16_NBF;
     // KS (split K): the block's warps share its RPW rows and take every NWT-th window each
-    const int row0 = KS ? blockIdx.x*RPW : blockIdx.x*RPB + wid*RPW;
+    int row0 = KS ? blockIdx.x*RPW : blockIdx.x*RPB + wid*RPW;
+    bool second = false;
+    if constexpr (GATE) {
+        if (row0 >= gate.rows1) {
+            second = true;
+            row0 -= gate.rows1;
+            rows -= gate.rows1;
+            W = gate.W2;
+            Y = gate.Y2;
+        } else {
+            rows = gate.rows1;
+        }
+    }
 
     __shared__ uint4 wst[NWT][RPW][NU];
 
@@ -259,6 +287,10 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
                 v += red[w][c][i];
             }
             if (row0 + i < rows) {
+                if constexpr (GATE) {
+                    const int r = row0 + i;
+                    v = second ? 1.0f / (1.0f + expf(-v)) : mmvq_f16_softplus(v + gate.b[r]) * gate.m[r];
+                }
                 Y[c*sy + row0 + i] = v;
             }
         }
@@ -301,8 +333,58 @@ void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx) {
     }
 }
 
-bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                            ggml_tensor * dst, const int64_t ncols) {
+static bool mmvq_f16_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int64_t ncols);
+static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int64_t ncols, int64_t K,
+                             __half ** xs_ptr, float ** sc_ptr);
+
+bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
+                                 const ggml_tensor * b, const ggml_tensor * m, ggml_tensor * gate_out, ggml_tensor * beta_out,
+                                 const int64_t ncols) {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_CUDA_FUSE_GDN_GATE");
+        return !s || atoi(s) != 0;
+    }();
+    const ggml_tensor * src1 = mm_a->src[1];
+    const int64_t K = mm_a->src[0]->ne[0], ra = mm_a->src[0]->ne[1], rb = mm_b->src[0]->ne[1];
+    auto vec_ok = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->ne[0] == ra && ggml_nelements(t) == ra && ggml_is_contiguous(t);
+    };
+    // outputs: ra (rb) floats per column, contiguous
+    auto out_ok = [&](const ggml_tensor * t, int64_t r) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == r*mm_a->ne[1];
+    };
+    if (!enabled || mm_b->src[1] != src1 || mm_b->src[0]->ne[0] != K || ra + rb >= 256 || ra != rb ||
+            !mmvq_f16_shape_ok(mm_a->src[0], src1, mm_a, ncols) || !mmvq_f16_shape_ok(mm_b->src[0], src1, mm_b, ncols) ||
+            !vec_ok(b) || !vec_ok(m) || !out_ok(gate_out, ra) || !out_ok(beta_out, rb)) {
+        return false;
+    }
+    __half * xs_ptr;
+    float  * sc_ptr;
+    mmvq_f16_prepare(ctx, src1, ncols, K, &xs_ptr, &sc_ptr);
+    mmvq_f16_gate g;
+    g.W2 = (const uint8_t *) mm_b->src[0]->data;
+    g.Y2 = (float *) beta_out->data;
+    g.b  = (const float *) b->data;
+    g.m  = (const float *) m->data;
+    g.rows1 = (int) ra;
+    const uint8_t * W = (const uint8_t *) mm_a->src[0]->data;
+    float * Y = (float *) gate_out->data;
+    const int g_blocks = (int) (ra + rb);
+    const dim3 bdk(WARP_SIZE, 4);
+    cudaStream_t stream = ctx.stream();
+    const int64_t rbytes = mm_a->src[0]->nb[1];
+    switch (ncols) {
+        case 2:  mmvq_f16_q6_K<2, 1, 4, true, 3, true><<<g_blocks, bdk, 0, stream>>>(W, rbytes, xs_ptr, sc_ptr, Y, ra, (int) (ra + rb), (int) K, g); break;
+        case 3:  mmvq_f16_q6_K<3, 1, 4, true, 3, true><<<g_blocks, bdk, 0, stream>>>(W, rbytes, xs_ptr, sc_ptr, Y, ra, (int) (ra + rb), (int) K, g); break;
+        case 4:  mmvq_f16_q6_K<4, 1, 4, true, 3, true><<<g_blocks, bdk, 0, stream>>>(W, rbytes, xs_ptr, sc_ptr, Y, ra, (int) (ra + rb), (int) K, g); break;
+        default: mmvq_f16_q6_K<5, 1, 4, true, 3, true><<<g_blocks, bdk, 0, stream>>>(W, rbytes, xs_ptr, sc_ptr, Y, ra, (int) (ra + rb), (int) K, g); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+static bool mmvq_f16_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int64_t ncols) {
+    // GGML_CUDA_MMVQ_F16=0 turns the fp16 path off
     static const bool enabled = [] {
         const char * s = getenv("GGML_CUDA_MMVQ_F16");
         return !s || atoi(s) != 0;
@@ -311,24 +393,21 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     static const int64_t min_rows = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MINROWS"); return s ? (int64_t) atoll(s) : (int64_t) 16; }();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t K = src0->ne[0], rows = src0->ne[1];
-    // Where it measured faster than the integer path (OPTLOG 206), test-backend-ops at 5 columns, rows x K:
-    // 8704x5120 154 -> 133 us, 6144x5120 115 -> 97, 5120x5120 98 -> 89, 3072x5120 67 -> 61,
-    // 5120x8704 161 -> 146, 5120x3072 61 -> 57. K must hold an even number of q6_K blocks.
-    if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || src0->type != GGML_TYPE_Q6_K ||
+    return !(!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || src0->type != GGML_TYPE_Q6_K ||
             src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < 2 || ncols > 5 ||
             K % 512 != 0 || rows < min_rows || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src0->nb[1] != (size_t) (K/256)*210 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
-            (src1->nb[1] % 16) != 0 || ((uintptr_t) src1->data % 16) != 0 || ((uintptr_t) src0->data % 4) != 0) {
-        return false;
-    }
+            (src1->nb[1] % 16) != 0 || ((uintptr_t) src1->data % 16) != 0 || ((uintptr_t) src0->data % 4) != 0);
+}
+
+static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int64_t ncols, const int64_t K,
+                             __half ** xs_out, float ** sc_out) {
     const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
     cudaStream_t stream = ctx.stream();
 
     mmvq_f16_cache & cache = mmvq_f16_caches[&ctx];
     const size_t xs_bytes = (size_t) ncols*K*sizeof(__half);
     const size_t need     = xs_bytes + (size_t) ncols*nw*sizeof(float);
-    __half * xs_ptr;
-    float  * sc_ptr;
     const bool hit = cache.src1 == src1 && cache.data == src1->data && cache.ncols == ncols && cache.K == K;
     if (!hit) {
         if (cache.cap < need) {
@@ -340,12 +419,30 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         }
         cache.src1 = src1; cache.data = src1->data; cache.ncols = ncols; cache.K = K;
     }
-    xs_ptr = (__half *) cache.buf;
-    sc_ptr = (float *) ((char *) cache.buf + xs_bytes);
+    __half * xs_ptr = (__half *) cache.buf;
+    float  * sc_ptr = (float *) ((char *) cache.buf + xs_bytes);
     if (!hit) {
         const dim3 pb(WARP_SIZE, 4), pg((nw + 3)/4, ncols);
         mmvq_f16_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, src1->nb[1]/sizeof(float), xs_ptr, sc_ptr, (int) K);
     }
+    *xs_out = xs_ptr;
+    *sc_out = sc_ptr;
+}
+
+bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                            ggml_tensor * dst, const int64_t ncols) {
+    const int64_t K = src0->ne[0], rows = src0->ne[1];
+    // Where it measured faster than the integer path (OPTLOG 206), test-backend-ops at 5 columns, rows x K:
+    // 8704x5120 154 -> 133 us, 6144x5120 115 -> 97, 5120x5120 98 -> 89, 3072x5120 67 -> 61,
+    // 5120x8704 161 -> 146, 5120x3072 61 -> 57. K must hold an even number of q6_K blocks.
+    if (!mmvq_f16_shape_ok(src0, src1, dst, ncols)) {
+        return false;
+    }
+    const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
+    cudaStream_t stream = ctx.stream();
+    __half * xs_ptr;
+    float  * sc_ptr;
+    mmvq_f16_prepare(ctx, src1, ncols, K, &xs_ptr, &sc_ptr);
     const int64_t sy = dst->nb[1]/sizeof(float);
     const uint8_t * W = (const uint8_t *) src0->data;
     float * Y = (float *) dst->data;
