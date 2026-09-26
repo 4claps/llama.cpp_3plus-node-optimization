@@ -136,6 +136,29 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
   fastdiv, DP4A, q4_0 dequant and norm changes). `p100-handoff/VERIFICATION.md` is the numerical
   audit.
 
+## Round 2, 2026-09-26 (resume here)
+
+Hot cards (70-78 C), production flags, depth-bench --restore --extra-chars 4100, 2 seeds x 2 questions:
+
+| | old build (72-77 C) | now | goal |
+|---|---|---|---|
+| 260k prefill | 87.7-91.6 t/s | 101.6-107.9 t/s | 95-100 (met) |
+| 2k decode | 68.6-69.7 ms/cycle | 49.4 t/s avg (58-63 ms/cycle) | 50 (~1% short, within heat noise) |
+| 260k decode | 116.8-120.6 ms/cycle | 29.4-30.2 t/s avg (95-104 ms/cycle) | 30 (at the line) |
+
+Merged today (OPTLOG 226-228): MTP draft head over the first 81920 tokens in q4_0
+(`LLAMA_MTP_DRAFT_VOCAB`, 0 = off; draft step 2.05 -> ~1.4 ms), fold prefill chunk 1024 (VRAM for
+the draft head; GPU0 min free at 262k with prefill now ~642-646 MiB, was 696-702), goal2/vattn2
+(q4p verify attention 2.44 -> 1.93 ms/call at 260k; verify KLD 0.001127), goal2/ops2 + ops2b
+(bit-exact launch fusions, verify pass ~-1.6 ms). Tried and dropped: CUDA graphs for the verify
+(slower, +100 MiB), big-path matvec prefetch/x-reorder (not faster), n-max 3/5 (model says worse).
+
+Gates on this build: tg256 31.17 t/s, PPL 2.6096, FA eval OK (full suite not run).
+
+Next: the 177 TP exchange ADDs per verify pass (fold into the next fused add+norm across meta
+subgraphs); the q6_K 5-col matvec (~36 of ~46 ms/pass) is still the bulk and resisted two attempts.
+Worktrees wt-{dec,vattn,mv3,pfattn} and goal/goal2 branches can be removed.
+
 ## Paused 2026-09-25 late (resume here)
 
 Goal the user set: hot cards, production serving flags, MTP on: 260k prefill (1k chunk)
