@@ -8416,3 +8416,41 @@ math.
 Speed, llama-bench pp1024 -ub 1024 (ABBA, warm cards): FOLD=0 397/383 -> fold-256 373/371
 (-6%); fold-128 367/361. pp1024 @ d32768: 234/247 -> 231/224 (-5%, noisy). Decode is untouched
 (mul_mat_vec_q / mmvq-f16). Per op in the model: ffn 5120->8704 6.8 -> 7.9 ms before the swizzle.
+
+## Attempt 222 — q4p attention (decode / verify) in fp16 with fp32 folds
+
+Same method as attempt 221, in the q4p kernel (decode and MTP verify over the q4_0 cache).
+
+QK (`Q4P_H16QK`, rows with BLOCK_T and PT 2: 6, 12 and 15 rows): Q goes to smem as half2 (q,q) in the
+same 4-byte slots. Two KV positions ride the two lanes: their nibbles are interleaved with one PRMT per
+pair of bytes, then a second PRMT against 0x64646464 makes half 0x64nn = 1024 + n exactly, and one
+HSUB2 of 1032 leaves the exact n - 8. 15 HFMA2 per dim cover both positions (was 30 FFMA). One chain
+per 32-dim q4_0 block, folded into fp32 through the block scale with the integer conversion (lo lane:
+shift left 16, arithmetic shift right 3, mask; hi lane: shift, mask); the 2^112 rebias is undone once
+per chunk. First try used `__byte_perm` selector nibble 8 for a zero byte: the intrinsic honours only
+the low 3 bits, so that byte was a copy of a nibble and the result was garbage (ERR ~1 in the eval).
+
+PV (`Q4P_H16PV`): P is published to smem as half2 (p,p) (the denominator sums the same rounded p); V
+nibbles become exact half2 pairs the same way and are scaled once by the V block scale (the one rounding,
+as for prefill weights); HFMA2 over dimension pairs, folded into the fp32 accumulators every
+`Q4P_PVF` = 32 positions. At DPT 4 (60 fp32 + 30 half2 registers) it was slower (3143 us, 3031 with V
+two positions ahead): a quarter of the work per position no longer covered the per-position loads. At
+DPT 8 it fits: 255 registers, no local memory.
+
+test-backend-ops perf, kv 262144, same session (fp32 kernel -> fp16):
+
+    5 tokens (verify, 15 rows)   3127.6 -> 2682.4 us  (-14%)
+    1 token  (decode, 6 rows)     942.1 ->  835.3 us  (-11%)
+
+FLASH_ATTN_EXT eval 4019/4019 on CUDA0. Verify path (perplexity -ub 5, 3 chunks) against the all-fp32
+base: KLD 0.001146 (fp32 kernel) -> 0.001137 (fp16), same top 98.86 -> 99.01 %, ln PPL ratio
+-0.000076 +- 0.000415 -> +0.000589 +- 0.000431: no difference at this resolution.
+
+Real-world MTP at 260k (`depth-bench.py --restore`, 2 questions x 5 seeds per arm, ABBA, hot cards 76 C):
+
+    fp32 attention  A1 26.09  A2 25.78  -> 25.93 t/s  123.1 ms/cycle  accept 0.668  3.19 tok/cycle
+    fp16 attention  B1 27.12  B2 27.10  -> 27.11 t/s  117.4 ms/cycle  accept 0.666  3.18 tok/cycle
+
++4.6% (-5.7 ms per cycle), acceptance unchanged. Gates on this build: perplexity 2.6096 (in band;
+all-fp32 reads 2.6095), FLASH_ATTN_EXT eval passes; tg256 read 27.0 +- 3.1 on 71 C cards (not
+valid, rerun cold). Kept.

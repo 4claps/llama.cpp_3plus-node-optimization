@@ -66,6 +66,29 @@
 #define Q4P_MINB 1
 #endif
 
+// QK in fp16: products on the HFMA2 pipe (two KV positions per instruction), one chain per 32-dim
+// q4_0 block folded into fp32 through the block scale. 1 = on, 2 = off.
+#ifndef Q4P_H16QK
+#define Q4P_H16QK 1
+#endif
+// PV in fp16: P published as half2 (p,p), V nibbles exact in fp16 then scaled by the block scale,
+// half2 chains over dimension pairs folded into fp32 every Q4P_PVF positions. Forces DPT 4
+// (60 fp32 + 30 half2 accumulators at 15 rows, where DPT 8 fp32 needed 120). 1 = on, 2 = off.
+#ifndef Q4P_H16PV
+#define Q4P_H16PV 1
+#endif
+#ifndef Q4P_PVF
+#define Q4P_PVF 32
+#endif
+
+// fp32 value * 2^-112 of the half in the high / low lane (integer conversion; subnormals flush)
+static __device__ __forceinline__ float fattn_q4p_hi_f(const uint32_t x) {
+    return __int_as_float((int32_t(x) >> 3) & 0x8FFFE000);
+}
+static __device__ __forceinline__ float fattn_q4p_lo_f(const uint32_t x) {
+    return __int_as_float((int32_t(x << 16) >> 3) & 0x8FFFE000);
+}
+
 template <int R>
 struct fattn_q4p_cfg {
     static constexpr int NT     = 256;                    // threads per block
@@ -102,6 +125,8 @@ struct fattn_q4p_cfg {
     // load the next chunk's K words during this chunk's PV phase (needs NW*PT spare registers;
     // R=24 has none)
     static constexpr bool KPF  = !ROLL && Q4P_KNOB(KPF, R == 24 ? 2 : 1) == 1;
+    static constexpr bool H16QK = Q4P_H16QK == 1 && PT == 2 && BLOCK_T && !ROLL;
+    static constexpr bool H16PV = Q4P_H16PV == 1 && (DPT == 4 || DPT == 8);
 
     static_assert(R % RG == 0, "bad RG");
     static_assert(NT % (NDG*RG) == 0 && NPG >= 1, "bad DPT");
@@ -212,7 +237,12 @@ static __global__ void flash_attn_ext_q4p(
         if (rl < RQ && ic0 + t < n_tok) {
             q = ((const float *) (Q + nb03*sequence + int64_t(nb02)*(head0 + g) + int64_t(nb01)*(ic0 + t)))[dim]*qscale;
         }
-        Q_s[((dim / DPS)*RG + rgi)*QREG + (dim % DPS)*RQP + rl] = q;
+        if constexpr (cfg::H16QK) {
+            const half2 qq = __float2half2_rn(q);
+            Q_s[((dim / DPS)*RG + rgi)*QREG + (dim % DPS)*RQP + rl] = __int_as_float(*(const int *) &qq);
+        } else {
+            Q_s[((dim / DPS)*RG + rgi)*QREG + (dim % DPS)*RQP + rl] = q;
+        }
     }
     if (tid < R) {
         m_s[tid] = -1e30f;
@@ -350,6 +380,52 @@ static __global__ void flash_attn_ext_q4p(
                 }
             }
 
+            if constexpr (cfg::H16QK) {
+                // positions 0 and 1 in the two lanes; K nibbles are exact in fp16 as 1024 + n
+                half2 t2[RQ];
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+                    t2[r] = make_half2(0.0f, 0.0f);
+                }
+                const half2 off = make_half2(1032.0f, 1032.0f);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+#pragma unroll
+                    for (int hh = 0; hh < 2; ++hh) {
+                        const uint32_t n0 = (hh ? (w[0][k] >> 4) : w[0][k]) & 0x0F0F0F0Fu;
+                        const uint32_t n1 = (hh ? (w[1][k] >> 4) : w[1][k]) & 0x0F0F0F0Fu;
+                        // interleave the two positions' nibbles, then pair each with a 0x64 byte:
+                        // half 0x64nn = 1024 + nn exactly
+                        const uint32_t i01 = __byte_perm(n0, n1, 0x5140); // n0[0] n1[0] n0[1] n1[1]
+                        const uint32_t i23 = __byte_perm(n0, n1, 0x7362); // n0[2] n1[2] n0[3] n1[3]
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const uint32_t yb = __byte_perm(e < 2 ? i01 : i23, 0x64646464u, (e & 1) ? 0x4342 : 0x4140);
+                            const half2 y2 = __hsub2(*(const half2 *) &yb, off);
+                            const uint4 * q4 = (const uint4 *) (Qt + (32*bl + 4*k + e + 16*hh)*RQP);
+#pragma unroll
+                            for (int rq = 0; rq < RQP/4; ++rq) {
+                                const uint4 q = q4[rq];
+                                const uint32_t qv[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+                                for (int c = 0; c < 4; ++c) {
+                                    if (4*rq + c < RQ) {
+                                        t2[4*rq + c] = __hfma2(*(const half2 *) &qv[c], y2, t2[4*rq + c]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+                    const uint32_t tb = *(const uint32_t *) &t2[r];
+                    S[0][r] = fmaf(d[0], fattn_q4p_lo_f(tb), S[0][r]);
+                    S[1][r] = fmaf(d[1], fattn_q4p_hi_f(tb), S[1][r]);
+                }
+                continue;
+            }
+
             float t[cfg::BLOCK_T ? PT : 1][cfg::BLOCK_T ? RQ : 1];
             if constexpr (cfg::BLOCK_T) {
 #pragma unroll
@@ -409,6 +485,16 @@ static __global__ void flash_attn_ext_q4p(
                     for (int r = 0; r < RQ; ++r) {
                         S[pt][r] = fmaf(d[pt], t[pt][r], S[pt][r]);
                     }
+                }
+            }
+        }
+
+        if constexpr (cfg::H16QK) {
+#pragma unroll
+            for (int pt = 0; pt < PT; ++pt) {
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+                    S[pt][r] *= 0x1p112f; // undo the conversion's rebias
                 }
             }
         }
@@ -498,7 +584,17 @@ static __global__ void flash_attn_ext_q4p(
                         const int rl = 4*rq + c;
                         pv[c] = rl < RQ ? exp2f(S[pt][rl] - m_s[qgrp*RQ + rl]) : 0.0f;
                     }
-                    ((float4 *) Pp)[rq] = make_float4(pv[0], pv[1], pv[2], pv[3]);
+                    if constexpr (cfg::H16PV) {
+                        uint32_t hb[4];
+#pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            const half2 h = __float2half2_rn(pv[c]);
+                            hb[c] = *(const uint32_t *) &h;
+                        }
+                        ((uint4 *) Pp)[rq] = make_uint4(hb[0], hb[1], hb[2], hb[3]);
+                    } else {
+                        ((float4 *) Pp)[rq] = make_float4(pv[0], pv[1], pv[2], pv[3]);
+                    }
                 }
             }
         }
@@ -527,7 +623,12 @@ static __global__ void flash_attn_ext_q4p(
                 for (int j = 0; j < LPPS; ++j) {
                     const int p = seg*LPPS + j;
                     if (p < p_end) {
-                        ls += P_s[p*PSTR + off];
+                        if constexpr (cfg::H16PV) {
+                            // the rounded p the numerator uses
+                            ls += __low2float(*(const half2 *) &P_s[p*PSTR + off]);
+                        } else {
+                            ls += P_s[p*PSTR + off];
+                        }
                     }
                 }
             }
@@ -551,6 +652,82 @@ static __global__ void flash_attn_ext_q4p(
         uint32_t nd  = fattn_q4p_ld16(vrow0 + 18*pv_b);
         uint32_t nw0 = __ldg((const uint32_t *) (vrow0 + pv_oa));
         uint32_t nw1 = __ldg((const uint32_t *) (vrow0 + pv_oa + 4));
+        if constexpr (cfg::H16PV) {
+            constexpr int NH = DPT/2;   // half2 accumulators per row
+            half2 acc2[RQ][NH];
+#pragma unroll
+            for (int r = 0; r < RQ; ++r) {
+#pragma unroll
+                for (int h = 0; h < NH; ++h) {
+                    acc2[r][h] = make_half2(0.0f, 0.0f);
+                }
+            }
+            const half2 off = make_half2(1032.0f, 1032.0f);
+            auto fold = [&]() {
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+#pragma unroll
+                    for (int h = 0; h < NH; ++h) {
+                        const uint32_t ab = *(const uint32_t *) &acc2[r][h];
+                        acc[r][2*h + 0] = fmaf(0x1p112f, fattn_q4p_lo_f(ab), acc[r][2*h + 0]);
+                        acc[r][2*h + 1] = fmaf(0x1p112f, fattn_q4p_hi_f(ab), acc[r][2*h + 1]);
+                        acc2[r][h] = make_half2(0.0f, 0.0f);
+                    }
+                }
+            };
+            int np = 0;
+            // V words two positions ahead: a quarter of the fp32 path's work per position no
+            // longer covers an L2 round trip
+            uint32_t nd2, nw02, nw12;
+            {
+                const char * vrow = Vb + int64_t(k0 + min(pg + NPG, p_end - 1))*nb21;
+                nd2  = fattn_q4p_ld16(vrow + 18*pv_b);
+                nw02 = __ldg((const uint32_t *) (vrow + pv_oa));
+                nw12 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+            }
+#pragma unroll 2
+            for (int p = pg; p < p_end; p += NPG) {
+                const half2    dv2 = __half2half2(__ushort_as_half((unsigned short) nd));
+                const uint32_t wv  = __byte_perm(nw0, nw1, pv_sel);
+                nd = nd2; nw0 = nw02; nw1 = nw12;
+                {
+                    const char * vrow = Vb + int64_t(k0 + min(p + 2*NPG, p_end - 1))*nb21;
+                    nd2  = fattn_q4p_ld16(vrow + 18*pv_b);
+                    nw02 = __ldg((const uint32_t *) (vrow + pv_oa));
+                    nw12 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+                }
+                // DPT 4: this thread's nibble half of the word; DPT 8: low nibbles (dims 0-3), then high
+                half2 y[NH];
+#pragma unroll
+                for (int h2 = 0; h2 < NH/2; ++h2) {
+                    const uint32_t nb = (DPT == 8 ? h2 : (dg & 1)) ? ((wv >> 4) & 0x0F0F0F0Fu) : (wv & 0x0F0F0F0Fu);
+                    const uint32_t ya = __byte_perm(nb, 0x64646464u, 0x4140); // bytes 0, 1 as 1024 + n
+                    const uint32_t yb = __byte_perm(nb, 0x64646464u, 0x4342); // bytes 2, 3
+                    y[2*h2 + 0] = __hmul2(__hsub2(*(const half2 *) &ya, off), dv2);
+                    y[2*h2 + 1] = __hmul2(__hsub2(*(const half2 *) &yb, off), dv2);
+                }
+                const uint4 * pq = (const uint4 *) (P_s + p*PSTR + vgrp*RQP);
+#pragma unroll
+                for (int rq = 0; rq < RQP/4; ++rq) {
+                    const uint4 q = pq[rq];
+                    const uint32_t pv[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        if (4*rq + c < RQ) {
+#pragma unroll
+                            for (int h = 0; h < NH; ++h) {
+                                acc2[4*rq + c][h] = __hfma2(*(const half2 *) &pv[c], y[h], acc2[4*rq + c][h]);
+                            }
+                        }
+                    }
+                }
+                if (++np == Q4P_PVF) {
+                    np = 0;
+                    fold();
+                }
+            }
+            fold();
+        } else
 #pragma unroll 2
         for (int p = pg; p < p_end; p += NPG) {
             const float    dv = __half2float(__ushort_as_half((unsigned short) nd));
