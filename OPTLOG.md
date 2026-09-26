@@ -8503,3 +8503,7 @@ merged build (attempts 223-225) B then old build A (build-sweep0925b), 2 questio
 
 B ran first (cards 62-66 C at start), A second (72-77 C), so A carries more heat penalty; a hot B
 rerun follows. Verify-path KLD on the merged build (-ub 5, 3 chunks): 0.001172 (was ~0.00114).
+Hot rerun of B right after (cards 79 C, 1 seed): 2k 38.6 t/s 75.0 ms/cycle; 260k decode 25.9 t/s
+126.2 ms/cycle; 260k prefill 101.7 t/s. So the decode gap in the table above is mostly heat order:
+at equal heat the decode gains are the per-kernel ones (verify pass -3% at 2k, q4p verify call
+-10.7% / draft call -5% at 260k, ~5 ms/cycle), not +15-25%. The prefill gain holds hot (+20%).
