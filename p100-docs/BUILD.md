@@ -45,7 +45,7 @@ template instances:
     ./tools/gate.sh           # decode benchmark, perplexity, flash-attention op tests
     ./tools/gate.sh --full    # the same, plus the full op suite (~25 minutes)
 
-Expect `tg256` around 30.6 t/s on cold cards, and perplexity 2.6101 ± 0.0198, inside the band
+Expect `tg256` around 31 t/s on cold cards, and perplexity about 2.610, inside the band
 2.6209 ± 0.0199.
 
 Two cautions about what a pass means:

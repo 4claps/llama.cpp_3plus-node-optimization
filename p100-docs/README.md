@@ -1,7 +1,7 @@
 # llama.cpp for 2x Tesla P100
 
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with CUDA work for Pascal (sm_60),
-which upstream mostly leaves on generic paths. It is tuned on one machine: two
+which upstream mostly leaves on generic paths. It is tuned for two
 Tesla P100-PCIE-16GB cards, tensor-split, running Qwen3.8-27B Q6_K with a q4_0 KV cache.
 
 It tracks upstream by merging. The last merge was upstream `f46bc30cb`
@@ -11,12 +11,13 @@ It tracks upstream by merging. The last merge was upstream `f46bc30cb`
 
 | | upstream at the fork point | this fork |
 |---|---|---|
-| decode, `tg256` | 17.51 t/s | **31.2 t/s** |
-| prefill, `pp2048` at `-ub 512` | 222.6 t/s | **380.4 t/s** (before the 2026-09-22 merge) |
-| MTP decode through `qwen-server`, real sampling (`depth-bench.py`, 2026-09-26 sweep) | — | **52 t/s** at 2k, 56 at 32k, 46 at 62k, 35 at 122k, 31 at 182k, **28-34 at 260k** (hot cards: 49 at 2k, ~30 at 260k) |
-| prefill at depth, `qwen-server` (30k-token chunks, 2026-09-26) | — | 316 t/s at 2k, 257 at 62k, 162 at 122k, 125 at 182k, **100-108 at 260k** |
-| decode at 229k context, 2026-09-22 build | — | 21.5 t/s plain, 23.2 with MTP |
-| perplexity (gate corpus, `-c 4096`) | — | **2.6096 ± 0.0198** (band 2.6209 ± 0.0199) |
+| decode, `tg256` (no MTP) | 17.51 t/s | **31.2 t/s** |
+| decode with MTP, 2k context | — | **52 t/s** |
+| decode with MTP, 260k context | — | **28-34 t/s** |
+| prefill at 260k context | — | **100 t/s** |
+| perplexity (gate corpus, `-c 4096`) | — | **2.6096** |
+
+[QUICKSTART.md](QUICKSTART.md) has the full table from 2k to 260k and the exact server command.
 
 The speed didn't cost accuracy. The P100 multiplies in fp16 at twice its fp32 rate, and this fork
 uses that everywhere the work is compute-bound (prefill matmuls, the MTP verify matvec, decode and
