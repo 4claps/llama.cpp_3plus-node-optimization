@@ -4614,6 +4614,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // CONCAT -> CPY of its tail (the conv state update, views between): one launch.
+    // GGML_CUDA_FUSE_CONCAT_CPY=0 disables.
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool cc_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_CONCAT_CPY");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        if (cc_on && j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_CPY && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                ggml_cuda_op_concat_cpy(*cuda_ctx, node, cgraph->nodes[j])) {
+            return j - i;
+        }
+    }
+
     // ADD (row bias) -> SOFTPLUS -> MUL (row scale): the delta net's gate. GGML_CUDA_FUSE_GATE=0 disables.
     if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
             cgraph->nodes[i + 2]->op == GGML_OP_MUL) {
