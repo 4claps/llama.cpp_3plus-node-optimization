@@ -136,17 +136,45 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
   fastdiv, DP4A, q4_0 dequant and norm changes). `p100-handoff/VERIFICATION.md` is the numerical
   audit.
 
-## Paused 2026-09-25 evening (resume here)
+## Paused 2026-09-25 late (resume here)
 
-- Committed today: `fc1c9056f` prefill GEMM fp16 products + fp32 accumulation (OPTLOG 221),
-  `0be3a47d9` q4p attention fp16 with folds (OPTLOG 222), `4a3a96ba3` docs (WIP).
-- User decision: keep the fold prefill kernel ON by default (costs ~6% prefill cold at short
-  context, maybe ~9% hot at 32k; `GGML_CUDA_GEMM_FOLD=0` restores cuBLAS fp16).
-- Finding: sustained runs lose ~25% prefill to the 175 W power cap as the cards heat
-  (SW Power Capping counter ~2.8 h on GPU0, no thermal slowdown). Yesterday's build: 313 cold ->
-  236 hot at pp1024 @ d32768. The morning-vs-evening depth sweeps differ mostly by this.
-- Evening sweep (new build, hot): /mnt/fast/p100-scratch/build-sweep0925b/sweep.log; morning:
-  build-sweep0925/sweep.log.
-- TODO for the push: update the README results table (tg256 cold on the new build read 30.97,
-  vs 32.02 on 3ba045898; not investigated, user did not want tg256 chased), then HANDOFF state,
-  then the full gate suite and the release refresh.
+Goal the user set: hot cards, production serving flags, MTP on: 260k prefill (1k chunk)
+95-100 t/s, 2k decode 50 t/s, 260k decode 30 t/s, math no less accurate.
+
+**Status: prefill met; decode not proven on hot cards.**
+
+| (1479 new tokens, depth-bench --restore) | old build (72-77 C) | new, 62-66 C | new, 79 C | goal |
+|---|---|---|---|---|
+| 260k prefill | 84.8 t/s | 122.5 | 101.7 | 95-100 (met) |
+| 260k decode | 26.9 t/s (123.7 ms/cycle) | 33.8 (101.4) | 25.9 (126.2) | 30 |
+| 2k decode | 42.6 t/s (71.7 ms/cycle) | 50.0 (60.0) | 38.6 (75.0) | 50 |
+
+Card temperature moves decode by +/-20%, more than the gains. What the kernel-level data
+supports: 2k verify pass -3% (~2 ms/cycle); 260k q4p verify call -10.7%, draft call -5%
+(~5 ms/cycle). Accuracy: prefill KLD vs all-fp32 0.00121 (was 0.00125); verify path (-ub 5,
+3 chunks) 0.00117 (was ~0.00114, within noise).
+
+Merged into p100-optimizations today (OPTLOG 223-225, not pushed):
+- 223 (goal/dec, bit-exact): fp16 q6_K matvec scales once per warp; 7 blocks/SM when it saves a
+  wave; host trims (fusion-check cache `GGML_CUDA_FUSE_CACHE`, device cache, 1-token attention in
+  graph mode 3); residual ADD fused into RMS_NORM+MUL (`GGML_CUDA_FUSE_ADD_NORM=0` off).
+- 224 (goal/vattn): q4p PV reduce-scatter at 15/18 rows, L2 prefetch off at 15; 1-token kernel
+  reduce-scatter + 2 blocks/SM (`GGML_CUDA_Q4P_OLD=1` = previous config, for A/B).
+- 225 (goal/pfattn): fold-path prefill attention in fattn-gemm.cu, default on for a q4_0 cache
+  (`GGML_CUDA_FA_FOLD=0` = old cuBLAS path; `_CHUNK` 2048, `_SPLIT` 2). Op at kv=262144 nb=1024
+  ~318 -> ~270 ms. Scratch ~165 MB/GPU at -ub 1024 (was ~71); GPU0 min free at 262k 696-702 MiB.
+
+Not done / next:
+1. **Measure decode fairly first**: strict ABBA old/new at one temperature (or pre-heat both
+   arms), several seeds. depth-bench.py now has `--extra-chars N` for prefill at a snapshot's depth.
+2. Not merged: goal/pfattn `6ba2952d5` (P layout; FA eval 4019/4019, not measured end to end).
+   Not committed: vattn's SEL-free reduce-scatter + mask preload, `wt-vattn/vt/q4p-c6.cuh`
+   (op test nb=5 2405 -> 2278 us; needs FA eval + in-server profile).
+3. Decode ideas from the dec agent, unstarted: fuse the delta-net prologue (~190 launches/pass,
+   ~0.5 ms), fold the exchange ADD into the residual ADD, draft top-k sampling on the GPU.
+   The fp16 matvec is ~90% instruction-bound (~44 instr per 8 weights, 20 are math).
+4. Gates not run on this build: tg256, full op suite (`./tools/gate.sh --full`). Then the README
+   results table and the release refresh (`qwen-server` still runs d3a650552).
+5. Cleanup: worktrees `/mnt/fast/p100-scratch/wt-{pfattn,vattn,dec}` (NTFS: git shows every file
+   as a mode change; commit by explicit path only), branches goal/*, a stale stash in wt-pfattn.
+   Agent reports: /mnt/fast/p100-scratch/goal-*.md, status-*.md; results in .../goal/*.jsonl.

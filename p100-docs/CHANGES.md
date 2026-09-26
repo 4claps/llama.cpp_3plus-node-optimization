@@ -232,12 +232,10 @@ activations, i.e. twice the math.
   It is at 255 registers and one block per SM, so what is left is latency, not arithmetic. Time
   attention changes in the server: the op test runs attention alone at 1328 MHz, where the
   server's power cap holds 1189 (OPTLOG 190).
-- **Prefill attention still accumulates in fp16.** The GEMM path (§3, long-context prefill)
-  accumulates QKᵀ over the 256 dimensions in fp16, and PV in fp16 within each 2048-key chunk,
-  folded into an fp32 running output. Perplexity can't see it (OPTLOG 152), but it is the one
-  place left where fp16 accumulates. `GGML_CUDA_FA_GEMM_PREC=32` makes it fp32 throughout,
-  more precise than upstream. It costs 11% of `pp2048` at depth 16384 and 27% at 65536.
-  Decode and verify never take this path.
+- **Prefill attention accumulation.** With a q4_0 cache the fold path (`GGML_CUDA_FA_FOLD`,
+  default on, OPTLOG 225) accumulates QK^T in fp16 chains of 128 summed in fp32, and PV in fp16
+  over 128 keys, fp32 across them. `GGML_CUDA_FA_FOLD=0` returns to the cuBLAS path (fp16 over the
+  whole 2048-key chunk); `GGML_CUDA_FA_GEMM_PREC=32` there is fp32 throughout.
 
 ## Scope
 
