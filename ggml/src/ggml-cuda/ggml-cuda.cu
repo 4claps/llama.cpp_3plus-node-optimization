@@ -4635,6 +4635,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return s == nullptr || atoi(s) != 0;
         }();
         const enum ggml_op ops_ns[2] = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+        // the q and k l2 norms back to back (views between them): one launch for both
+        if (norm_scale_on && ggml_can_fuse(cgraph, i, ops_ns, 2)) {
+            int j = i + 2;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                ++j;
+            }
+            if (j + 1 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM && cgraph->nodes[j + 1]->op == GGML_OP_SCALE &&
+                    cgraph->nodes[j]->src[0] != cgraph->nodes[i + 1] && cgraph->nodes[j]->src[0]->view_src != cgraph->nodes[i + 1] &&
+                    ggml_can_fuse(cgraph, j, ops_ns, 2) &&
+                    ggml_cuda_op_rms_norm_scale2(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1])) {
+                return j + 1 - i;
+            }
+        }
         if (norm_scale_on && ggml_can_fuse(cgraph, i, ops_ns, 2) &&
                 ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1])) {
             return 1;
