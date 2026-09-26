@@ -143,6 +143,11 @@ struct fattn_q4p_cfg {
     // R=24 has none)
     static constexpr bool KPF  = !ROLL && Q4P_KNOB(KPF, R == 24 ? 2 : 1) == 1;
     static constexpr bool H16QK = Q4P_H16QK == 1 && PT == 2 && BLOCK_T && !ROLL;
+    // fp16 QK with two rows per Q_s word (HFMA2 takes each half broadcast): one LDS.128 per 8 rows
+#ifndef Q4P_QPK
+#define Q4P_QPK 1
+#endif
+    static constexpr bool QPK   = H16QK && Q4P_QPK == 1 && RQP % 8 == 0;
     static constexpr bool H16PV = Q4P_H16PV == 1 && (DPT == 4 || DPT == 8);
     static constexpr bool RS    = !OLD && Q4P_RSON == 1 && Q4P_KNOB(RS, (R == 6 || R == 15 || R == 18) ? 1 : 2) == 1 &&
                                   H16PV && DPT == 8 && RG == 1 && NPG == 8 && C/NPG <= Q4P_PVF;
@@ -261,7 +266,9 @@ static __global__ void flash_attn_ext_q4p(
         if (rl < RQ && ic0 + t < n_tok) {
             q = ((const float *) (Q + nb03*sequence + int64_t(nb02)*(head0 + g) + int64_t(nb01)*(ic0 + t)))[dim]*qscale;
         }
-        if constexpr (cfg::H16QK) {
+        if constexpr (cfg::QPK) {
+            ((half *) (Q_s + ((dim / DPS)*RG + rgi)*QREG + (dim % DPS)*(RQP/2)))[rl] = __float2half_rn(q);
+        } else if constexpr (cfg::H16QK) {
             const half2 qq = __float2half2_rn(q);
             Q_s[((dim / DPS)*RG + rgi)*QREG + (dim % DPS)*RQP + rl] = __int_as_float(*(const int *) &qq);
         } else {
@@ -499,6 +506,23 @@ static __global__ void flash_attn_ext_q4p(
                         for (int e = 0; e < 4; ++e) {
                             const uint32_t yb = __byte_perm(e < 2 ? i01 : i23, 0x64646464u, (e & 1) ? 0x4342 : 0x4140);
                             const half2 y2 = __hsub2(*(const half2 *) &yb, off);
+                            if constexpr (cfg::QPK) {
+                                const uint4 * q4 = (const uint4 *) (Qt + (32*bl + 4*k + e + 16*hh)*(RQP/2));
+#pragma unroll
+                                for (int rq = 0; rq < RQP/8; ++rq) {
+                                    const uint4 q = q4[rq];
+                                    const uint32_t qv[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+                                    for (int c = 0; c < 8; ++c) {
+                                        if (8*rq + c < RQ) {
+                                            const half2 qh = *(const half2 *) &qv[c/2];
+                                            const half2 qb = (c & 1) ? __high2half2(qh) : __low2half2(qh);
+                                            t2[8*rq + c] = __hfma2(qb, y2, t2[8*rq + c]);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                             const uint4 * q4 = (const uint4 *) (Qt + (32*bl + 4*k + e + 16*hh)*RQP);
 #pragma unroll
                             for (int rq = 0; rq < RQP/4; ++rq) {
