@@ -313,6 +313,7 @@ static __global__ void fattn_gemm_q_to_f16(
 // (not over the 2048-key chunk) and fp32 across tiles.
 namespace fa_fold {
 __device__ unsigned long long fa_dbg_clk[8];
+__device__ int fa_dbg_on;
 
 // The KV range is cut into nsplit independent streams of L keys each (own O, m, l), merged at the
 // end: the PV grid is only (DV/128) x (N/128) x heads, 3.4 waves on 56 SMs with one stream.
@@ -419,17 +420,26 @@ struct fa_fold_tiles {
     uint32_t Bs[2][BK2][BN];
 };
 
-template <bool A_PAIRS, int fold_k2, bool B_BLOCKED = false, typename F>
+struct fa_fold_nop { __device__ void operator()() const {} };
+
+template <bool A_PAIRS, int fold_k2, bool B_BLOCKED = false, typename F, typename PRE = fa_fold_nop>
 static __device__ __forceinline__ void fa_fold_mainloop(
         fa_fold_tiles<A_PAIRS> & sm,
         const half * __restrict__ A, const int64_t lda, const int mA,   // valid rows of A (m)
         const half * __restrict__ B, const int64_t ldb, const int nB,   // valid rows of B (n)
-        const int K, float (&acc)[8][8], F on_fold) {
+        const int K, float (&acc)[8][8], F on_fold, PRE pre = PRE()) {
     const int t  = threadIdx.x;
     const int tx = t & 15;
     const int ty = t >> 4;
 
     half2 h[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            h[i][j] = make_half2(0.0f, 0.0f);
+        }
+    }
     uint4 ra[2];
     uint4 rb[2];
     auto gload = [&](const int k0) {
@@ -481,6 +491,7 @@ static __device__ __forceinline__ void fa_fold_mainloop(
 
     const int nit = K / (2*BK2);
     gload(0);
+    pre();   // runs while the first tile is in flight
     sstore(0);
     __syncthreads();
 
@@ -489,7 +500,6 @@ static __device__ __forceinline__ void fa_fold_mainloop(
         if (it + 1 < nit) {
             gload((it + 1)*2*BK2);
         }
-        const bool restart = (it*BK2) % fold_k2 == 0;
 #pragma unroll
         for (int k2 = 0; k2 < BK2; k2++) {
             const int   sw = (k2 >> 2) << 3;
@@ -505,12 +515,21 @@ static __device__ __forceinline__ void fa_fold_mainloop(
                 for (int j = 0; j < 8; j++) {
                     const half2 ai = *(const half2 *) &a[i];
                     const half2 bj = *(const half2 *) &b[j];
-                    h[i][j] = k2 == 0 && restart ? __hmul2(ai, bj) : __hfma2(ai, bj, h[i][j]);
+                    h[i][j] = __hfma2(ai, bj, h[i][j]);
                 }
             }
         }
         if (((it + 1)*BK2) % fold_k2 == 0 || it + 1 == nit) {
             on_fold(((it + 1)*BK2 - 1) / fold_k2, acc, h);
+            // restart the chains (zeroing here, once per fold, is cheaper than an HMUL2 select
+            // inside the loop, which compiled to both products plus a MOV per chain)
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    h[i][j] = make_half2(0.0f, 0.0f);
+                }
+            }
         }
         if (it + 1 < nit) {
             sstore(buf ^ 1);
@@ -746,6 +765,13 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk2(
     const int nB = N - n0;
 
     half2 hh[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            hh[i][j] = make_half2(0.0f, 0.0f);
+        }
+    }
     uint4 ra[2], rb[2];
     auto gload = [&](const int k0) {
 #pragma unroll
@@ -793,7 +819,7 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk2(
                 for (int j = 0; j < 8; j++) {
                     const half2 ai = *(const half2 *) &a[i];
                     const half2 bj = *(const half2 *) &b[j];
-                    hh[i][j] = it == 0 && k2 == 0 ? __hmul2(ai, bj) : __hfma2(ai, bj, hh[i][j]);
+                    hh[i][j] = __hfma2(ai, bj, hh[i][j]);
                 }
             }
         }
@@ -910,42 +936,45 @@ static __global__ void __launch_bounds__(256, 1) fa_fold_pv(
     const int m0 = blockIdx.x*BM;
     const int n0 = blockIdx.y*BN;
     const int ty = threadIdx.x >> 4;
+    const long long t0 = clock64();
 
-    if (threadIdx.x < BN) {
-        const int n = n0 + threadIdx.x;
-        float M = -INFINITY, c = 0.0f;
-        if (n < N) {
-            const float mo = m_in[(int64_t) h*N + n];
-            M = mo;
-            for (int tt = 0; tt < ntile; tt++) {
-                M = fmaxf(M, mt[((int64_t) h*(C/TK) + tt)*N + n]);
-            }
-            c = mo == -INFINITY ? 0.0f : expf(mo - M);
-            if (blockIdx.x == 0) {
-                float l = l_state[(int64_t) h*N + n]*c;
-                if (M != -INFINITY) {
-                    for (int tt = 0; tt < ntile; tt++) {
-                        const int64_t o = ((int64_t) h*(C/TK) + tt)*N + n;
-                        const float mm = mt[o];
-                        l += mm == -INFINITY ? 0.0f : lt[o]*expf(mm - M);
-                    }
+    const long long t1 = clock64();
+    auto prologue = [&]() {
+        if (threadIdx.x < BN) {
+            const int n = n0 + threadIdx.x;
+            float M = -INFINITY, c = 0.0f;
+            if (n < N) {
+                const float mo = m_in[(int64_t) h*N + n];
+                M = mo;
+                for (int tt = 0; tt < ntile; tt++) {
+                    M = fmaxf(M, mt[((int64_t) h*(C/TK) + tt)*N + n]);
                 }
-                l_state[(int64_t) h*N + n] = l;
-                m_out[(int64_t) h*N + n]   = M;
+                c = mo == -INFINITY ? 0.0f : expf(mo - M);
+                if (blockIdx.x == 0) {
+                    float l = l_state[(int64_t) h*N + n]*c;
+                    if (M != -INFINITY) {
+                        for (int tt = 0; tt < ntile; tt++) {
+                            const int64_t o = ((int64_t) h*(C/TK) + tt)*N + n;
+                            const float mm = mt[o];
+                            l += mm == -INFINITY ? 0.0f : lt[o]*expf(mm - M);
+                        }
+                    }
+                    l_state[(int64_t) h*N + n] = l;
+                    m_out[(int64_t) h*N + n]   = M;
+                }
+                for (int tt = 0; tt < ntile; tt++) {
+                    const float mm = mt[((int64_t) h*(C/TK) + tt)*N + n];
+                    fac[tt][threadIdx.x] = (mm == -INFINITY || M == -INFINITY) ? 0.0f : expf(mm - M);
+                }
+            } else {
+                for (int tt = 0; tt < ntile; tt++) {
+                    fac[tt][threadIdx.x] = 0.0f;
+                }
             }
-            for (int tt = 0; tt < ntile; tt++) {
-                const float mm = mt[((int64_t) h*(C/TK) + tt)*N + n];
-                fac[tt][threadIdx.x] = (mm == -INFINITY || M == -INFINITY) ? 0.0f : expf(mm - M);
-            }
-        } else {
-            for (int tt = 0; tt < ntile; tt++) {
-                fac[tt][threadIdx.x] = 0.0f;
-            }
+            Mn[threadIdx.x]   = M;
+            corr[threadIdx.x] = c;
         }
-        Mn[threadIdx.x]   = M;
-        corr[threadIdx.x] = c;
-    }
-    __syncthreads();
+    };
 
     float acc[8][8];
 #pragma unroll
@@ -967,11 +996,187 @@ static __global__ void __launch_bounds__(256, 1) fa_fold_pv(
                     a[i][j] += fold_h(hh[i][j]) * f;
                 }
             }
-        });
+        }, prologue);   // the mainloop's first __syncthreads orders fac/corr for everyone
 
+    const long long t2 = clock64();
+    // all 16 loads of the running output first (the fp16 chains' registers are free now), so their
+    // latencies overlap instead of queueing behind each store
+    float4 oin[8][2];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int n = min(n0 + fa_fold_col(j), N - 1);
+#pragma unroll
+        for (int ih = 0; ih < 2; ih++) {
+            oin[j][ih] = *(const float4 *) (O_in + ((int64_t) h*N + n)*DV + m0 + ih*64 + ty*4);
+        }
+    }
 #pragma unroll
     for (int j = 0; j < 8; j++) {
         const int c = fa_fold_col(j);
+        const int n = n0 + c;
+        if (n >= N) {
+            continue;
+        }
+        const float cr = corr[c];
+#pragma unroll
+        for (int ih = 0; ih < 2; ih++) {
+            const int64_t o = ((int64_t) h*N + n)*DV + m0 + ih*64 + ty*4;
+            const float4 oi = oin[j][ih];
+            float4 v;
+            v.x = oi.x*cr + acc[ih*4 + 0][j]*0x1p112f;
+            v.y = oi.y*cr + acc[ih*4 + 1][j]*0x1p112f;
+            v.z = oi.z*cr + acc[ih*4 + 2][j]*0x1p112f;
+            v.w = oi.w*cr + acc[ih*4 + 3][j]*0x1p112f;
+            *(float4 *) (O_out + o) = v;
+        }
+    }
+    if (threadIdx.x == 0 && fa_dbg_on) {
+        const long long t3 = clock64();
+        atomicAdd(&fa_dbg_clk[0], (unsigned long long) (t1 - t0));
+        atomicAdd(&fa_dbg_clk[1], (unsigned long long) (t2 - t1));
+        atomicAdd(&fa_dbg_clk[2], (unsigned long long) (t3 - t2));
+        atomicAdd(&fa_dbg_clk[3], 1ull);
+    }
+}
+
+// PV at two CTAs per SM: 128 (dv) x 64 (query column) tiles, 8x4 outputs per thread, so the fp32
+// accumulators and the fp16 chains fit in 128 registers together. One CTA's prologue, fold and
+// O read/write epilogue overlap the other's main loop. grid (DV/128, ceil(N/64), heads).
+constexpr int BN2 = 64;
+static __global__ void __launch_bounds__(256, 2) fa_fold_pv2(
+        const half2 * __restrict__ Vp, const half * __restrict__ P,
+        const float * __restrict__ mt, const float * __restrict__ lt,
+        const float * __restrict__ m_in, float * __restrict__ m_out, float * __restrict__ l_state,
+        const float * __restrict__ O_in, float * __restrict__ O_out,
+        const int DV, const int N, const int C, const int ntile) {
+    __shared__ __align__(16) uint32_t As[2][BK2][BM];
+    __shared__ __align__(16) uint32_t Bs[2][BK2][BN2];
+    __shared__ float corr[BN2];
+    __shared__ float fac[MAXTILE][BN2];
+
+    const int h  = blockIdx.z;
+    const int m0 = blockIdx.x*BM;
+    const int n0 = blockIdx.y*BN2;
+    const int t  = threadIdx.x;
+    const int tx = t & 15;
+    const int ty = t >> 4;
+
+    if (t < BN2) {
+        const int n = n0 + t;
+        float c = 0.0f;
+        if (n < N) {
+            const float mo = m_in[(int64_t) h*N + n];
+            float M = mo;
+            for (int tt = 0; tt < ntile; tt++) {
+                M = fmaxf(M, mt[((int64_t) h*(C/TK) + tt)*N + n]);
+            }
+            c = mo == -INFINITY ? 0.0f : expf(mo - M);
+            float l = l_state[(int64_t) h*N + n]*c;
+            for (int tt = 0; tt < ntile; tt++) {
+                const int64_t o = ((int64_t) h*(C/TK) + tt)*N + n;
+                const float mm = mt[o];
+                const float f  = (mm == -INFINITY || M == -INFINITY) ? 0.0f : expf(mm - M);
+                fac[tt][t] = f;
+                l += f == 0.0f ? 0.0f : lt[o]*f;
+            }
+            if (blockIdx.x == 0) {
+                l_state[(int64_t) h*N + n] = l;
+                m_out[(int64_t) h*N + n]   = M;
+            }
+        } else {
+            for (int tt = 0; tt < ntile; tt++) {
+                fac[tt][t] = 0.0f;
+            }
+        }
+        corr[t] = c;
+    }
+
+    // A: Vp [k/2][DV] half2 pairs; B: P blocked [k/32][128][32], this CTA's 64 rows of the 128
+    const uint32_t * A = (const uint32_t *) (Vp + (int64_t) h*(C/2)*DV + m0);
+    const half     * B = P + ((int64_t) h*((gridDim.y + 1)/2) + blockIdx.y/2)*C*BN + (blockIdx.y & 1)*BN2*32;
+
+    float acc[8][4];
+    half2 hh[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            acc[i][j] = 0.0f;
+            hh[i][j]  = make_half2(0.0f, 0.0f);
+        }
+    }
+    uint4 ra[2], rb;
+    auto gload = [&](const int k0) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int l = t + 256*i;
+            ra[i] = *(const uint4 *) (A + (int64_t) (k0/2 + (l >> 5))*DV + (l & 31)*4);
+        }
+        rb = *(const uint4 *) (B + (int64_t) (k0/32)*(BN*32) + (t >> 2)*32 + (t & 3)*8);
+    };
+    auto sstore = [&](const int buf) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int l  = t + 256*i;
+            const int r  = l >> 5;
+            *(uint4 *) &As[buf][r][((l & 31)*4) ^ ((r >> 2) << 3)] = ra[i];
+        }
+        const int r  = t >> 2;
+        const int c  = t & 3;
+        const int rs = r ^ (c << 3);
+        Bs[buf][c*4 + 0][rs] = rb.x; Bs[buf][c*4 + 1][rs] = rb.y;
+        Bs[buf][c*4 + 2][rs] = rb.z; Bs[buf][c*4 + 3][rs] = rb.w;
+    };
+
+    const int nit = ntile*TK / (2*BK2);
+    constexpr int IT_PER_TILE = TK/(2*BK2);
+    gload(0);
+    sstore(0);
+    __syncthreads();
+    for (int it = 0; it < nit; it++) {
+        const int buf = it & 1;
+        if (it + 1 < nit) {
+            gload((it + 1)*2*BK2);
+        }
+#pragma unroll
+        for (int k2 = 0; k2 < BK2; k2++) {
+            const int   sw = (k2 >> 2) << 3;
+            const uint4 a0 = *(const uint4 *) &As[buf][k2][(ty*4) ^ sw];
+            const uint4 a1 = *(const uint4 *) &As[buf][k2][(64 + ty*4) ^ sw];
+            const uint4 b0 = *(const uint4 *) &Bs[buf][k2][(tx*4) ^ sw];
+            const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const uint32_t b[4] = {b0.x, b0.y, b0.z, b0.w};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const half2 ai = *(const half2 *) &a[i];
+                    const half2 bj = *(const half2 *) &b[j];
+                    hh[i][j] = __hfma2(ai, bj, hh[i][j]);
+                }
+            }
+        }
+        if ((it + 1) % IT_PER_TILE == 0) {
+            const int tt = it / IT_PER_TILE;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float f = fac[tt][tx*4 + j];
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    acc[i][j] += fold_h(hh[i][j]) * f;
+                    hh[i][j] = make_half2(0.0f, 0.0f);
+                }
+            }
+        }
+        if (it + 1 < nit) {
+            sstore(buf ^ 1);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int c = tx*4 + j;
         const int n = n0 + c;
         if (n >= N) {
             continue;
@@ -1062,7 +1267,7 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
 
     cudaStream_t stream = ctx.stream();
 
-    static const int chunk_env  = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_CHUNK", 1024);
+    static const int chunk_env  = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_CHUNK", 2048);
     static const int nsplit_env = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_SPLIT", 2);
     const int64_t nsplit = std::max(1, std::min(8, nsplit_env));
     const int64_t Lsp = ((nkv + nsplit - 1)/nsplit + TK - 1)/TK*TK;   // keys per split
@@ -1070,7 +1275,12 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
     const int64_t nz = nhkv*nsplit;   // virtual heads
     static const int qk_fold = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_QK", 2);
     static const int fdbg = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_DBG", 0);
+    static const int pv_mode = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_PV", 1);
 
+    if (fdbg == 7) {
+        const int one = 1;
+        CUDA_CHECK(cudaMemcpyToSymbol(fa_dbg_on, &one, sizeof(int)));
+    }
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<half>  Qf16(pool, D*N*nhkv);
     ggml_cuda_pool_alloc<half>  K16(pool, D*C*nz);
@@ -1137,15 +1347,26 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
                 CUDA_CHECK(cudaGetLastError());
             }
             {
-                const dim3 grid(DV/BM, (N + BN - 1)/BN, nz);
-                fa_fold_pv<<<grid, 256, 0, stream>>>(Vp.ptr, P.ptr, mt.ptr, lt.ptr, m_cur, m_nxt, l_state.ptr,
-                    O_cur, O_nxt, (int) DV, (int) N, (int) C, ntile);
+                if (pv_mode == 2) {
+                    const dim3 grid(DV/BM, (N + BN2 - 1)/BN2, nz);
+                    fa_fold_pv2<<<grid, 256, 0, stream>>>(Vp.ptr, P.ptr, mt.ptr, lt.ptr, m_cur, m_nxt, l_state.ptr,
+                        O_cur, O_nxt, (int) DV, (int) N, (int) C, ntile);
+                } else {
+                    const dim3 grid(DV/BM, (N + BN - 1)/BN, nz);
+                    fa_fold_pv<<<grid, 256, 0, stream>>>(Vp.ptr, P.ptr, mt.ptr, lt.ptr, m_cur, m_nxt, l_state.ptr,
+                        O_cur, O_nxt, (int) DV, (int) N, (int) C, ntile);
+                }
                 CUDA_CHECK(cudaGetLastError());
             }
             std::swap(O_cur, O_nxt);
             std::swap(m_cur, m_nxt);
         }
 
+        if (fdbg == 7) {
+            unsigned long long hc[8];
+            CUDA_CHECK(cudaMemcpyFromSymbol(hc, fa_dbg_clk, sizeof(hc), 0, cudaMemcpyDeviceToHost));
+            fprintf(stderr, "pv clocks per CTA: pro %.0f main %.0f epi %.0f (n %llu)\n", (double) hc[0]/hc[3], (double) hc[1]/hc[3], (double) hc[2]/hc[3], hc[3]);
+        }
         if (fdbg == 5 || fdbg == 6) {
             unsigned long long hc[8];
             CUDA_CHECK(cudaMemcpyFromSymbol(hc, fa_dbg_clk, sizeof(hc), 0, cudaMemcpyDeviceToHost));
