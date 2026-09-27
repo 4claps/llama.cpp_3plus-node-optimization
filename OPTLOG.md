@@ -8584,3 +8584,96 @@ matvec's activation cache was keyed by the context address, and CUDA1's context 
 address, inheriting a CUDA0 buffer. The cache now records its device and reallocates on a mismatch.
 Serving never recreates contexts, so no measurement was affected. Rerun: 16316/16316 on CUDA0 and
 CUDA1, 3/3 backends. Gates on this build: tg256 32.09 t/s (cool cards), PPL 2.6096.
+
+## Round 3 (2026-09-26): ideas from other projects
+
+Six research-only agents surveyed ik_llama.cpp, upstream PRs since f46bc30cb, vLLM (incl. Pascal
+forks), ExLlamaV2/V3, FLA, TensorRT-LLM, SGLang, three other P100 forks (Joe11221/p100-llama-cpp,
+shinbunbun/llama-cpp-p100-patches, Mikec78660/vLLM-Pascal), papers and host/server overhead.
+Filter: low-medium effort, math exact or better. Taken: 230-233. Considered and not taken: see 234.
+
+Measurement note: at -ub 5 (so the verify-width kernels and exchanges run), a `--kl-divergence-base`
+run and a `--kl-divergence` run of the SAME library differ (max KLD 5.9e-5, PPL 2.726681 vs
+2.726761) -- the base-writing run itself reads differently. Every --kl-divergence run agreed to every
+printed digit: the shipped 192fd789a release build, this build with 230+231 off, each alone, both on
+(PPL(Q) 2.726761, mean KLD 0.000000, max 0.000059, same top 100%). So 230 and 231 are exact against
+the shipped build. Paired A/B was needed for speed: hot cards drift ±5% between arms.
+
+## Attempt 230: one-kernel P2P AllReduce for small tensor-parallel exchanges (KEPT, +1.3% tg, +1.0% verify)
+
+From ik_llama.cpp reduce.cu (PR 1022/1080) and vLLM's custom all-reduce. The meta backend's butterfly
+does, per exchange: peer memcpy on a copy stream + events + a one-node ADD graph on each GPU. Now
+try_allreduce (the "butterfly" comm path, which was a stub returning false) does it in one kernel per
+GPU: GPU j sums half j of the elements as t0 + t1 in fp32 (reading the peer tensor over P2P) and
+writes the sum into both tensors; events before ("both partials done") and after ("both halves
+written"). Same sum as the butterfly's ADD on either GPU (fp32 add commutes), so bit-identical.
+f32 only, <= 256 KB (decode/verify); prefill keeps the butterfly and its f16 wire. Needs GGML_CUDA_P2P.
+GGML_CUDA_AR_P2P=0 turns it off. Differs from 128/189: those staged through host memory.
+
+Microbench (2x P100, PHB, 51 KB f16 exchange): direct P2P read 25.5 us/round vs local-only 26.0,
+memcpyPeer+add 36.5. Real model, paired runs on hot cards:
+- tg128, 10 pairs: +1.27% (se 0.29), on won all 10 (30.58 -> 30.97 t/s)
+- pp5 (verify-shaped), 8 pairs: +0.96% (se 0.17)
+
+## Attempt 231: fused FFN gate + up + SWIGLU in the fp16 verify matvec (KEPT, +2.1% verify)
+
+From ik_llama.cpp's fused up/gate mmvq; upstream turns this fusion off on Pascal and for >1 column.
+mmvq_f16_q6_K gets a GLU template flag: each warp's 4 row slots are 2 gate rows + the same 2 up rows,
+epilogue silu(g)*u with the SWIGLU kernel's expression. Each row's arithmetic is the unfused
+kernel's (2 warps x 4 rows band), so bit-identical. Matched in the graph as MUL_MAT, MUL_MAT,
+GLU(SWIGLU) with views between, >= 3072 rows, 2-5 columns. GGML_CUDA_FUSE_FFN_GLU=0 turns it off.
+test-backend-ops: new MUL_MAT_VEC_FUSION q6_K cases (m 2-5, n 3072/8704, k 5120) pass.
+pp5, 8 pairs: +2.07% (se 0.12) on top of 230; 230+231 together +3.05% (se 0.20).
+
+## Attempt 232: lazy scheduler hash reset (KEPT, host-only, exact)
+
+shinbunbun patch 21: ggml_backend_sched_reset memset the whole hash table (tens of thousands of
+entries) on every graph rebuild; now it clears only the entries marked used. Every write to the
+tables goes through hash_id (find_or_insert), which marks the entry used, so unused entries stay
+(-1, NULL) from sched_new. Their measurement: ~117 us per graph. Not separately measurable here.
+
+## Attempt 233: top-p 0.95 on the sampled draft distribution (option kept, OFF by default)
+
+From the papers survey: the target samples with top-k 20 then top-p 0.95, the draft only top-k 20,
+so draft mass outside the target's nucleus is always rejected. LLAMA_SPEC_DRAFT_TOPP=P truncates the
+sampled q to its top-p prefix (llama_sampler_top_p's rule) and records the truncated q in dp.dists,
+so the verify rule stays lossless (tokens outside q count as q = 0). Server, 3 seeds x 2 questions:
+acceptance 2k 0.512 -> 0.518, 260k 0.662 -> 0.641 -- within the text-to-text spread (the draft's
+RNG use changes the text). No gain shown; left off.
+
+## Attempt 234: block verification for the sampled MTP draft (KEPT, on by default, +1.8% accepted drafts)
+
+Sun et al., "Block Verification Accelerates Speculative Decoding", arXiv:2403.10444v3, Algorithm 2
+(transcribed from the paper): keep[i] = min(keep[i-1] * p(X_i)/q(X_i), 1); accept position i with
+h_i = S_i / (S_i + 1 - keep[i]), S_i = sum_x max(keep[i]*p_i(x) - q_i(x), 0) (h_G = keep[G]); tau =
+the LAST accepted position (no early exit); the correction token from max(keep[tau]*p - q, 0) at tau,
+or from p at G. Theorem 1: same output distribution as the target; Theorem 2: never fewer accepted
+tokens in expectation than per-token verification. In common_sampler_sample_and_accept_n_dist; only
+for a stateless chain (no grammar, penalties, DRY, mirostat, reasoning budget), else the per-token
+rule. LLAMA_SPEC_BLOCK_VERIFY=0 turns it off; =2 prints the paired statistic below.
+
+Checks:
+- Monte Carlo of the exact code path (vocab 3, gamma 2, random p/q trees, 400k runs, first 3 output
+  tokens): worst cell 2.35 standard errors over 27 cells (null behaviour); a deliberately wrong
+  acceptance rule (h = keep) gives 75.8.
+- Paired, noise-free gain on real traffic: by Lemma 3 keep[i] is the probability the prefix is kept,
+  so on the SAME drafts the expected accepted drafts are sum keep[i] (block) against
+  sum prod min(1, p/q) (token). Server, 4 seeds x 2 questions: 2k +2.4%, cumulative with 260k +1.84%
+  (260k alone ~+1.3%). About +1.5% tokens per cycle at 2k, ~+1% at 260k. The extra host cost (every
+  position's target distribution is sampled, not only up to the first rejection) is ~4 prefiltered
+  top-k samples per cycle. Unpaired server runs can't see an effect this size: the text changes
+  with the verify's RNG use (acceptance 0.518 -> 0.537 at 2k, 0.674 -> 0.634 at 260k, both noise).
+
+## Attempt 235: considered from the survey and not taken
+
+- Decode graph slots per graph kind (shinbunbun 22): the patch's own note says a separate scheduler
+  changes which fusions fire (they are chosen by buffer address), so output changed at 5 tokens and
+  they cap it at 4; here that leaves the draft's 1-token step, ~0.8 ms/cycle, and upstream #29466
+  reports a -sm tensor second-request crash from someone running that patch set. Skipped.
+- Lamport push AllReduce with a fused ADD+RMS_NORM epilogue (TRT-LLM): the next step past 230;
+  medium effort, not done this round.
+- q6_K repack to an ExLlama LOP3 layout: largest single idea (~10% verify) but high effort.
+- Chunked delta-net prefill, device-chained draft steps, fp16 1-column decode: high effort or not
+  exact. q4_0 KV scale refit (ik #1547): changes the numerics (a quality change), not taken without
+  a separate accuracy study.
+- Joe11221's P2P "10x slower"/internal AllReduce gains are from a dual-socket host (attempt 189 here).
