@@ -14,5 +14,11 @@ bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_ten
                                  const ggml_tensor * b, const ggml_tensor * m, ggml_tensor * gate_out, ggml_tensor * beta_out,
                                  int64_t ncols);
 
+// The FFN's gate and up matvecs (same activation, same shape, 2..5 columns, >= 3072 rows) and the
+// SWIGLU after them, in one launch. Bit-identical to MUL_MAT, MUL_MAT, GLU(SWIGLU).
+// GGML_CUDA_FUSE_FFN_GLU=0 disables.
+bool ggml_cuda_mmvq_f16_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
+                            ggml_tensor * dst, int64_t ncols);
+
 // Forget the cached fp16 activation (called at the start of every graph compute, like the q8_1 cache).
 void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx);

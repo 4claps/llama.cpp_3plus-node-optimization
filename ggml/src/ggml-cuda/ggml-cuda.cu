@@ -4684,6 +4684,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // The FFN's gate and up matvecs and their SWIGLU, in one launch (verify widths, fp16 path):
+    //   MUL_MAT(up) -> MUL_MAT(gate) -> GLU(SWIGLU, gate, up), in either matvec order, views between.
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_Q6_K && node->ne[0] >= 3072 &&
+            node->ne[1] >= 2 && node->ne[1] <= 5) {
+        const int n = cgraph->n_nodes;
+        auto next = [&](int j) {
+            for (++j; j < n; ++j) {
+                if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                    return j;
+                }
+            }
+            return -1;
+        };
+        const int j2 = next(i), jg = j2 < 0 ? -1 : next(j2);
+        if (jg > 0) {
+            ggml_tensor * mm2 = cgraph->nodes[j2], * glu = cgraph->nodes[jg];
+            if (mm2->op == GGML_OP_MUL_MAT && glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                    ggml_get_op_params_i32(glu, 1) == 0 && glu->src[1] != nullptr &&
+                    ((glu->src[0] == node && glu->src[1] == mm2) || (glu->src[0] == mm2 && glu->src[1] == node)) &&
+                    mm2->src[1] == node->src[1] && ggml_are_same_shape(node, mm2) &&
+                    ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, j2) == 1 &&
+                    !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(mm2->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                const ggml_tensor * mm_gate = glu->src[0], * mm_up = glu->src[1];
+                if (ggml_cuda_mmvq_f16_glu(*cuda_ctx, mm_gate, mm_up, glu, ggml_cuda_active_cols(node->src[1]->ne[1]))) {
+                    return jg - i;
+                }
+            }
+        }
+    }
+
     // The delta net's alpha/beta matvecs and what follows them, in one launch:
     //   MUL_MAT(alpha) -> ADD(dt) -> SOFTPLUS -> MUL(a) = gate,  MUL_MAT(beta) -> SIGMOID = beta
     // (views between them allowed). Every intermediate must be consumed only inside the group.

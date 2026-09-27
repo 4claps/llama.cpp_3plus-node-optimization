@@ -11285,6 +11285,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // the fp16 q6_K gate+up+SWIGLU verify kernel (mmvq-f16.cu): >= 3072 rows, K a multiple of 512
+    for (int64_t m_batch : { 2, 3, 4, 5 }) {
+        for (int64_t n_rows : { 3072, 8704 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, m_batch, n_rows, 5120,
+                false, 1, 1, false, false, true, false, {1, 1}));
+        }
+    }
+    {
+        {
+        }
+    }
 
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,

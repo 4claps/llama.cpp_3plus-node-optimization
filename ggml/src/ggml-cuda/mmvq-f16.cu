@@ -1,4 +1,5 @@
 #include "mmvq-f16.cuh"
+#include "unary.cuh"
 
 #include <unordered_map>
 
@@ -166,17 +167,23 @@ static __device__ __forceinline__ float mmvq_f16_softplus(const float x) {
     return (x > 20.0f) ? x : logf(1.0f + expf(x)); // op_softplus (unary.cu)
 }
 
-template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT, bool GATE = false>
+// GLU: the FFN's gate and up matvecs and the SWIGLU after them in one launch. Each warp takes RPW/2
+// output rows: its first RPW/2 row slots walk the gate matrix (W), the rest the same rows of up
+// (gate.W2), and the epilogue writes silu(gate) * up with the unfused SWIGLU kernel's expression.
+// Every row's arithmetic is the unfused kernel's, so the result is bit-identical.
+template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT, bool GATE = false, bool GLU = false>
 __launch_bounds__(NWT*WARP_SIZE, MINB) // 12/NWT: 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
 static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XS,
                                      const float * __restrict__ S, float * __restrict__ Y, const int64_t sy,
                                      int rows, const int K, const mmvq_f16_gate gate = {}) {
     static_assert(!GATE || (KS && RPW == 1), "GATE: split-K, one row per block");
+    static_assert(!GLU || (!KS && !GATE && RPW % 2 == 0), "GLU: row-parallel, gate/up row pairs");
+    constexpr int ORW = GLU ? RPW/2 : RPW; // output rows per warp
     constexpr int RPB = NWT*RPW, WB = MMVQ_F16_NBF*210, NU = (WB + 15 + 15)/16;
     const int lane = threadIdx.x, wid = threadIdx.y;
     const int nb = K/256, nw = (nb + MMVQ_F16_NBF - 1)/MMVQ_F16_NBF;
     // KS (split K): the block's warps share its RPW rows and take every NWT-th window each
-    int row0 = KS ? blockIdx.x*RPW : blockIdx.x*RPB + wid*RPW;
+    int row0 = KS ? blockIdx.x*RPW : GLU ? (blockIdx.x*NWT + wid)*ORW : blockIdx.x*RPB + wid*RPW;
     bool second = false;
     if constexpr (GATE) {
         if (row0 >= gate.rows1) {
@@ -214,7 +221,11 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
     const char * rp[RPW];
 #pragma unroll
     for (int i = 0; i < RPW; ++i) {
-        rp[i] = (const char *) W + (int64_t) min(row0 + i, rows - 1)*row_bytes + (KS ? (int64_t) wid*WB : 0);
+        if constexpr (GLU) {
+            rp[i] = (const char *) (i < ORW ? W : gate.W2) + (int64_t) min(row0 + i % ORW, rows - 1)*row_bytes;
+        } else {
+            rp[i] = (const char *) W + (int64_t) min(row0 + i, rows - 1)*row_bytes + (KS ? (int64_t) wid*WB : 0);
+        }
     }
     const __half * xw[NC];
 #pragma unroll
@@ -298,15 +309,23 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
     }
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
+        float v[RPW];
 #pragma unroll
         for (int i = 0; i < RPW; ++i) {
-            float v = acc[c][i];
+            v[i] = acc[c][i];
 #pragma unroll
             for (int o = 16; o; o >>= 1) {
-                v += __shfl_xor_sync(0xFFFFFFFF, v, o);
+                v[i] += __shfl_xor_sync(0xFFFFFFFF, v[i], o);
             }
+        }
+#pragma unroll
+        for (int i = 0; i < ORW; ++i) {
             if (lane == i && row0 + i < rows) {
-                Y[c*sy + row0 + i] = v;
+                if constexpr (GLU) {
+                    Y[c*sy + row0 + i] = ggml_cuda_op_silu_single(v[i]) * v[i + ORW]; // op_swiglu (unary.cu)
+                } else {
+                    Y[c*sy + row0 + i] = v[i];
+                }
             }
         }
     }
@@ -380,6 +399,46 @@ bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_ten
         case 4:  mmvq_f16_q6_K<4, 1, 4, true, 3, true><<<g_blocks, bdk, 0, stream>>>(W, rbytes, xs_ptr, sc_ptr, Y, ra, (int) (ra + rb), (int) K, g); break;
         default: mmvq_f16_q6_K<5, 1, 4, true, 3, true><<<g_blocks, bdk, 0, stream>>>(W, rbytes, xs_ptr, sc_ptr, Y, ra, (int) (ra + rb), (int) K, g); break;
     }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_mmvq_f16_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
+                            ggml_tensor * dst, const int64_t ncols) {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_CUDA_FUSE_FFN_GLU");
+        return !s || atoi(s) != 0;
+    }();
+    const ggml_tensor * src1 = mm_gate->src[1];
+    const ggml_tensor * wg = mm_gate->src[0], * wu = mm_up->src[0];
+    const int64_t K = wg->ne[0], rows = wg->ne[1];
+    // only the big row-parallel shapes (the unfused kernel's 2 warps x 4 rows band)
+    if (!enabled || mm_up->src[1] != src1 || wu->ne[0] != K || wu->ne[1] != rows || wu->nb[1] != wg->nb[1] || rows < 3072 ||
+            !mmvq_f16_shape_ok(wg, src1, mm_gate, ncols) || !mmvq_f16_shape_ok(wu, src1, mm_up, ncols) ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != rows || ggml_nrows(dst) != mm_gate->ne[1]) {
+        return false;
+    }
+    __half * xs_ptr;
+    float  * sc_ptr;
+    mmvq_f16_prepare(ctx, src1, ncols, K, &xs_ptr, &sc_ptr);
+    mmvq_f16_gate g;
+    g.W2 = (const uint8_t *) wu->data;
+    const uint8_t * W = (const uint8_t *) wg->data;
+    float * Y = (float *) dst->data;
+    const int64_t sy = dst->nb[1]/sizeof(float);
+    constexpr int ORW = MMVQ_F16_RPW/2;
+    const int nblk = (int) ((rows + MMVQ_F16_NW*ORW - 1)/(MMVQ_F16_NW*ORW));
+    const dim3 bdk(WARP_SIZE, MMVQ_F16_NW);
+    cudaStream_t stream = ctx.stream();
+    const int64_t rb = wg->nb[1];
+#define GLU_LAUNCH(NC) mmvq_f16_q6_K<NC, MMVQ_F16_RPW, MMVQ_F16_NW, false, 6, false, true><<<nblk, bdk, 0, stream>>>(W, rb, xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K, g)
+    switch (ncols) {
+        case 2:  GLU_LAUNCH(2); break;
+        case 3:  GLU_LAUNCH(3); break;
+        case 4:  GLU_LAUNCH(4); break;
+        default: GLU_LAUNCH(5); break;
+    }
+#undef GLU_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
