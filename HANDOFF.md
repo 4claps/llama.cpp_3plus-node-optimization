@@ -136,7 +136,17 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
   fastdiv, DP4A, q4_0 dequant and norm changes). `p100-handoff/VERIFICATION.md` is the numerical
   audit.
 
-## Round 2, 2026-09-26 (resume here)
+## Round 3, 2026-09-26 (resume here)
+
+Ideas from other projects (six research agents; OPTLOG 230-235). Kept, all exact: one-kernel P2P
+AllReduce (GGML_CUDA_AR_P2P), FFN gate+up+SWIGLU fusion in mmvq-f16 (GGML_CUDA_FUSE_FFN_GLU), lazy
+sched hash reset, block verification of MTP drafts (LLAMA_SPEC_BLOCK_VERIFY, =2 prints the paired
+gain). Gates: tg256 31.91 (warm), PPL 2.6096, full ops 16324/16324 x2, KLD identical to shipped.
+Server vs the 192fd789a build: cycle 2k -5%, 260k -6%. Next candidates, in order: Lamport push
+AllReduce with the ADD+RMS_NORM epilogue fused (TRT-LLM); q6_K LOP3 repack (big, high effort).
+Parked: PR #1 on the public fork (Q4_K vdr 4 by mewsian) -- revisit with a Q4_K_M model.
+
+## Round 2, 2026-09-26
 
 Hot cards (70-78 C), production flags, depth-bench --restore --extra-chars 4100, 2 seeds x 2 questions:
 

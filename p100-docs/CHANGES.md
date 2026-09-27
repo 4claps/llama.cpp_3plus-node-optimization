@@ -237,6 +237,24 @@ loss of accuracy. OPTLOG 223-228.
 draft head and the fold scratch, `-ub 2048` plus the vision projector leaves GPU0 162 MiB at 262k. Tried and reverted: CUDA graphs for the verify
 (slower, +100 MiB), register prefetch in the big matvec (slower).
 
+## 13. Ideas from other projects, round 3 (2026-09-26)
+
+A survey of ik_llama.cpp, upstream llama.cpp, vLLM, TensorRT-LLM, SGLang, ExLlama, other P100 forks
+and papers, filtered to low-to-medium effort changes that keep the math exact. OPTLOG 230-235.
+
+| change | source | effect | math |
+|---|---|---|---|
+| one-kernel P2P AllReduce for decode/verify-sized tensor-parallel exchanges (`GGML_CUDA_AR_P2P=0` = off) | ik_llama.cpp `reduce.cu`, vLLM custom all-reduce | plain decode +1.3%, verify pass +1.0% | bit-identical |
+| FFN gate + up + SwiGLU in one fp16 verify matvec (`GGML_CUDA_FUSE_FFN_GLU=0` = off) | ik_llama.cpp fused up/gate | verify pass +2.1% | bit-identical |
+| scheduler resets only the hash entries it used | shinbunbun/llama-cpp-p100-patches #21 | host time per graph rebuild | exact (host only) |
+| block verification of sampled MTP drafts (`LLAMA_SPEC_BLOCK_VERIFY=0` = off) | Sun et al., arXiv:2403.10444 | +1.8% accepted drafts on the same drafts | same output distribution (proved; Monte Carlo checked) |
+
+Every change was checked against the shipped build: perplexity 2.6096 (identical), KLD at verify
+width identical to every printed digit, full op suite 16324/16324 on both GPUs. Against the shipped
+build, ABBA through the server: MTP cycle time 2k 56.6 -> 53.8 ms (-5%), 260k 90.1 -> 84.3 ms (-6%),
+prefill unchanged within noise (these changes don't touch prefill). Draft top-p
+(`LLAMA_SPEC_DRAFT_TOPP`) is available but showed no gain.
+
 ## Known gaps
 
 - **`GGML_CUDA_DEVICES` above the physical GPU count isn't reproducible.** At 3 virtual devices,

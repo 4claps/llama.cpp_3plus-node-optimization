@@ -86,6 +86,9 @@ A/B testing.
 | `GGML_CUDA_GEMM_FOLD=0` | prefill matmuls on stock cuBLAS fp16 instead of the fold kernel (fp16 products, fp32 sums) |
 | `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` | prefill matmuls fully in fp32. ~40% slower, no measurable accuracy gain |
 | `GGML_CUDA_FA_GEMM=0` | turns off the GEMM attention path for long prefill |
+| `GGML_CUDA_AR_P2P=0` | the tensor-parallel exchange back to copy-then-add (the one-kernel P2P version is bit-identical and faster) |
+| `GGML_CUDA_FUSE_FFN_GLU=0` | the FFN gate, up and SwiGLU as three kernels again (bit-identical) |
+| `LLAMA_SPEC_BLOCK_VERIFY=0` | per-token draft verification instead of block verification (same output distribution; block accepts more) |
 | `LLAMA_MTP_DRAFT_VOCAB=0` | the MTP draft scores the full vocabulary instead of a small copy of the common tokens. Saves ~112 MiB per card, drafts get slower, output is unchanged |
 
 ## Benchmarking
