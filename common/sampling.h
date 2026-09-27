@@ -96,6 +96,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // every returned token is distributed exactly as common_sampler_sample would draw it, and the
 // logits are not touched. positions where the grammar applies use the plain rule (accept the
 // target's own sample if it matches).
+// block verification's decision (Sun et al., arXiv:2403.10444, Algorithm 2), exposed for tests:
+// P[i] target distribution after X^i (i = 0..draft.size()), dists[i] the distribution draft[i]
+// was drawn from, ids[i] a token drawn from P[i]. Returns the accepted count, sets the next token y.
+size_t common_spec_block_verify(const std::vector<std::vector<llama_token_data>> & P,
+                                const std::vector<std::vector<llama_token_data>> & dists,
+                                const llama_tokens & draft, const std::vector<llama_token> & ids,
+                                std::mt19937 & rng, llama_token & y, std::vector<double> & keep);
+
 std::vector<llama_token> common_sampler_sample_and_accept_n_dist(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
         const std::vector<std::vector<llama_token_data>> & dists, std::mt19937 & rng);
 
