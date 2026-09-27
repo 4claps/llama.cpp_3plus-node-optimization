@@ -8677,3 +8677,12 @@ Checks:
   exact. q4_0 KV scale refit (ik #1547): changes the numerics (a quality change), not taken without
   a separate accuracy study.
 - Joe11221's P2P "10x slower"/internal AllReduce gains are from a dual-socket host (attempt 189 here).
+
+## Attempt 236: verification of round 3 against the shipped build (09-26, before pushing)
+
+- Raw logits, byte for byte (llama-perplexity --kl-divergence-base output, same corpus, previous
+  release 192fd789a unpacked from the archive vs this build): -ub 5 (verify width: P2P AllReduce, FFN
+  GLU fusion), 2 chunks, 2.03 GB: IDENTICAL; -ub 1 (decode width), 1 chunk, 1.02 GB: IDENTICAL.
+- Block verification: the decision moved into common_spec_block_verify, which the server calls; a
+  C++ test links it from libllama-common (p100-handoff/tools/block-verify-test). 1M runs: G=2 worst
+  1.85 SE over 27 sequences, G=4 2.21 SE over 81; planted bug 337 SE.
