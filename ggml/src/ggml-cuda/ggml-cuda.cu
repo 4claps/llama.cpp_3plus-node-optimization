@@ -1187,9 +1187,109 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
 
+// Two-GPU AllReduce of a small f32 tensor in one kernel per GPU over direct P2P loads/stores
+// (the approach of ik_llama.cpp's reduce.cu). GPU j owns half j of the elements: it reads both
+// partials, adds them as t0 + t1 in fp32 -- the same sum, bit for bit, as the butterfly's
+// ADD(own, peer copy) on either GPU, since fp32 addition commutes -- and writes the sum into both
+// GPUs' tensors. No peer memcpy, no ADD subgraph: two launches and four events per exchange
+// instead of two copies, two copy-stream waits and two one-node graphs. The halves are disjoint,
+// so the only ordering needed is "both partials done" before and "both halves written" after.
+// Measured on 2x P100-PCIe (PHB): a 5-token exchange costs ~0 us over a local-only kernel, the
+// memcpyPeer + ADD path ~10 us. GGML_CUDA_AR_P2P=0 turns it off.
+static __global__ void k_ar_p2p_f32(float * __restrict__ t0, float * __restrict__ t1, const int64_t lo, const int64_t hi) {
+    const int64_t i = lo + (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < hi) {
+        const float s = t0[i] + t1[i];
+        t0[i] = s;
+        t1[i] = s;
+    }
+}
+
+struct ggml_cuda_ar_p2p_state {
+    int         ok = -1; // -1 unknown, 0 unusable, 1 usable
+    cudaEvent_t ready[2] = {nullptr, nullptr};
+    cudaEvent_t done[2]  = {nullptr, nullptr};
+};
+
+static bool ggml_backend_cuda_comm_try_allreduce_p2p(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    static ggml_cuda_ar_p2p_state st; // one comm context per process in practice; devices checked below
+    if (comm_ctx->backends.size() != 2) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx[2] = {
+        (ggml_backend_cuda_context *) comm_ctx->backends[0]->context,
+        (ggml_backend_cuda_context *) comm_ctx->backends[1]->context,
+    };
+    if (st.ok < 0) {
+        const char * env = getenv("GGML_CUDA_AR_P2P");
+        st.ok = 0;
+        const int p0 = ggml_cuda_get_physical_device(ctx[0]->device);
+        const int p1 = ggml_cuda_get_physical_device(ctx[1]->device);
+        int can01 = 0, can10 = 0;
+        if (p0 != p1) {
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can01, p0, p1));
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can10, p1, p0));
+        }
+        // peer access is only enabled with GGML_CUDA_P2P (ggml_cuda_init)
+        if ((!env || atoi(env) != 0) && getenv("GGML_CUDA_P2P") != nullptr && p0 != p1 && can01 && can10) {
+            for (int j = 0; j < 2; ++j) {
+                ggml_cuda_set_device(ctx[j]->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&st.ready[j], cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&st.done[j],  cudaEventDisableTiming));
+            }
+            st.ok = 1;
+            GGML_LOG_INFO("%s: small tensor-parallel exchanges use the one-kernel P2P AllReduce\n", __func__);
+        }
+    }
+    if (st.ok != 1) {
+        return false;
+    }
+
+    const int64_t ne = ggml_nelements(tensors[0]);
+    for (int j = 0; j < 2; ++j) {
+        const ggml_tensor * t = tensors[j];
+        if (t == nullptr || t->type != GGML_TYPE_F32 || ggml_nelements(t) != ne || !ggml_is_contiguous(t) ||
+                (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+    }
+    // large (prefill) exchanges keep the butterfly and its f16 wire format
+    if (ne == 0 || ne*sizeof(float) > 256*1024) {
+        return false;
+    }
+
+    float * d[2] = {(float *) tensors[0]->data, (float *) tensors[1]->data};
+    const int64_t half = (ne + 1) / 2;
+
+    for (int j = 0; j < 2; ++j) {
+        ggml_cuda_set_device(ctx[j]->device);
+        CUDA_CHECK(cudaEventRecord(st.ready[j], ctx[j]->stream()));
+    }
+    for (int j = 0; j < 2; ++j) {
+        ggml_cuda_set_device(ctx[j]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[j]->stream(), st.ready[1 - j], 0));
+        const int64_t lo = j == 0 ? 0 : half;
+        const int64_t hi = j == 0 ? half : ne;
+        if (hi > lo) {
+            const int nb = (int) ((hi - lo + 255) / 256);
+            k_ar_p2p_f32<<<nb, 256, 0, ctx[j]->stream()>>>(d[0], d[1], lo, hi);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaEventRecord(st.done[j], ctx[j]->stream()));
+    }
+    for (int j = 0; j < 2; ++j) {
+        ggml_cuda_set_device(ctx[j]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[j]->stream(), st.done[1 - j], 0));
+        // the peer copy path orders its copy stream against work_event; keep it current
+        ctx[j]->record_work();
+    }
+    return true;
+}
+
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
-        ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
-    return false;
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    return ggml_backend_cuda_comm_try_allreduce_p2p(comm_ctx, tensors);
 }
 
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
