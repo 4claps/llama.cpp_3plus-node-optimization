@@ -1379,6 +1379,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return s ? (float) atof(s) : 0.0f;
     }();
     std::mt19937 sample_rng{0x5eed};
+    // LLAMA_SPEC_DRAFT_TOPP=P < 1: also cut the sampled draft distribution to its top-p nucleus, as
+    // the target's sampler does (top-p 0.95 after top-k). Draft mass outside the target's nucleus
+    // can never be accepted. Lossless: dp.dists records the truncated q the token was drawn from.
+    float        sample_top_p = [] {
+        const char * s = getenv("LLAMA_SPEC_DRAFT_TOPP");
+        return s ? (float) atof(s) : 1.0f;
+    }();
 
     void set_seed(uint32_t seed) override {
         sample_rng.seed(seed);
@@ -1802,6 +1809,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                     for (auto & c : q) {
                         c.p = (float) (c.p / sum);
+                    }
+                    if (sample_top_p < 1.0f) {
+                        // llama_sampler_top_p's rule: the smallest prefix whose mass reaches top_p
+                        double cum = 0.0;
+                        size_t keep = q.size();
+                        for (size_t j = 0; j < q.size(); ++j) {
+                            cum += q[j].p;
+                            if (cum >= sample_top_p) {
+                                keep = j + 1;
+                                break;
+                            }
+                        }
+                        q.resize(keep);
+                        for (auto & c : q) {
+                            c.p = (float) (c.p / cum);
+                        }
                     }
                     const double u = std::uniform_real_distribution<double>(0.0, 1.0)(sample_rng);
                     double acc = 0.0;

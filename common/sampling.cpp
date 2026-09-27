@@ -848,6 +848,105 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_dist(struct common_s
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    // Block verification (LLAMA_SPEC_BLOCK_VERIFY=0 turns it off) (Sun et al., arXiv:2403.10444, Algorithm 2)
+    // instead of the per-token rule. Same output distribution (their Theorem 1), and never fewer
+    // accepted tokens in expectation (Theorem 2): a rejection at position i does not end the block,
+    // a later position can still accept the longer prefix, and the correction token is drawn from a
+    // residual scaled by the prefix's keep probability. It needs every position's target
+    // distribution up front, so only for a stateless chain: no grammar, penalties, DRY, mirostat
+    // or reasoning budget (their outputs would depend on the tokens accepted before them).
+    static const bool block_verify = [] {
+        const char * s = getenv("LLAMA_SPEC_BLOCK_VERIFY");
+        return !s || atoi(s) != 0; // on by default; =0 restores the per-token rule
+    }();
+    const auto & sp = gsmpl->params;
+    if (block_verify && !gsmpl->grmr && !gsmpl->rbudget && sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f &&
+            sp.penalty_present == 0.0f && sp.dry_multiplier == 0.0f && sp.mirostat == 0) {
+        const size_t G = draft.size();
+        // target distributions after X^i (i = 0..G) and a token drawn from each
+        std::vector<std::vector<llama_token_data>> P(G + 1);
+        std::vector<llama_token> ids(G + 1);
+        for (size_t i = 0; i <= G; ++i) {
+            ids[i] = common_sampler_sample(gsmpl, ctx, idxs[i]);
+            P[i].assign(gsmpl->cur_p.data, gsmpl->cur_p.data + gsmpl->cur_p.size);
+        }
+        const auto prob = [](const std::vector<llama_token_data> & d, llama_token t) {
+            for (const auto & c : d) {
+                if (c.id == t) {
+                    return (double) c.p;
+                }
+            }
+            return 0.0;
+        };
+        std::vector<double> keep(G + 1, 1.0); // p_i: probability the prefix X^i is kept
+        size_t tau = 0;
+        for (size_t i = 1; i <= G; ++i) {
+            const double eta = unif(rng);
+            const double qx  = prob(dists[i - 1], draft[i - 1]);
+            keep[i] = qx > 0.0 ? std::min(keep[i - 1] * prob(P[i - 1], draft[i - 1]) / qx, 1.0) : 0.0;
+            double h = keep[i];
+            if (i < G) {
+                double S = 0.0;
+                for (const auto & c : P[i]) {
+                    S += std::max(0.0, keep[i] * c.p - prob(dists[i], c.id));
+                }
+                const double den = S + 1.0 - keep[i];
+                h = den > 0.0 ? S / den : 0.0;
+            }
+            if (eta <= h) {
+                tau = i;
+            }
+        }
+        // LLAMA_SPEC_BLOCK_VERIFY=2 also prints, every 256 blocks, the expected accepted drafts under
+        // both rules for these same drafts: sum_i keep[i] (their Lemma 3) against
+        // sum_i prod_{j<=i} min(1, p_j/q_j). A paired, noise-free estimate of the gain.
+        static const bool bv_stats = [] { const char * s = getenv("LLAMA_SPEC_BLOCK_VERIFY"); return s && atoi(s) == 2; }();
+        if (bv_stats) {
+            static double e_blk = 0.0, e_tok = 0.0, n_drafted = 0.0;
+            static int64_t n_blocks = 0;
+            double t = 1.0;
+            for (size_t i = 1; i <= G; ++i) {
+                const double qx = prob(dists[i - 1], draft[i - 1]);
+                t *= qx > 0.0 ? std::min(prob(P[i - 1], draft[i - 1]) / qx, 1.0) : 0.0;
+                e_tok += t;
+                e_blk += keep[i];
+            }
+            n_drafted += (double) G;
+            if (++n_blocks % 256 == 0) {
+                LOG_INF("block verify: %lld blocks, expected accepted per drafted token: token %.4f, block %.4f (%+.2f%%)\n",
+                        (long long) n_blocks, e_tok/n_drafted, e_blk/n_drafted, 100.0*(e_blk/e_tok - 1.0));
+            }
+        }
+        for (size_t i = 0; i < tau; ++i) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+        }
+        llama_token y = ids[tau];
+        if (tau < G) {
+            // residual max(p_tau * M_b - M_s, 0) at X^tau
+            double sum_r = 0.0;
+            for (const auto & c : P[tau]) {
+                sum_r += std::max(0.0, keep[tau] * c.p - prob(dists[tau], c.id));
+            }
+            if (sum_r > 0.0) {
+                double t = unif(rng) * sum_r;
+                for (const auto & c : P[tau]) {
+                    const double r = std::max(0.0, keep[tau] * c.p - prob(dists[tau], c.id));
+                    if (r > 0.0) {
+                        y = c.id;
+                        t -= r;
+                        if (t < 0.0) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        common_sampler_accept(gsmpl, y, true);
+        result.push_back(y);
+        return result;
+    }
+
     for (size_t i = 0; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i]);
 
