@@ -51,3 +51,15 @@ Loki (NeurIPS 2024): low-dim (PCA) key scoring ranks keys well enough to pick to
 Candidate design for 300+ at 260k: low-dim scoring (r = 32-64 of 256) + per-query top-k + exact
 attention over the chosen keys. Next: GGML_CUDA_FA_ORACLE_DELTA (exact scores, drop logits more than
 delta below the query max) to measure the true output error on this model per sparsity level.
+
+## Correction: 0-context breakdown
+
+"fused:RMS_NORM n=24" is the gated-norm fusion group, which runs the z-projection matmul (5120x3072)
+inside it: the norm is not slow. Real split at pp2048 d0: matmuls ~86% (~12.6 TFLOPS), GATED_DELTA_NET
+7.5% (recurrent kernel at ~0.44 TFLOPS: latency-bound), FA 2.6%, rest ~4%. Wall vs op-sum gap (~10%)
+matches 128 cross-GPU exchanges per ubatch (21 MB each at ~7.1 GB/s = ~0.37 s per 2048 tokens,
+attempt 184), which run between subgraphs and are not overlapped with compute.
+
+Exact levers for 0 context: (1) overlap the TP exchange with compute (micro-batch the ubatch),
+~-7%; (2) chunked delta-net (a graph path exists: build_delta_net_chunking; cparams.fused_gdn_ch picks
+the recurrent CUDA op), up to ~-5%; (3) fold GEMM efficiency (12.6 -> 14+ TFLOPS), ~-10%.
