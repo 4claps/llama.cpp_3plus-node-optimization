@@ -71,3 +71,14 @@ runs ~12.6 TFLOPS = ~70%; cuBLAS hgemm reached ~84%. gemm_fold_kernel is __launc
 one CTA per SM, so smem-store/sync/global-load phases are exposed. fa_fold_qk2 fixed the same issue
 with 2 CTAs/SM (+20%). 500 at 0 context needs the matmuls at ~81% plus exchange/GDN savings.
 Candidate: a 2-CTA/SM fold GEMM (smaller per-thread tile or fp32 partials staged differently).
+
+## 2026-09-28: user rules out any approximation (math must not change)
+
+Oracle/approximate-attention runs stopped. Exact analysis: at 260k, per token per card, attention
+~49 GFLOP (16 layers x 12 heads x 1024 FLOP per query-key pair x ~251k keys) + weights ~25 GFLOP
+= ~74 GFLOP. 300 t/s needs ~22 TFLOPS per card; P100 peak is 19.05 (1328 MHz), ~18 at the cap.
+Exact ideas examined: q4_0 lookup tables (smem 32/clk vs 128 fp16 FMA/clk: slower), Strassen/
+Winograd (fp16 operand sums round: worse math), packed small-int products (no room on Pascal),
+key-range attention split to balance the hotter GPU1 (~+4%, exact), CPU co-compute (~+3%),
+power-efficient kernels for clock headroom (<= +6%). Exact ceiling ~150-170 t/s at 260k.
+4x P100 would make 300 exact arithmetically possible (~11 TFLOPS/card needed).
