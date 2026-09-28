@@ -114,3 +114,13 @@ STS then LDG(it+2) before the barrier (15.7; 15.3 even after bank renaming). The
 loss is real but the obvious CUDA-level reorderings lose more than they save.
 Attention kernels: fa_fold_qk2 45% of HFMA2 bank-conflicted (REG 128, 2 CTAs/SM: renaming must stay
 inside the accumulators), fa_fold_pv 36% (REG 214). Renaming worth ~3% on the GEMM.
+
+## 2026-09-28: nsys trace of pp2048 d0 (two passes, per pass per GPU)
+
+kernels 4.56 / 4.61 s; peer copies (kind 10) 125 x 21 MB at 7.0 (GPU0) / 8.3 (GPU1) GB/s = 0.37 / 0.32 s,
+zero overlap with kernels; idle ~0.1 s. Exposed exchange = ~7% of a prefill pass at any depth.
+Exact fix: token-chunk the row-parallel matmuls (attn out, FFN down) and start each chunk's peer copy
+while the next chunk computes (2 chunks ~3.5%, 4 chunks up to ~7% minus GEMM wave-tail losses).
+
+Exact 0-context budget (392 t/s now): bank renaming ~2%, exchange overlap 3.5-7%, chunked delta-net
+~5%, GEMM store/barrier phase up to ~12% (not yet solved). All four: ~490; realistic ~440-460.
