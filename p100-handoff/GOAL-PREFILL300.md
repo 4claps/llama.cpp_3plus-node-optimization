@@ -124,3 +124,14 @@ while the next chunk computes (2 chunks ~3.5%, 4 chunks up to ~7% minus GEMM wav
 
 Exact 0-context budget (392 t/s now): bank renaming ~2%, exchange overlap 3.5-7%, chunked delta-net
 ~5%, GEMM store/barrier phase up to ~12% (not yet solved). All four: ~490; realistic ~440-460.
+
+## 2026-09-28: exchange overlap landed (OPTLOG 237)
+
+pp2048 d0 392 -> ~411 t/s (+4.5%), logits bit-identical (3.05 GB compare). Direct P2P epilogue writes:
+253 t/s (dead end, opt-in only). Chunked delta-net graph (build_delta_net_chunking) asserts under
+-sm tensor (meta split axis unknown); a chunked GDN needs its own CUDA kernel (<= 7.5% available).
+Recurrent GDN kernel already swept (OPTLOG 73, 76): latency-bound on per-token warp reductions.
+
+Remaining exact budget at 0 context from ~411: GEMM store/barrier phase (<= ~10% overall, unsolved),
+bank renaming (~2%, harness-only so far), chunked GDN kernel (<= ~5-7%). Best case ~490, i.e. 500 not
+yet in reach with what is known; 300 at 260k remains above the P100's peak FLOP rate for exact math.
