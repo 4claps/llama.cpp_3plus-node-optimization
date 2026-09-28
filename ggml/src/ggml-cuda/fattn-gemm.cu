@@ -859,6 +859,63 @@ static __global__ void __launch_bounds__(256, 1) fa_fold_pv(
     }
 }
 
+// Oracle sparse attention (diagnostic, GGML_CUDA_FA_ORACLE_DELTA): Mq[kvh][n] = max over this
+// chunk's tiles and splits of mt (the per-tile max, log2 units), accumulated across chunks.
+static __global__ void fa_oracle_max(const float * __restrict__ mt, float * __restrict__ Mq,
+        const int N, const int C, const int ntile, const int nsplit, const int nz) {
+    const int n = blockIdx.x*blockDim.x + threadIdx.x;
+    const int kvh = blockIdx.y;
+    if (n >= N) {
+        return;
+    }
+    float M = Mq[(int64_t) kvh*N + n];
+    for (int sp = 0; sp < nsplit; sp++) {
+        const int z = kvh*nsplit + sp;
+        for (int tt = 0; tt < ntile; tt++) {
+            M = fmaxf(M, mt[((int64_t) z*(C/TK) + tt)*N + n]);
+        }
+    }
+    Mq[(int64_t) kvh*N + n] = M;
+}
+
+// Zero every P entry whose logit is more than dlog2 below its query's global max and recompute the
+// tile row sums lt over the kept keys, so the PV pass computes softmax over the kept set only.
+// grid (ntile, ceil(N/BN), nz), block BN: one thread per query column, 128 keys each.
+static __global__ void fa_oracle_prune(half * __restrict__ P, const float * __restrict__ mt, float * __restrict__ lt,
+        const float * __restrict__ Mq, const float dlog2, const int N, const int C, const int nsplit,
+        unsigned long long * __restrict__ kept, unsigned long long * __restrict__ total) {
+    const int tt = blockIdx.x;
+    const int nb = blockIdx.y;
+    const int z  = blockIdx.z;
+    const int r  = threadIdx.x;
+    const int n  = nb*BN + r;
+    unsigned long long k = 0, tot = 0;
+    if (n < N) {
+        const int64_t o = ((int64_t) z*(C/TK) + tt)*N + n;
+        const float m = mt[o];
+        const float thr = Mq[(int64_t) (z/nsplit)*N + n] - dlog2;
+        float s = 0.0f;
+        for (int kb = 0; kb < TK/32; kb++) {
+            half * row = P + (((int64_t) (z*gridDim.y + nb)*(C/32) + tt*(TK/32) + kb)*BN + r)*32;
+            for (int e = 0; e < 32; e++) {
+                const float p = __half2float(row[e]);
+                if (p > 0.0f) {
+                    tot++;
+                    if (log2f(p) + m >= thr) {
+                        s += p;
+                        k++;
+                    } else {
+                        row[e] = __float2half(0.0f);
+                    }
+                }
+            }
+        }
+        lt[o] = s;
+    }
+    atomicAdd(kept, k);
+    atomicAdd(total, tot);
+}
+
 // dst[d, head, t] = sum_split w*O / sum_split w*l, w = exp(m_split - max m): the split merge
 static __global__ void fa_fold_finalize(
         const float * __restrict__ O, const float * __restrict__ m, const float * __restrict__ l,
@@ -1036,6 +1093,14 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
     CUDA_CHECK(cudaGetLastError());
 
     static const bool sparsity = ggml_cuda_fa_fold_env("GGML_CUDA_FA_SPARSITY", 0) != 0;
+    // GGML_CUDA_FA_ORACLE_DELTA=d (natural-log units, diagnostic): drop keys whose logit is more than d
+    // below the query's max over all keys; softmax over the rest. An upper bound on what any fast
+    // key selector can achieve at that sparsity. Costs an extra QK pass.
+    static const float oracle_delta = [] { const char * e = getenv("GGML_CUDA_FA_ORACLE_DELTA"); return e ? (float) atof(e) : 0.0f; }();
+    const bool  oracle = oracle_delta > 0.0f;
+    const float oracle_dlog2 = oracle_delta*1.44269504088896341f;
+    ggml_cuda_pool_alloc<float> Mq(pool, oracle ? N*nhkv : 1);
+    ggml_cuda_pool_alloc<unsigned long long> ocnt(pool, 2);
     fa_sparsity_acc sacc;
     std::vector<float> h_mt, h_lt;
 
@@ -1058,6 +1123,25 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
         fattn_gemm_fill<<<(N*nz + 255)/256, 256, 0, stream>>>(m_cur, -INFINITY, N*nz);
         CUDA_CHECK(cudaGetLastError());
 
+        if (oracle) {
+            fattn_gemm_fill<<<(N*nhkv + 255)/256, 256, 0, stream>>>(Mq.ptr, -INFINITY, N*nhkv);
+            CUDA_CHECK(cudaMemsetAsync(ocnt.ptr, 0, 2*sizeof(unsigned long long), stream));
+            for (int64_t c = 0; c < Lsp; c += C) {
+                const fa_fold_split g = {(int) nsplit, (int) Lsp, (int) c, (int) nkv};
+                const int nkv_c = (int) std::min(C, Lsp - c);
+                const int ntile = (nkv_c + TK - 1)/TK;
+                const int nb  = (int) (D/QK4_0);
+                const int kpb = 256/nb;
+                const int npairs = ntile*TK/2;
+                fa_fold_dequant<<<dim3((npairs + kpb - 1)/kpb, nz, 1), kpb*nb, 0, stream>>>(
+                    (const char *) K->data + s*K->nb[3], (const char *) V->data + s*V->nb[3],
+                    K16.ptr, Vp.ptr, K->nb[1], K->nb[2], V->nb[1], V->nb[2], (int) D, g, (int) C);
+                fa_fold_qk2<<<dim3(ntile, (N + BN - 1)/BN, nz), 256, 0, stream>>>(K16.ptr, Qf16.ptr, (const half *) mask->data,
+                    mask_first.ptr, s_mask, P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g);
+                fa_oracle_max<<<dim3((N + 127)/128, nhkv, 1), 128, 0, stream>>>(mt.ptr, Mq.ptr, (int) N, (int) C, ntile, (int) nsplit, (int) nz);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
         for (int64_t c = 0; c < Lsp; c += C) {
             const fa_fold_split g = {(int) nsplit, (int) Lsp, (int) c, (int) nkv};
             // the longest stream this chunk (split 0 is always full-length)
@@ -1076,6 +1160,11 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
                 const dim3 grid(ntile, (N + BN - 1)/BN, nz);
                 fa_fold_qk2<<<grid, 256, 0, stream>>>(K16.ptr, Qf16.ptr, (const half *) mask->data, mask_first.ptr, s_mask,
                     P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if (oracle) {
+                fa_oracle_prune<<<dim3(ntile, (N + BN - 1)/BN, nz), BN, 0, stream>>>(P.ptr, mt.ptr, lt.ptr, Mq.ptr, oracle_dlog2,
+                    (int) N, (int) C, (int) nsplit, ocnt.ptr, ocnt.ptr + 1);
                 CUDA_CHECK(cudaGetLastError());
             }
             if (sparsity) {
@@ -1119,6 +1208,13 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(cudaGetLastError());
         if (sparsity) {
             sacc.report(ctx.device, nkv, nt);
+        }
+        if (oracle) {
+            unsigned long long h[2];
+            CUDA_CHECK(cudaMemcpyAsync(h, ocnt.ptr, sizeof(h), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            fprintf(stderr, "fa_oracle dev %d delta %.2f nkv %lld nt %lld: kept %.4f of %llu nonzero logits\n", ctx.device,
+                oracle_delta, (long long) nkv, (long long) nt, h[1] ? (double) h[0]/h[1] : 0.0, h[1]);
         }
     }
 }
