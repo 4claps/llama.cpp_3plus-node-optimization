@@ -1220,6 +1220,27 @@ static bool ggml_cuda_peer_copy_compressible(const ggml_tensor * src, const ggml
 // stream runs the next chunk. Same wire format and same sum as the butterfly's compressed peer copy
 // + ADD; only the overlap differs. GGML_CUDA_XCHG_CHUNKS=1 turns it off.
 static bool ggml_cuda_allreduce_chunked(ggml_backend_cuda_context * ctx[2], struct ggml_tensor ** tensors, const int64_t ne) {
+    // direct mode: each GEMM already wrote its f16 partial into the other GPU's landing buffer
+    if (ctx[0]->xchg.direct && ctx[1]->xchg.direct && ctx[0]->xchg.data == tensors[0]->data &&
+            ctx[1]->xchg.data == tensors[1]->data && ctx[0]->xchg.rows*ctx[0]->xchg.col[1] == ne &&
+            ctx[1]->xchg.rows*ctx[1]->xchg.col[1] == ne) {
+        for (int j = 0; j < 2; ++j) {
+            ggml_cuda_set_device(ctx[j]->device);
+            cudaStream_t st = ctx[j]->stream();
+            half * stage_in = (half *) ctx[j]->peer_stage_get(ggml_backend_cuda_context::PEER_STAGE_IN, ne*sizeof(half));
+            CUDA_CHECK(cudaStreamWaitEvent(st, ctx[1 - j]->xchg.ev[0], 0));   // the peer's GEMM (and its P2P writes) done
+            k_add_f16_into_f32<<<(unsigned) ((ne + 255)/256), 256, 0, st>>>((float *) tensors[j]->data, stage_in, ne);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaEventRecord(ctx[j]->peer_stage_free, st));
+        }
+        for (int j = 0; j < 2; ++j) {
+            ggml_cuda_set_device(ctx[j]->device);
+            ctx[j]->record_work();
+            ctx[j]->xchg.data = nullptr;
+            ctx[j]->xchg.direct = false;
+        }
+        return true;
+    }
     for (int j = 0; j < 2; ++j) {
         const auto & xc = ctx[j]->xchg;
         const int cc = ggml_cuda_info().devices[ctx[j]->device].cc;
@@ -1315,6 +1336,8 @@ static bool ggml_backend_cuda_comm_try_allreduce_p2p(
                 CUDA_CHECK(cudaEventCreateWithFlags(&st.done[j],  cudaEventDisableTiming));
             }
             st.ok = 1;
+            ctx[0]->xchg_peer = ctx[1];
+            ctx[1]->xchg_peer = ctx[0];
             GGML_LOG_INFO("%s: small tensor-parallel exchanges use the one-kernel P2P AllReduce\n", __func__);
         }
     }

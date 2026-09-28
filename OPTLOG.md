@@ -8699,3 +8699,7 @@ bit. Anything else (first exchange before the f16 probe, non-fold matmuls, graph
 
     pp2048 d0, -ub 2048 (alternating):  chunks=1 396.8 / 390.8   chunks=4 413.3 / 411.7   (+4.5%)
     logits, gate corpus -c 4096 -ub 2048, 3 chunks, 3.05 GB: chunks 1 vs 4 IDENTICAL (PPL 3.7658)
+Tried on top: GGML_CUDA_XCHG_DIRECT=1, the GEMM epilogue also writing its f16 outputs straight into the
+peer's landing buffer over P2P (no copy stream, no chunking): 253 t/s against 411 (chunked) and 388
+(off). The epilogue's scattered 8-byte stores make poor PCIe transactions across the two root ports.
+Off by default; kept only as an opt-in. Chunk count: 2 -> 392, 4 -> 403, 8 -> 385/376 (warm cards).

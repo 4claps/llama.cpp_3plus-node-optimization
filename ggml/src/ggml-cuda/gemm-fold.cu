@@ -79,7 +79,7 @@ static __device__ __forceinline__ float gemm_fold_h(const half2 p) {
 template <int fold_k2, bool out16>
 __global__ void __launch_bounds__(256, 1) gemm_fold_kernel(
         const half * __restrict__ W, const half * __restrict__ X, const float * __restrict__ cs,
-        float * __restrict__ Y, const int M, const int N, const int K, const int64_t sy) {
+        float * __restrict__ Y, const int M, const int N, const int K, const int64_t sy, half * __restrict__ R) {
     __shared__ __align__(16) uint32_t As[2][BK2][BM];
     __shared__ __align__(16) uint32_t Bs[2][BK2][BN];
 
@@ -193,6 +193,12 @@ __global__ void __launch_bounds__(256, 1) gemm_fold_kernel(
                 v.z = __half2float(__float2half(v.z)); v.w = __half2float(__float2half(v.w));
             }
             *(float4 *) (Y + n*sy + m) = v;
+            if (out16 && R != nullptr) {
+                // the tensor-parallel peer's landing buffer, over P2P: the same f16 values the
+                // compressed peer copy would send (v is f16-exact here)
+                half2 r[2] = {__floats2half2_rn(v.x, v.y), __floats2half2_rn(v.z, v.w)};
+                *(uint2 *) (R + n*sy + m) = *(const uint2 *) r;
+            }
         }
     }
 }
@@ -287,6 +293,37 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
     static const int xchg_chunks = std::max(1, std::min(8, ggml_cuda_gemm_fold_env("GGML_CUDA_XCHG_CHUNKS", 4)));
     cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capturing));
+    // direct mode (GGML_CUDA_XCHG_DIRECT=1, off): also write the f16 outputs straight into the peer's landing
+    // buffer over P2P. Measured 253 t/s against 411 for the chunked copies: the epilogue's scattered 8-byte
+    // stores make poor PCIe transactions across the two CPU root ports (OPTLOG 237).
+    static const bool xchg_direct = ggml_cuda_gemm_fold_env("GGML_CUDA_XCHG_DIRECT", 0) != 0;
+    ggml_backend_cuda_context * peer = ctx.xchg_peer;
+    if (ctx.xchg_want && xchg_direct && peer != nullptr && ctx.peer_f16_ok == 1 && N >= 512 && o16 &&
+            ggml_cuda_gemm_fold_k2() == 128 && capturing == cudaStreamCaptureStatusNone && ggml_is_contiguous(dst)) {
+        auto & xc = ctx.xchg;
+        half * R = (half *) peer->peer_stage_get(ggml_backend_cuda_context::PEER_STAGE_IN, (size_t) M*N*sizeof(half));
+        if (peer->peer_stage_free == nullptr) {
+            ggml_cuda_set_device(peer->device);
+            CUDA_CHECK(cudaEventCreateWithFlags(&peer->peer_stage_free, cudaEventDisableTiming));
+        }
+        ggml_cuda_set_device(ctx.device);
+        if (xc.ev[0] == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&xc.ev[0], cudaEventDisableTiming));
+        }
+        // the peer must have consumed its previous delivery before this kernel overwrites it
+        CUDA_CHECK(cudaStreamWaitEvent(stream, peer->peer_stage_free, 0));
+        gemm_fold_kernel<128, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, R);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(xc.ev[0], stream));
+        xc.n = 1;
+        xc.rows = M;
+        xc.col[0] = 0;
+        xc.col[1] = N;
+        xc.direct = true;
+        xc.data = dst->data;
+        return true;
+    }
+
     if (ctx.xchg_want && xchg_chunks > 1 && N >= 512 && o16 && ggml_cuda_gemm_fold_k2() == 128 &&
             capturing == cudaStreamCaptureStatusNone && ggml_is_contiguous(dst)) {
         const int64_t nb   = (N + BN - 1)/BN;
@@ -303,23 +340,24 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             }
             const int64_t n0 = xc.col[c], nc = xc.col[c + 1] - n0;
             const dim3 gc((M + BM - 1)/BM, (nc + BN - 1)/BN);
-            gemm_fold_kernel<128, true><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy);
+            gemm_fold_kernel<128, true><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy, nullptr);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaEventRecord(xc.ev[c], stream));
         }
+        xc.direct = false;
         xc.data = dst->data;
         return true;
     }
 
     switch (ggml_cuda_gemm_fold_k2()) {
-        case 16: o16 ? gemm_fold_kernel<16, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy)
-                     : gemm_fold_kernel<16, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy); break;
-        default:  o16 ? gemm_fold_kernel<128, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy)
-                      : gemm_fold_kernel<128, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy); break;
-        case 64: o16 ? gemm_fold_kernel<64, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy)
-                     : gemm_fold_kernel<64, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy); break;
-        case 32: o16 ? gemm_fold_kernel<32, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy)
-                     : gemm_fold_kernel<32, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy); break;
+        case 16: o16 ? gemm_fold_kernel<16, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr)
+                     : gemm_fold_kernel<16, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr); break;
+        default:  o16 ? gemm_fold_kernel<128, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr)
+                      : gemm_fold_kernel<128, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr); break;
+        case 64: o16 ? gemm_fold_kernel<64, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr)
+                     : gemm_fold_kernel<64, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr); break;
+        case 32: o16 ? gemm_fold_kernel<32, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr)
+                     : gemm_fold_kernel<32, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr); break;
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

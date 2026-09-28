@@ -1558,7 +1558,10 @@ struct ggml_backend_cuda_context {
         int64_t      col[9] = {0};     // chunk c covers tokens [col[c], col[c+1])
         int64_t      rows = 0;         // elements per token
         cudaEvent_t  ev[8] = {nullptr};
+        bool         direct = false;   // outputs were also written into the peer's landing buffer
     } xchg;
+    // the other GPU of a two-GPU tensor split (set when the P2P all-reduce comes up)
+    ggml_backend_cuda_context * xchg_peer = nullptr;
 
     cudaStream_t peer_copy_stream() {
         if (copy_stream == nullptr) {
