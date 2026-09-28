@@ -63,3 +63,11 @@ attempt 184), which run between subgraphs and are not overlapped with compute.
 Exact levers for 0 context: (1) overlap the TP exchange with compute (micro-batch the ubatch),
 ~-7%; (2) chunked delta-net (a graph path exists: build_delta_net_chunking; cparams.fused_gdn_ch picks
 the recurrent CUDA op), up to ~-5%; (3) fold GEMM efficiency (12.6 -> 14+ TFLOPS), ~-10%.
+
+## 0-context GEMM lever
+
+Under prefill both cards sit at the 175 W cap at ~1252 MHz (peak there: 17.95 TFLOPS). The fold GEMM
+runs ~12.6 TFLOPS = ~70%; cuBLAS hgemm reached ~84%. gemm_fold_kernel is __launch_bounds__(256, 1):
+one CTA per SM, so smem-store/sync/global-load phases are exposed. fa_fold_qk2 fixed the same issue
+with 2 CTAs/SM (+20%). 500 at 0 context needs the matmuls at ~81% plus exchange/GDN savings.
+Candidate: a 2-CTA/SM fold GEMM (smaller per-thread tile or fp32 partials staged differently).
