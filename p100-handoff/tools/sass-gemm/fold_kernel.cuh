@@ -68,13 +68,20 @@ extern "C" __global__ void __launch_bounds__(256, 1) fold_gemm(
     const int nt = K / (2*BK2);
     gload(0);
     sstore(0);
+#ifdef PREFETCH2
+    if (nt > 1) {
+        gload(2*BK2);   // tile 1 in flight during tile 0
+    }
+#endif
     __syncthreads();
 
     for (int it = 0; it < nt; it++) {
         const int buf = it & 1;
+#if !defined(ABL_NO_GLOAD) && !defined(PREFETCH2)
         if (it + 1 < nt) {
             gload((it + 1)*2*BK2);
         }
+#endif
         // the first product of a chain starts it (HMUL2) instead of zeroing 64 registers
         const bool restart = (it*BK2) % fold_k2 == 0;
 #pragma unroll
@@ -95,8 +102,26 @@ extern "C" __global__ void __launch_bounds__(256, 1) fold_gemm(
                     h[i][j] = k2 == 0 && restart ? __hmul2(ai, bj) : __hfma2(ai, bj, h[i][j]);
                 }
             }
+#ifdef SPREAD_STS
+            if (k2 >= BK2 - 8 && it + 1 < nt) {
+                const int p  = k2 - (BK2 - 8);   // 0..7: (i, component)
+                const int ii = p >> 2, cc = p & 3;
+                const int l  = t + 256*ii;
+                const int r  = l >> 2;
+                const int c  = l & 3;
+                const int rs = r ^ (c << 3);
+                const uint32_t va = cc == 0 ? ra[ii].x : cc == 1 ? ra[ii].y : cc == 2 ? ra[ii].z : ra[ii].w;
+                const uint32_t vb = cc == 0 ? rb[ii].x : cc == 1 ? rb[ii].y : cc == 2 ? rb[ii].z : rb[ii].w;
+                As[buf ^ 1][c*4 + cc][rs] = va;
+                Bs[buf ^ 1][c*4 + cc][rs] = vb;
+            }
+#endif
         }
+#ifdef ABL_NO_FOLD
+        if (it + 1 == nt) {
+#else
         if (((it + 1)*BK2) % fold_k2 == 0 || it + 1 == nt) {
+#endif
 #pragma unroll
             for (int i = 0; i < 8; i++) {
 #pragma unroll
@@ -105,10 +130,21 @@ extern "C" __global__ void __launch_bounds__(256, 1) fold_gemm(
                 }
             }
         }
+#ifndef ABL_NO_SYNC
+#ifndef SPREAD_STS
         if (it + 1 < nt) {
             sstore(buf ^ 1);
         }
+#endif
+#ifdef PREFETCH2
+        if (it + 2 < nt) {
+            gload((it + 2)*2*BK2);   // registers are free again: the tile they held is in smem
+        }
+#endif
+#ifndef ABL_NO_BAR
         __syncthreads();
+#endif
+#endif
     }
 
 #pragma unroll

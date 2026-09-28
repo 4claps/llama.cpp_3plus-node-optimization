@@ -95,3 +95,22 @@ HFMA2). bankfix.py (renames only the scalar accumulators into free/other registe
 Output bit-identical (0 of 17.8M differ). Harness 8704x5120 N=2048: 14.40 -> 14.03 ms (-2.6%, incl.
 dequant+prescale). So bank conflicts cost ~3%, not the whole gap. Under load the card sits at
 ~1265-1278 MHz, 175 W (power-throttled): peak there 18.2 TFLOPS; kernel alone ~13.5 TFLOPS = ~74%.
+
+## 2026-09-28: fold GEMM ablation (harness, 8704x5120 N=2048, ms incl. ~0.45 ms dequant+prescale)
+
+| variant (timing only) | ms |
+|---|---|
+| shipped | 14.44 |
+| no fp32 folds | 14.07 |
+| no tile store + barrier | 12.43 |
+| no global loads (stores keep stale data) | 13.67 |
+| no global loads, no barrier | 12.57 |
+| no barrier only | 14.17 |
+| no store/barrier/loads/folds (pure LDS+HFMA2) | 12.09 (~86% of the throttled peak) |
+| bank-renamed shipped kernel (bit-identical) | 14.03-14.14 |
+
+Tried (exact, both slower): spreading the 16 STS into k2 = 8..15 (15.9); fetching two tiles ahead,
+STS then LDG(it+2) before the barrier (15.7; 15.3 even after bank renaming). The ~14% store/barrier
+loss is real but the obvious CUDA-level reorderings lose more than they save.
+Attention kernels: fa_fold_qk2 45% of HFMA2 bank-conflicted (REG 128, 2 CTAs/SM: renaming must stay
+inside the accumulators), fa_fold_pv 36% (REG 214). Renaming worth ~3% on the GEMM.
