@@ -28,6 +28,8 @@
 #include "gemm-fold.cuh"
 #include "convert.cuh"
 
+#include <algorithm>
+
 namespace {
 
 constexpr int BM  = 128;
@@ -280,6 +282,35 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const float * cs  = s_alloc.get();
     float       * Y   = (float *) dst->data;
     const bool    o16 = mode == 2;
+
+    // exchange source: token chunks with an event after each (see xchg in common.cuh)
+    static const int xchg_chunks = std::max(1, std::min(8, ggml_cuda_gemm_fold_env("GGML_CUDA_XCHG_CHUNKS", 4)));
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capturing));
+    if (ctx.xchg_want && xchg_chunks > 1 && N >= 512 && o16 && ggml_cuda_gemm_fold_k2() == 128 &&
+            capturing == cudaStreamCaptureStatusNone && ggml_is_contiguous(dst)) {
+        const int64_t nb   = (N + BN - 1)/BN;
+        const int     nch  = (int) std::min<int64_t>(xchg_chunks, nb);
+        auto & xc = ctx.xchg;
+        xc.n = nch;
+        xc.rows = M;
+        for (int c = 0; c <= nch; c++) {
+            xc.col[c] = std::min<int64_t>(N, (nb*c/nch)*BN);
+        }
+        for (int c = 0; c < nch; c++) {
+            if (xc.ev[c] == nullptr) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&xc.ev[c], cudaEventDisableTiming));
+            }
+            const int64_t n0 = xc.col[c], nc = xc.col[c + 1] - n0;
+            const dim3 gc((M + BM - 1)/BM, (nc + BN - 1)/BN);
+            gemm_fold_kernel<128, true><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaEventRecord(xc.ev[c], stream));
+        }
+        xc.data = dst->data;
+        return true;
+    }
+
     switch (ggml_cuda_gemm_fold_k2()) {
         case 16: o16 ? gemm_fold_kernel<16, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy)
                      : gemm_fold_kernel<16, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy); break;

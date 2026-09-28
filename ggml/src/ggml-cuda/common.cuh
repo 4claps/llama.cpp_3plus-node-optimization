@@ -1548,6 +1548,18 @@ struct ggml_backend_cuda_context {
         return peer_stage[dir];
     }
 
+    // Token-chunked exchange source (GGML_CUDA_XCHG_CHUNKS): graph compute sets xchg_want for a
+    // graph's last node; the fold GEMM then runs it in token chunks, recording ev[c] after chunk c,
+    // so the tensor-parallel all-reduce can send chunk c while later chunks still compute.
+    bool xchg_want = false;
+    struct {
+        const void * data = nullptr;
+        int          n    = 0;
+        int64_t      col[9] = {0};     // chunk c covers tokens [col[c], col[c+1])
+        int64_t      rows = 0;         // elements per token
+        cudaEvent_t  ev[8] = {nullptr};
+    } xchg;
+
     cudaStream_t peer_copy_stream() {
         if (copy_stream == nullptr) {
             ggml_cuda_set_device(device);

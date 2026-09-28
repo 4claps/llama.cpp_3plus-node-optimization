@@ -8686,3 +8686,16 @@ Checks:
 - Block verification: the decision moved into common_spec_block_verify, which the server calls; a
   C++ test links it from libllama-common (p100-handoff/tools/block-verify-test). 1M runs: G=2 worst
   1.85 SE over 27 sequences, G=4 2.21 SE over 81; planted bug 337 SE.
+
+## Attempt 237: overlap the prefill tensor-parallel exchange with the matmul (KEPT, +4.5% pp2048, bit-identical) -- 2026-09-28
+
+nsys, pp2048 d0: 125 peer copies of 21 MB per pass per GPU at 7.0/8.3 GB/s = 0.37/0.32 s, none of it
+overlapped with kernels (~7% of the pass). Now graph compute flags a graph's last node (xchg_want);
+when it is a fold GEMM (>= 512 tokens, f16 outputs), it runs in GGML_CUDA_XCHG_CHUNKS (default 4)
+token chunks with an event after each. The CUDA comm hook (ggml_cuda_allreduce_chunked) then narrows
+each chunk to f16 and sends it on the copy stream as soon as its event fires, while the next chunk
+computes, and finishes with one own += (float) peer kernel per GPU: the butterfly's widen + ADD bit for
+bit. Anything else (first exchange before the f16 probe, non-fold matmuls, graphs) takes the old path.
+
+    pp2048 d0, -ub 2048 (alternating):  chunks=1 396.8 / 390.8   chunks=4 413.3 / 411.7   (+4.5%)
+    logits, gate corpus -c 4096 -ub 2048, 3 chunks, 3.05 GB: chunks 1 vs 4 IDENTICAL (PPL 3.7658)
