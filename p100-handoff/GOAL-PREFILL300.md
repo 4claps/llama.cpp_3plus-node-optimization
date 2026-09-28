@@ -140,3 +140,9 @@ SASS hand edit (movests.py): the 16 STS + 3 DEPBARs moved from the store phase i
 against 14.53 for the unmodified cubin: store placement is not the cost. The ~14% is the global-load
 latency interacting with the per-tile barrier; fixing it needs a restructured pipeline (e.g. a
 3-stage smem ring or warp-specialised loads), not a reordering.
+Warp-specialised GEMM (fold_kernel_ws.cuh: 8 compute + 2 loader warps, 3-stage smem ring, named
+barriers bar.arrive/bar.sync): bit-identical, 14.87 ms vs 14.45-14.57 (-2.5%). With the store move
+also not helping, the ~14% of the no-barrier ablation looks like the benefit of warps drifting out of
+lockstep (staggered LDS bursts), which any per-tile handoff re-synchronises. Open idea: stagger the
+warps deliberately (e.g. half the warps start at k2 = 8) with a 3-stage ring so no CTA-wide barrier
+is needed per tile.
