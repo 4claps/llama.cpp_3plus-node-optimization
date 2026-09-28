@@ -82,3 +82,16 @@ Winograd (fp16 operand sums round: worse math), packed small-int products (no ro
 key-range attention split to balance the hotter GPU1 (~+4%, exact), CPU co-compute (~+3%),
 power-efficient kernels for clock headroom (<= +6%). Exact ceiling ~150-170 t/s at 260k.
 4x P100 would make 300 exact arithmetically possible (~11 TFLOPS/card needed).
+
+## 2026-09-28: SASS-level GEMM work (exact), p100-handoff/tools/sass-gemm/
+
+Toolchain: CuAssembler (sm_60 supported) in /mnt/fast/p100-scratch/CuAssembler, venv at
+/mnt/fast/p100-scratch/venv. fold_kernel.cuh = exact copy of gemm_fold_kernel<128,true>; cand_fold.cuh
+plugs it into gemm-harness and loads an edited cubin from $CUBIN, checking bitwise equality vs the
+compiled kernel. Round trip cubin -> cuasm -> cubin: identical SASS.
+
+Finding: 424 register-bank conflicts per tile-loop pass among the 1160 FMA-type instructions (42% of
+HFMA2). bankfix.py (renames only the scalar accumulators into free/other registers) -> 82 conflicts.
+Output bit-identical (0 of 17.8M differ). Harness 8704x5120 N=2048: 14.40 -> 14.03 ms (-2.6%, incl.
+dequant+prescale). So bank conflicts cost ~3%, not the whole gap. Under load the card sits at
+~1265-1278 MHz, 175 W (power-throttled): peak there 18.2 TFLOPS; kernel alone ~13.5 TFLOPS = ~74%.
