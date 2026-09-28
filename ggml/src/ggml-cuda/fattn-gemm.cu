@@ -33,6 +33,9 @@
 #include "convert.cuh"
 
 #include <cublas_v2.h>
+#include <algorithm>
+#include <mutex>
+#include <vector>
 
 // Precision, chosen at runtime.
 //
@@ -905,6 +908,81 @@ static bool ggml_cuda_fa_fold_usable(const ggml_tensor * dst) {
         K->ne[2] == V->ne[2] && Q->ne[1]*(Q->ne[2]/K->ne[2]) <= 65535*fa_fold::BN;
 }
 
+// GGML_CUDA_FA_SPARSITY=1 (diagnostic only, slow: syncs after every chunk): how much of each
+// query's softmax mass sits in each 128-key tile, from the kernel's own per-tile max and sum.
+// Prints, per call, the fraction of (128-query x 128-key) blocks a block-sparse kernel would
+// have to keep to cover 99 / 99.9 / 99.99 % of every query's mass. Changes no output.
+struct fa_sparsity_acc {
+    int64_t N = 0, T = 0, nhkv = 0;
+    std::vector<float> lm;   // [kvh][n][tile] log2 mass
+    void init(int64_t N_, int64_t T_, int64_t nhkv_) {
+        N = N_; T = T_; nhkv = nhkv_;
+        lm.assign((size_t) (nhkv*N*T), -INFINITY);
+    }
+    void add(const std::vector<float> & mt, const std::vector<float> & lt, int64_t nz, int64_t nsplit,
+             int64_t ctiles, int64_t tile0_of_split_c /* c/TK */, int64_t tiles_per_split) {
+        for (int64_t z = 0; z < nz; z++) {
+            const int64_t kvh = z / nsplit, sp = z % nsplit;
+            for (int64_t tt = 0; tt < ctiles; tt++) {
+                const int64_t tg = sp*tiles_per_split + tile0_of_split_c + tt;
+                if (tg >= T) continue;
+                for (int64_t n = 0; n < N; n++) {
+                    const float m = mt[((size_t) (z*ctiles + tt))*N + n];
+                    const float l = lt[((size_t) (z*ctiles + tt))*N + n];
+                    lm[((size_t) (kvh*N + n))*T + tg] = (m == -INFINITY || !(l > 0.0f)) ? -INFINITY : m + log2f(l);
+                }
+            }
+        }
+    }
+    void report(int dev, int64_t nkv, int64_t nt) {
+        static std::mutex mu;
+        static int call = 0;
+        const double taus[3] = {0.99, 0.999, 0.9999};
+        double qfrac[3] = {0, 0, 0}, bfrac[3] = {0, 0, 0};
+        int64_t nq = 0, nb = 0;
+        std::vector<std::pair<float, int>> v(T);
+        std::vector<uint8_t> need[3];
+        for (int k = 0; k < 3; k++) need[k].assign((size_t) T, 0);
+        for (int64_t kvh = 0; kvh < nhkv; kvh++) {
+            for (int64_t n0 = 0; n0 < N; n0 += 128) {
+                for (int k = 0; k < 3; k++) std::fill(need[k].begin(), need[k].end(), 0);
+                int64_t valid_tiles = 0;
+                for (int64_t n = n0; n < std::min(N, n0 + 128); n++) {
+                    const float * row = &lm[((size_t) (kvh*N + n))*T];
+                    float mx = -INFINITY;
+                    for (int64_t t = 0; t < T; t++) mx = std::max(mx, row[t]);
+                    if (mx == -INFINITY) continue;
+                    double tot = 0; int64_t nv = 0;
+                    for (int64_t t = 0; t < T; t++) {
+                        const float w = row[t] == -INFINITY ? 0.0f : exp2f(row[t] - mx);
+                        v[t] = {w, (int) t}; tot += w; nv += w > 0.0f;
+                    }
+                    valid_tiles = std::max(valid_tiles, nv);
+                    std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.first > b.first; });
+                    for (int k = 0; k < 3; k++) {
+                        double c = 0; int64_t i = 0;
+                        while (i < T && c < taus[k]*tot) { c += v[i].first; need[k][v[i].second] = 1; i++; }
+                        qfrac[k] += nv ? (double) i / nv : 0;
+                    }
+                    nq++;
+                }
+                if (valid_tiles == 0) continue;
+                for (int k = 0; k < 3; k++) {
+                    int64_t cnt = 0;
+                    for (int64_t t = 0; t < T; t++) cnt += need[k][t];
+                    bfrac[k] += (double) cnt / valid_tiles;
+                }
+                nb++;
+            }
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        fprintf(stderr, "fa_sparsity dev %d call %d nkv %lld nt %lld | per-query tiles kept 99%%/99.9%%/99.99%%: %.3f %.3f %.3f"
+                " | 128x128 blocks kept: %.3f %.3f %.3f\n", dev, call++, (long long) nkv, (long long) nt,
+                qfrac[0]/std::max<int64_t>(1, nq), qfrac[1]/std::max<int64_t>(1, nq), qfrac[2]/std::max<int64_t>(1, nq),
+                bfrac[0]/std::max<int64_t>(1, nb), bfrac[1]/std::max<int64_t>(1, nb), bfrac[2]/std::max<int64_t>(1, nb));
+    }
+};
+
 static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using namespace fa_fold;
     const ggml_tensor * Q    = dst->src[0];
@@ -957,7 +1035,14 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
     fattn_gemm_mask_first_nz<256><<<nt, 256, 0, stream>>>((const half *) mask->data, mask_first.ptr, s_mask, (int) nkv);
     CUDA_CHECK(cudaGetLastError());
 
+    static const bool sparsity = ggml_cuda_fa_fold_env("GGML_CUDA_FA_SPARSITY", 0) != 0;
+    fa_sparsity_acc sacc;
+    std::vector<float> h_mt, h_lt;
+
     for (int64_t s = 0; s < ns; ++s) {
+        if (sparsity) {
+            sacc.init(N, nsplit*(Lsp/TK), nhkv);
+        }
         for (int64_t kvh = 0; kvh < nhkv; ++kvh) {
             fattn_gemm_q_to_f16<<<dim3(nt, gqa, 1), 256, 0, stream>>>(
                 (const char *) Q->data + s*Q->nb[3], Qf16.ptr + kvh*N*D,
@@ -993,6 +1078,31 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
                     P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g);
                 CUDA_CHECK(cudaGetLastError());
             }
+            if (sparsity) {
+                const size_t cnt = (size_t) (C/TK)*N*nz;
+                h_mt.resize(cnt); h_lt.resize(cnt);
+                CUDA_CHECK(cudaMemcpyAsync(h_mt.data(), mt.ptr, cnt*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(h_lt.data(), lt.ptr, cnt*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                // mt/lt are laid out [z][C/TK][N]; only the first ntile tiles of this chunk are written
+                std::vector<float> cm((size_t) ntile*N*nz), cl((size_t) ntile*N*nz);
+                for (int64_t z = 0; z < nz; z++) {
+                    for (int64_t tt = 0; tt < ntile; tt++) {
+                        memcpy(&cm[((size_t) (z*ntile + tt))*N], &h_mt[((size_t) (z*(C/TK) + tt))*N], N*sizeof(float));
+                        memcpy(&cl[((size_t) (z*ntile + tt))*N], &h_lt[((size_t) (z*(C/TK) + tt))*N], N*sizeof(float));
+                    }
+                }
+                // a split whose keys end before this chunk's ntile tiles leaves stale values: mask by key range
+                for (int64_t z = 0; z < nz; z++) {
+                    const int64_t off = (z % nsplit)*Lsp + c;
+                    for (int64_t tt = 0; tt < ntile; tt++) {
+                        if (off + tt*TK >= nkv || c + tt*TK >= Lsp) {
+                            for (int64_t n = 0; n < N; n++) cm[((size_t) (z*ntile + tt))*N + n] = -INFINITY;
+                        }
+                    }
+                }
+                sacc.add(cm, cl, nz, nsplit, ntile, c/TK, Lsp/TK);
+            }
             {
                 const dim3 grid(DV/BM, (N + BN - 1)/BN, nz);
                 fa_fold_pv<<<grid, 256, 0, stream>>>(Vp.ptr, P.ptr, mt.ptr, lt.ptr, m_cur, m_nxt, l_state.ptr,
@@ -1007,6 +1117,9 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
             O_cur, m_cur, l_state.ptr, (float *) dst->data + s*(dst->nb[3]/sizeof(float)),
             (int) DV, (int) nt, (int) N, (int) gqa, (int) nsplit, dst_s1, dst_s2);
         CUDA_CHECK(cudaGetLastError());
+        if (sparsity) {
+            sacc.report(ctx.device, nkv, nt);
+        }
     }
 }
 
