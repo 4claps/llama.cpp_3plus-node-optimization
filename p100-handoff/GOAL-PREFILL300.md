@@ -135,3 +135,8 @@ Recurrent GDN kernel already swept (OPTLOG 73, 76): latency-bound on per-token w
 Remaining exact budget at 0 context from ~411: GEMM store/barrier phase (<= ~10% overall, unsolved),
 bank renaming (~2%, harness-only so far), chunked GDN kernel (<= ~5-7%). Best case ~490, i.e. 500 not
 yet in reach with what is known; 300 at 260k remains above the P100's peak FLOP rate for exact math.
+SASS hand edit (movests.py): the 16 STS + 3 DEPBARs moved from the store phase into the HFMA2 block
+(55/70/85% points), addresses recomputed at the loop top into R200-R204. Bit-identical, but 14.73 ms
+against 14.53 for the unmodified cubin: store placement is not the cost. The ~14% is the global-load
+latency interacting with the per-tile barrier; fixing it needs a restructured pipeline (e.g. a
+3-stage smem ring or warp-specialised loads), not a reordering.
