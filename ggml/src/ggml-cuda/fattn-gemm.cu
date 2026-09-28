@@ -1092,6 +1092,61 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
     fattn_gemm_mask_first_nz<256><<<nt, 256, 0, stream>>>((const half *) mask->data, mask_first.ptr, s_mask, (int) nkv);
     CUDA_CHECK(cudaGetLastError());
 
+    // GGML_CUDA_FA_DUMP=dir (diagnostic): for calls with >= GGML_CUDA_FA_DUMP_MIN_NKV keys (default
+    // 250000), write Q (f32), K and V (raw q4_0 rows), the per-query first masked key and a meta line,
+    // so attention approximations can be scored offline against the exact result.
+    {
+        static const char * dump_dir = getenv("GGML_CUDA_FA_DUMP");
+        static const int64_t dump_min = ggml_cuda_fa_fold_env("GGML_CUDA_FA_DUMP_MIN_NKV", 250000);
+        static std::mutex dump_mu;
+        static int dump_call = 0;
+        if (dump_dir && nkv >= dump_min && ns == 1) {
+            int id;
+            {
+                std::lock_guard<std::mutex> lock(dump_mu);
+                id = dump_call++;
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            char fn[1024];
+            auto wr = [&](const char * what, const void * h, size_t n) {
+                snprintf(fn, sizeof(fn), "%s/c%03d_d%d_%s.bin", dump_dir, id, ctx.device, what);
+                FILE * f = fopen(fn, "wb");
+                GGML_ASSERT(f);
+                fwrite(h, 1, n, f);
+                fclose(f);
+            };
+            {   // Q: [D, nt, nh] f32, rows gathered contiguously
+                std::vector<float> h((size_t) D*nt*nh);
+                for (int64_t hh = 0; hh < nh; hh++) {
+                    CUDA_CHECK(cudaMemcpy2D(h.data() + (size_t) hh*nt*D, D*sizeof(float),
+                        (const char *) Q->data + hh*Q->nb[2], Q->nb[1], D*sizeof(float), nt, cudaMemcpyDeviceToHost));
+                }
+                wr("q", h.data(), h.size()*sizeof(float));
+            }
+            for (int kv = 0; kv < 2; kv++) {   // K, V: [nhkv][nkv][row bytes] raw q4_0
+                const ggml_tensor * t = kv ? V : K;
+                const size_t rb = ggml_row_size(t->type, t->ne[0]);
+                std::vector<char> h((size_t) rb*nkv*nhkv);
+                for (int64_t hh = 0; hh < nhkv; hh++) {
+                    CUDA_CHECK(cudaMemcpy2D(h.data() + (size_t) hh*nkv*rb, rb, (const char *) t->data + hh*t->nb[2], t->nb[1],
+                        rb, nkv, cudaMemcpyDeviceToHost));
+                }
+                wr(kv ? "v" : "k", h.data(), h.size());
+            }
+            {
+                std::vector<float> h(nt);
+                CUDA_CHECK(cudaMemcpy(h.data(), mask_first.ptr, nt*sizeof(float), cudaMemcpyDeviceToHost));
+                wr("maskfirst", h.data(), h.size()*sizeof(float));
+            }
+            snprintf(fn, sizeof(fn), "%s/c%03d_d%d_meta.txt", dump_dir, id, ctx.device);
+            FILE * f = fopen(fn, "w");
+            GGML_ASSERT(f);
+            fprintf(f, "D %lld DV %lld nt %lld nh %lld nhkv %lld nkv %lld scale %.9g\n", (long long) D, (long long) DV,
+                (long long) nt, (long long) nh, (long long) nhkv, (long long) nkv, scale);
+            fclose(f);
+        }
+    }
+
     static const bool sparsity = ggml_cuda_fa_fold_env("GGML_CUDA_FA_SPARSITY", 0) != 0;
     // GGML_CUDA_FA_ORACLE_DELTA=d (natural-log units, diagnostic): drop keys whose logit is more than d
     // below the query's max over all keys; softmax over the rest. An upper bound on what any fast
