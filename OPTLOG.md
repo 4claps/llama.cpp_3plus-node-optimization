@@ -8720,3 +8720,25 @@ value (x * 2^-112) flushed to zero whenever the half chain sum was subnormal, an
 when |acc| < 2^-14 in prescaled units. The new fold keeps those values. Harness with -use_fast_math, N=512:
 2.3% of outputs differ; NMSE vs fp64 equal for both (3.00e-6 / 3.32e-6 / 3.00e-6 on the 3 shapes).
 KLD vs the old kernel (8 chunks, -c 4096): mean 0.00118, top-p same 98.9%; old vs itself 0.
+
+## Attempt 239: chunked gated delta net for prefill (gdn-chunked.cu) - KEPT
+
+Scalar-gate, S_v = 128 prefill calls with at least 64 tokens (after the K-1 snapshot tail) now run a
+chunked form (64-token chunks, forward substitution on the residual, fp64 log-decay prefix sums;
+team/gdn work). Decode and short batches still take the recurrence. `GGML_CUDA_GDN_CHUNKED=0` restores
+the shipped kernel; `=2` is a slower variant with fp64 K K^T/Q K^T/state update; `GGML_CUDA_GDN_REF=1`
+runs a sequential fp64-state recurrence, used only as the accuracy reference below.
+
+- Op harness (n 2048, H 24): 1.92 ms vs 7.3 ms shipped (3.8x). NMSE vs fp64 over 4 data modes x
+  seeds: better on uniform and correlated keys, 1.5-2x worse under strong gates (~1e-14 either way).
+- In-model, KLD against the fp64-recurrence base (8 chunks, c 4096):
+
+  | GDN path | mean KLD | max KLD | same top p |
+  |---|---|---|---|
+  | shipped recurrence | 0.001193 ± 0.000031 | 0.262 | 98.80% |
+  | chunked fp32 (kept) | 0.001206 ± 0.000029 | 0.150 | 98.92% |
+  | chunked + fp64 parts | 0.001215 ± 0.000035 | 0.275 | 98.86% |
+
+  All three sit on the same ~0.0012 floor (any fp32-level perturbation reaches it): tie.
+- pp2048 -ub 1024 ABBA: 410 -> 426 t/s (+3.8%). tg128 ABBA 32.15 vs 32.14 (unchanged).
+- PPL 2.6099 ± 0.0198 (band 2.6209 ± 0.0199); FLASH_ATTN_EXT 3/3.

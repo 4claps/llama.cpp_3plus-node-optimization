@@ -331,6 +331,16 @@ bool ggml_cuda_gdn_gather_lookup(const ggml_tensor * consumer, const float ** ba
     return true;
 }
 
+// gdn-chunked.cu: chunked prefill form and an fp64 reference, both opt-in by env
+struct ggml_cuda_gdn_alt_args {
+    const float * q; const float * k; const float * v; const float * g; const float * beta;
+    const float * curr_state; float * dst; float * state;
+    int64_t H, n_tokens, n_seqs, neqk1, rq3;
+    int64_t sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3;
+    float scale; int64_t state_slot_stride; int K; const int32_t * s_idx; int64_t s_row;
+};
+bool ggml_cuda_gdn_alt(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_alt_args & a);
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -427,6 +437,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_idx, s_row, stream);
         }
     } else {
+        if (S_v == 128) {
+            const ggml_cuda_gdn_alt_args a = { q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                H, n_tokens, n_seqs, neqk1, rq3, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                scale, state_slot_stride, K, s_idx, s_row };
+            if (ggml_cuda_gdn_alt(ctx, a)) {
+                return;
+            }
+        }
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
