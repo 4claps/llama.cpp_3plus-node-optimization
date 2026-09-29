@@ -8703,3 +8703,20 @@ Tried on top: GGML_CUDA_XCHG_DIRECT=1, the GEMM epilogue also writing its f16 ou
 peer's landing buffer over P2P (no copy stream, no chunking): 253 t/s against 411 (chunked) and 388
 (off). The epilogue's scattered 8-byte stores make poor PCIe transactions across the two root ports.
 Off by default; kept only as an opt-in. Chunk count: 2 -> 392, 4 -> 403, 8 -> 385/376 (warm cards).
+
+## Attempt 238: fold GEMM with cheaper bookkeeping (gemm_fold_kernel_u2) - KEPT
+
+Same products, fp16 chains and fold points as gemm_fold_kernel<128, true>. Changes: load/store offsets
+computed once, the tile loop unrolled by two (compile-time smem buffer), the fold as HADD2.F32 with the
+2^-112 moved into the column scale (a power of two), blocks grouped 4 weight row-blocks at a time for L2
+reuse. Found by the GEMM team agent (k3.cuh, /mnt/fast/p100-scratch/team/gemm). GGML_CUDA_GEMM_FOLD_U2=0
+reverts. Needs K % 64 == 0 (all model shapes).
+
+    harness 8704x5120 N=2048 (no fast-math): 14.57 -> 13.68 ms, 0 of 17.8M outputs differ; down/agate same
+    pp2048 d0 -ub 2048 ABBA: U2=1 453.4 / 444.7   U2=0 414.5 / 412.0   (+8.5%)
+    gate: tg256 32.17, PPL 2.6101 +/- 0.0198, FLASH_ATTN_EXT pass
+Not bit-identical in the real build: ggml compiles with -use_fast_math (FTZ), so the old fold's scaled
+value (x * 2^-112) flushed to zero whenever the half chain sum was subnormal, and the accumulator flushed
+when |acc| < 2^-14 in prescaled units. The new fold keeps those values. Harness with -use_fast_math, N=512:
+2.3% of outputs differ; NMSE vs fp64 equal for both (3.00e-6 / 3.32e-6 / 3.00e-6 on the 3 shapes).
+KLD vs the old kernel (8 chunks, -c 4096): mean 0.00118, top-p same 98.9%; old vs itself 0.

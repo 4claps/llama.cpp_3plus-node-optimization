@@ -203,6 +203,153 @@ __global__ void __launch_bounds__(256, 1) gemm_fold_kernel(
     }
 }
 
+// The same products, chains and folds as gemm_fold_kernel<128, true>, with cheaper bookkeeping:
+// load/store offsets computed once, the tile loop unrolled by two (compile-time buffer index), the
+// fold as HADD2.F32 with the 2^-112 moved into the column scale (a power of two, so every rounding
+// is unchanged), and blocks grouped by RASTER weight row-blocks for L2 reuse. Needs K % 64 == 0.
+// Harness 8704x5120 N=2048: 14.57 -> 13.68 ms, 0 of 17.8M outputs differ.
+constexpr int GEMM_FOLD_RASTER = 4;
+
+__global__ void __launch_bounds__(256, 1) gemm_fold_kernel_u2(
+        const half * __restrict__ W, const half * __restrict__ X, const float * __restrict__ cs,
+        float * __restrict__ Y, const int M, const int N, const int K, const int64_t sy) {
+    __shared__ __align__(16) uint32_t As[2][BK2][BM];
+    __shared__ __align__(16) uint32_t Bs[2][BK2][BN];
+
+    const int t   = threadIdx.x;
+    const int tx  = t & 15;
+    const int ty  = t >> 4;
+    const int gm  = gridDim.x;
+    const int gn  = gridDim.y;
+    const int lin = blockIdx.x + blockIdx.y*gm;
+    const int grp = lin / (GEMM_FOLD_RASTER*gn);
+    const int gsz = min(GEMM_FOLD_RASTER, gm - grp*GEMM_FOLD_RASTER);
+    const int m0  = (grp*GEMM_FOLD_RASTER + (lin % (GEMM_FOLD_RASTER*gn)) % gsz)*BM;
+    const int n0  = ((lin % (GEMM_FOLD_RASTER*gn)) / gsz)*BN;
+
+    float acc[8][8];
+    half2 h[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc[i][j] = 0.0f;
+            h[i][j]   = make_half2(0.0f, 0.0f);
+        }
+    }
+
+    const uint4 * pa[2];
+    const uint4 * pb[2];
+    bool va[2], vb[2];
+    int  so[2];
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int l = t + 256*i, r = l >> 2, c = l & 3;
+        va[i] = m0 + r < M;
+        vb[i] = n0 + r < N;
+        pa[i] = (const uint4 *) (W + (int64_t) (va[i] ? m0 + r : 0)*K + c*8);
+        pb[i] = (const uint4 *) (X + (int64_t) (vb[i] ? n0 + r : 0)*K + c*8);
+        so[i] = (c*4)*BM + (r ^ (c << 3));   // same XOR swizzle as gemm_fold_kernel
+    }
+    int ao[4], bo[4];
+#pragma unroll
+    for (int g = 0; g < 4; g++) {
+        ao[g] = (ty*4) ^ (g << 3);
+        bo[g] = (tx*4) ^ (g << 3);
+    }
+
+    uint4 ra[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+    uint4 rb[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+    auto gload = [&](const int it) {   // tile it = K offset it*32 halves = it*4 uint4
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            if (va[i]) ra[i] = pa[i][it*4];
+            if (vb[i]) rb[i] = pb[i][it*4];
+        }
+    };
+    auto sstore = [&](const int buf) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            uint32_t * a = &As[buf][0][0] + so[i];
+            uint32_t * b = &Bs[buf][0][0] + so[i];
+            a[0] = ra[i].x; a[BM] = ra[i].y; a[2*BM] = ra[i].z; a[3*BM] = ra[i].w;
+            b[0] = rb[i].x; b[BN] = rb[i].y; b[2*BN] = rb[i].z; b[3*BN] = rb[i].w;
+        }
+    };
+    auto tile = [&](const int buf, const bool restart) {
+#pragma unroll
+        for (int k2 = 0; k2 < BK2; k2++) {
+            const uint4 a0 = *(const uint4 *) &As[buf][k2][ao[k2 >> 2]];
+            const uint4 a1 = *(const uint4 *) &As[buf][k2][ao[k2 >> 2] + 64];
+            const uint4 b0 = *(const uint4 *) &Bs[buf][k2][bo[k2 >> 2]];
+            const uint4 b1 = *(const uint4 *) &Bs[buf][k2][bo[k2 >> 2] + 64];
+            const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const uint32_t b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const half2 ai = *(const half2 *) &a[i];
+                    const half2 bj = *(const half2 *) &b[j];
+                    h[i][j] = k2 == 0 && restart ? __hmul2(ai, bj) : __hfma2(ai, bj, h[i][j]);
+                }
+            }
+        }
+    };
+    auto fold = [&]() {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                acc[i][j] += __half2float(__hadd(__low2half(h[i][j]), __high2half(h[i][j])));
+            }
+        }
+    };
+
+    constexpr int TPF = 128/BK2;       // tiles per fold
+    const int nt = K / (2*BK2);        // even: K % 64 == 0
+    gload(0);
+    sstore(0);
+    __syncthreads();
+    for (int it = 0; it < nt; it += 2) {
+        gload(it + 1);
+        tile(0, it % TPF == 0);
+        sstore(1);
+        __syncthreads();
+        if (it + 2 < nt) {
+            gload(it + 2);
+        }
+        tile(1, false);
+        if ((it + 2) % TPF == 0 || it + 2 >= nt) {
+            fold();
+        }
+        if (it + 2 < nt) {
+            sstore(0);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int n = n0 + (j < 4 ? tx*4 + j : 64 + tx*4 + j - 4);
+        if (n >= N) {
+            continue;
+        }
+        const float s = cs[n] * 0x1p-112f;
+#pragma unroll
+        for (int ih = 0; ih < 2; ih++) {
+            const int m = m0 + ih*64 + ty*4;
+            if (m >= M) {
+                continue;
+            }
+            float4 v = make_float4(acc[ih*4 + 0][j]*s, acc[ih*4 + 1][j]*s, acc[ih*4 + 2][j]*s, acc[ih*4 + 3][j]*s);
+            v.x = __half2float(__float2half(v.x)); v.y = __half2float(__float2half(v.y));
+            v.z = __half2float(__float2half(v.z)); v.w = __half2float(__float2half(v.w));
+            *(float4 *) (Y + n*sy + m) = v;
+        }
+    }
+}
+
 } // namespace
 
 static int ggml_cuda_gemm_fold_env(const char * name, int def) {
@@ -298,6 +445,9 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // stores make poor PCIe transactions across the two CPU root ports (OPTLOG 237).
     static const bool xchg_direct = ggml_cuda_gemm_fold_env("GGML_CUDA_XCHG_DIRECT", 0) != 0;
     ggml_backend_cuda_context * peer = ctx.xchg_peer;
+    // GGML_CUDA_GEMM_FOLD_U2=0 falls back to gemm_fold_kernel (bit-identical, slower)
+    static const bool u2_env = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD_U2", 1) != 0;
+    const bool u2 = u2_env && o16 && K % 64 == 0 && ggml_cuda_gemm_fold_k2() == 128;
     if (ctx.xchg_want && xchg_direct && peer != nullptr && ctx.peer_f16_ok == 1 && N >= 512 && o16 &&
             ggml_cuda_gemm_fold_k2() == 128 && capturing == cudaStreamCaptureStatusNone && ggml_is_contiguous(dst)) {
         auto & xc = ctx.xchg;
@@ -340,7 +490,11 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             }
             const int64_t n0 = xc.col[c], nc = xc.col[c + 1] - n0;
             const dim3 gc((M + BM - 1)/BM, (nc + BN - 1)/BN);
-            gemm_fold_kernel<128, true><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy, nullptr);
+            if (u2) {
+                gemm_fold_kernel_u2<<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy);
+            } else {
+                gemm_fold_kernel<128, true><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy, nullptr);
+            }
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaEventRecord(xc.ev[c], stream));
         }
@@ -349,6 +503,11 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
         return true;
     }
 
+    if (u2) {
+        gemm_fold_kernel_u2<<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     switch (ggml_cuda_gemm_fold_k2()) {
         case 16: o16 ? gemm_fold_kernel<16, true><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr)
                      : gemm_fold_kernel<16, false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr); break;
