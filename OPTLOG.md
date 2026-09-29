@@ -8742,3 +8742,15 @@ runs a sequential fp64-state recurrence, used only as the accuracy reference bel
   All three sit on the same ~0.0012 floor (any fp32-level perturbation reaches it): tie.
 - pp2048 -ub 1024 ABBA: 410 -> 426 t/s (+3.8%). tg128 ABBA 32.15 vs 32.14 (unchanged).
 - PPL 2.6099 ± 0.0198 (band 2.6209 ± 0.0199); FLASH_ATTN_EXT 3/3.
+
+## Attempts 240-243: 0-context leftovers after the chunked delta net - all REVERTED (no measurable gain)
+
+pp2048 -ub 2048 is now ~465 t/s (4334 ms/pass under nsys: fold GEMM 80.5% at ~14 TFLOPS in-model,
+flash_attn_tile 2.7%, q6_K dequant 2.1%, prescale 2.1%, gdn2 2.1%, idle 3.4%).
+- 240 k8 GEMM (half2 = two output rows, fold every 64 k2; team/gemm/k8.cuh): NMSE 2.57e-6 vs 3.00e-6
+  (more accurate), but 128 regs for 2 CTAs/SM spills 220 B -> 12.3 TFLOPS; at 1 CTA/SM 13.2 vs k3 13.6.
+- 241 GEMM attention at short KV (min KV 4096 -> 1024): 470.7 vs 467.5 ABBA, noise.
+- 242 exchange chunks: 8 uniform chunks 437 vs 464 (per-chunk wave tails); 7,7,1,1 / 7,7,2 tiles: noise.
+- 243 high-priority copy stream: nsys shows the f16 narrowing kernel was starved behind the next GEMM
+  chunk (~1.5 ms/exchange on GPU0) and priority fixes that, but throughput moved <1% (465.9 vs 464.2):
+  the exposed part is the last chunk's copy (0.7-1.0 ms) + ~0.6 ms GPU1-vs-GPU0 skew.
