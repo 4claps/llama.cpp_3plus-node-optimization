@@ -8754,3 +8754,32 @@ flash_attn_tile 2.7%, q6_K dequant 2.1%, prescale 2.1%, gdn2 2.1%, idle 3.4%).
 - 243 high-priority copy stream: nsys shows the f16 narrowing kernel was starved behind the next GEMM
   chunk (~1.5 ms/exchange on GPU0) and priority fixes that, but throughput moved <1% (465.9 vs 464.2):
   the exposed part is the last chunk's copy (0.7-1.0 ms) + ~0.6 ms GPU1-vs-GPU0 skew.
+
+## Attempts 244-247: fill the exchange wait, pair gate/up, single-pass prescale - KEPT (all exact)
+
+nsys at pp2048 -ub 2048: ~148 ms/pass of GPU idle, nearly all at the end of each of the 128 chunked
+exchanges (k_add waiting for the last chunk's copy, plus GPU1 ~3% slower: 1286 vs 1304 MHz).
+- 244 gate/up pairing (GGML_CUDA_GEMM_FOLD_PAIR): the graph loop hands the next MUL_MAT on the same
+  src1 to fold_try, which runs both as one u2 launch (template PAIR: rows [0,Ms) -> W/Y, [Ms,M) ->
+  W2/Y2, Ms % 128 == 0) with one prescale. Op profile: ffn gate+up 3323 -> 3265 ms. Only when >1.5 GB
+  is free (holds both f16 weights; 262k GPU0 min free fell 508 -> 434 MiB without the guard).
+- 245 weight prefetch (GGML_CUDA_FOLD_PREFETCH): per device, the fold weights used between one
+  exchange and the next are learned on the first pass; each exchange dequantizes them into a
+  persistent buffer on the compute stream before waiting for the copies; fold_try uses them when the
+  weight pointer matches. Off (buffer not allocated) unless free VRAM stays above 1 GB after it.
+- 246 high-priority copy stream (GGML_CUDA_XCHG_PRIO): without it the exchange's f16 narrowing kernel
+  waited ~1.5 ms behind the next GEMM chunk / prefetch dequants for SMs (nsys), delaying the copy.
+- 247 single-pass prescale (GGML_CUDA_FOLD_PRESCALE_V): row held in registers, float4 loads.
+
+| pp2048 -ub 2048 ABBA (cool cards) | off | on |
+|---|---|---|
+| pairing | 469.5 | 470.3 (op profile -29 ms/pass) |
+| prefetch (1 weight) + priority | 465.6 | 472.0 |
+| prefetch all weights to next exchange vs 1 | 470.4 | 474.2 |
+| single-pass prescale | 474.6 | 478.5 |
+
+Idle per pass 148 -> 55-69 ms (the rest is GPU1's lag). KLD vs the unpaired base: -0.000006 / max
+0.000004 / top 100%, identical to the unpaired build against its own base (the base file's
+quantization floor): bit-exact. PPL 2.6099, FLASH_ATTN_EXT 3/3, tg128 ABBA 31.89 vs 31.87 (decode
+never takes these paths). 260k prefill 122.7/126.0 t/s (unchanged).
+Also tried: 128-thread 64x128 CTAs at 2/SM (k9): 13.1 vs 13.65 TFLOPS, reverted.

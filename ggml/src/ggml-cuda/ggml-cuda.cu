@@ -1291,6 +1291,7 @@ static bool ggml_cuda_allreduce_chunked(ggml_backend_cuda_context * ctx[2], stru
     for (int j = 0; j < 2; ++j) {
         ggml_cuda_set_device(ctx[j]->device);
         cudaStream_t st = ctx[j]->stream();
+        ggml_cuda_gemm_fold_prefetch(*ctx[j]);                             // fill the wait (gemm-fold.cuh)
         CUDA_CHECK(cudaStreamWaitEvent(st, ctx[1 - j]->copy_event, 0));   // the peer's partial has landed
         CUDA_CHECK(cudaStreamWaitEvent(st, ctx[j]->copy_event, 0));       // our own partial has been read
         k_add_f16_into_f32<<<(unsigned) ((ne + 255)/256), 256, 0, st>>>((float *) tensors[j]->data, stage_in[j], ne);
@@ -5302,8 +5303,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 cuda_ctx->xchg_want = i == cgraph->n_nodes - 1;
+                // two matmuls on the same activations may run as one fold launch (gemm-fold.cuh)
+                ggml_tensor * fold_partner = nullptr;
+                if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes && !is_concurrent_event_active) {
+                    ggml_tensor * nx = cgraph->nodes[i + 1];
+                    if (nx->op == GGML_OP_MUL_MAT && nx->src[1] == node->src[1] && nx->src[0] != node &&
+                            (nx->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                        fold_partner = nx;
+                    }
+                }
+                ggml_cuda_gemm_fold_set_partner(fold_partner);
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 cuda_ctx->xchg_want = false;
+                const bool fold_partner_done = ggml_cuda_gemm_fold_take_partner_done();
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5318,6 +5330,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+                if (fold_partner_done) {
+                    i++;   // ran with this node; the gap makes the next iteration treat it like a fused node
+                }
             }
         }
 

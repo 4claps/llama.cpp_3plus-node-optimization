@@ -26,6 +26,9 @@
 // to cuBLAS COMPUTE_16F.
 
 #include "gemm-fold.cuh"
+
+#include <unordered_map>
+#include <vector>
 #include "convert.cuh"
 
 #include <algorithm>
@@ -64,6 +67,53 @@ __global__ void gemm_fold_prescale(const float * __restrict__ X, const int64_t s
     half * y = X16 + (int64_t) n*K;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
         y[k] = __float2half(x[k]*s);
+    }
+    if (threadIdx.x == 0) {
+        cs[n] = ldexpf(1.0f, e) * 0x1p112f;
+    }
+}
+
+// Same outputs as gemm_fold_prescale, one read of X: the row is held in registers (float4 x NV per
+// thread) between the max and the scaling. Needs K % 4 == 0, 16-byte aligned rows, K <= 1024*NV.
+template <int NV>
+__global__ void __launch_bounds__(256) gemm_fold_prescale_v(const float * __restrict__ X, const int64_t s1,
+        half * __restrict__ X16, float * __restrict__ cs, const int K, const int xexp) {
+    const int n = blockIdx.x;
+    const float4 * x = (const float4 *) (X + n*s1);
+    const int K4 = K/4;
+    float4 r[NV];
+    float m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+        const int k = threadIdx.x + 256*i;
+        r[i] = k < K4 ? x[k] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        m = fmaxf(m, fmaxf(fmaxf(fabsf(r[i].x), fabsf(r[i].y)), fmaxf(fabsf(r[i].z), fabsf(r[i].w))));
+    }
+    __shared__ float sm[32];
+    m = warp_reduce_max(m);
+    if ((threadIdx.x & 31) == 0) {
+        sm[threadIdx.x >> 5] = m;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        m = threadIdx.x < 8 ? sm[threadIdx.x] : 0.0f;
+        m = warp_reduce_max(m);
+        if (threadIdx.x == 0) {
+            sm[0] = m;
+        }
+    }
+    __syncthreads();
+    m = sm[0];
+    const int   e = xexp < 0 ? 0 : m > 0.0f && isfinite(m) ? ilogbf(m) - xexp : 0;
+    const float s = ldexpf(1.0f, -e);
+    half2 * y = (half2 *) (X16 + (int64_t) n*K);
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+        const int k = threadIdx.x + 256*i;
+        if (k < K4) {
+            y[2*k + 0] = __halves2half2(__float2half(r[i].x*s), __float2half(r[i].y*s));
+            y[2*k + 1] = __halves2half2(__float2half(r[i].z*s), __float2half(r[i].w*s));
+        }
     }
     if (threadIdx.x == 0) {
         cs[n] = ldexpf(1.0f, e) * 0x1p112f;
@@ -210,9 +260,14 @@ __global__ void __launch_bounds__(256, 1) gemm_fold_kernel(
 // Harness 8704x5120 N=2048: 14.57 -> 13.68 ms, 0 of 17.8M outputs differ.
 constexpr int GEMM_FOLD_RASTER = 4;
 
+// PAIR: two weights sharing X in one launch (gemm_fold_pair). Rows [0, Ms) come from W into Y, rows
+// [Ms, M) from W2 into Y2; Ms is a multiple of BM, so each block sits wholly on one side and every
+// output is computed exactly as in two separate launches.
+template <bool PAIR>
 __global__ void __launch_bounds__(256, 1) gemm_fold_kernel_u2(
         const half * __restrict__ W, const half * __restrict__ X, const float * __restrict__ cs,
-        float * __restrict__ Y, const int M, const int N, const int K, const int64_t sy) {
+        float * __restrict__ Y, const int M, const int N, const int K, const int64_t sy,
+        const half * __restrict__ W2, float * __restrict__ Y2, const int Ms, const int64_t sy2) {
     __shared__ __align__(16) uint32_t As[2][BK2][BM];
     __shared__ __align__(16) uint32_t Bs[2][BK2][BN];
 
@@ -224,8 +279,14 @@ __global__ void __launch_bounds__(256, 1) gemm_fold_kernel_u2(
     const int lin = blockIdx.x + blockIdx.y*gm;
     const int grp = lin / (GEMM_FOLD_RASTER*gn);
     const int gsz = min(GEMM_FOLD_RASTER, gm - grp*GEMM_FOLD_RASTER);
-    const int m0  = (grp*GEMM_FOLD_RASTER + (lin % (GEMM_FOLD_RASTER*gn)) % gsz)*BM;
+    const int m0g = (grp*GEMM_FOLD_RASTER + (lin % (GEMM_FOLD_RASTER*gn)) % gsz)*BM;
     const int n0  = ((lin % (GEMM_FOLD_RASTER*gn)) / gsz)*BN;
+    const bool second = PAIR && m0g >= Ms;
+    const half * Wc  = second ? W2 : W;
+    float *      Yc  = second ? Y2 : Y;
+    const int    m0  = second ? m0g - Ms : m0g;
+    const int    Mc  = !PAIR ? M : second ? M - Ms : Ms;
+    const int64_t syc = second ? sy2 : sy;
 
     float acc[8][8];
     half2 h[8][8];
@@ -245,9 +306,9 @@ __global__ void __launch_bounds__(256, 1) gemm_fold_kernel_u2(
 #pragma unroll
     for (int i = 0; i < 2; i++) {
         const int l = t + 256*i, r = l >> 2, c = l & 3;
-        va[i] = m0 + r < M;
+        va[i] = m0 + r < Mc;
         vb[i] = n0 + r < N;
-        pa[i] = (const uint4 *) (W + (int64_t) (va[i] ? m0 + r : 0)*K + c*8);
+        pa[i] = (const uint4 *) (Wc + (int64_t) (va[i] ? m0 + r : 0)*K + c*8);
         pb[i] = (const uint4 *) (X + (int64_t) (vb[i] ? n0 + r : 0)*K + c*8);
         so[i] = (c*4)*BM + (r ^ (c << 3));   // same XOR swizzle as gemm_fold_kernel
     }
@@ -339,13 +400,13 @@ __global__ void __launch_bounds__(256, 1) gemm_fold_kernel_u2(
 #pragma unroll
         for (int ih = 0; ih < 2; ih++) {
             const int m = m0 + ih*64 + ty*4;
-            if (m >= M) {
+            if (m >= Mc) {
                 continue;
             }
             float4 v = make_float4(acc[ih*4 + 0][j]*s, acc[ih*4 + 1][j]*s, acc[ih*4 + 2][j]*s, acc[ih*4 + 3][j]*s);
             v.x = __half2float(__float2half(v.x)); v.y = __half2float(__float2half(v.y));
             v.z = __half2float(__float2half(v.z)); v.w = __half2float(__float2half(v.w));
-            *(float4 *) (Y + n*sy + m) = v;
+            *(float4 *) (Yc + n*syc + m) = v;
         }
     }
 }
@@ -394,6 +455,131 @@ bool ggml_cuda_gemm_fold_wants_f32(ggml_backend_cuda_context & ctx, const ggml_t
     return ggml_cuda_gemm_fold_eligible(ctx, src0, src1, dst) && src0->ne[1] < ggml_cuda_gemm_fold_min_rows();
 }
 
+// Weight prefetch (see gemm-fold.cuh): per device, which fold weights followed each exchanged matmul
+// (learned on the first pass), and a buffer the exchange wait dequantizes them into.
+struct gemm_fold_prefetch_state {
+    static constexpr int NMAX = 6;
+    const void * trigger = nullptr;      // src0 of the matmul whose exchange is pending
+    const void * learning = nullptr;     // trigger whose followers are being recorded
+    std::unordered_map<const void *, std::vector<const ggml_tensor *>> next;
+    half *       buf     = nullptr;
+    size_t       cap     = 0;            // halfs
+    bool         broken  = false;
+    const void * held[NMAX] = {};
+    size_t       off[NMAX]  = {};
+};
+static gemm_fold_prefetch_state gemm_fold_pf[GGML_CUDA_MAX_DEVICES];
+
+static bool gemm_fold_prefetch_on() {
+    static const bool on = ggml_cuda_gemm_fold_env("GGML_CUDA_FOLD_PREFETCH", 1) != 0;
+    return on;
+}
+
+static int gemm_fold_prefetch_max() {
+    // fold weights dequantized ahead per exchange wait (all the ones up to the next exchange by default)
+    static const int v = std::max(1, std::min(gemm_fold_prefetch_state::NMAX,
+        ggml_cuda_gemm_fold_env("GGML_CUDA_FOLD_PREFETCH_N", gemm_fold_prefetch_state::NMAX)));
+    return v;
+}
+
+void ggml_cuda_gemm_fold_prefetch(ggml_backend_cuda_context & ctx) {
+    auto & st = gemm_fold_pf[ctx.device];
+    for (auto & h : st.held) {
+        h = nullptr;
+    }
+    if (!gemm_fold_prefetch_on() || st.broken || st.trigger == nullptr) {
+        return;
+    }
+    auto it = st.next.find(st.trigger);
+    if (it == st.next.end() || it->second.empty()) {
+        return;
+    }
+    const auto & w = it->second;
+    size_t need = 0;
+    for (const ggml_tensor * t : w) {
+        need += (size_t) ggml_nelements(t);
+    }
+    if (need > st.cap) {
+        if (st.buf != nullptr) {
+            CUDA_CHECK(cudaFree(st.buf));
+            st.buf = nullptr;
+            st.cap = 0;
+        }
+        // keep a safety margin: GPU0 also drives the desktop
+        size_t free_b = 0, total_b = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        if (free_b < need*sizeof(half) + ((size_t) 1 << 30) || cudaMalloc(&st.buf, need*sizeof(half)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            st.buf = nullptr;
+            st.broken = true;
+            return;
+        }
+        st.cap = need;
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < w.size(); i++) {
+        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(w[i]->type);
+        to_fp16(w[i]->data, st.buf + o, ggml_nelements(w[i]), ctx.stream());
+        st.held[i] = w[i]->data;
+        st.off[i]  = o;
+        o += (size_t) ggml_nelements(w[i]);
+    }
+}
+
+// the prefetched f16 copy of w, or nullptr
+static const half * gemm_fold_prefetched(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
+    auto & st = gemm_fold_pf[ctx.device];
+    for (int i = 0; i < gemm_fold_prefetch_state::NMAX; i++) {
+        if (st.held[i] != nullptr && st.held[i] == w->data) {
+            st.held[i] = nullptr;
+            return st.buf + st.off[i];
+        }
+    }
+    return nullptr;
+}
+
+// record the fold weights that follow an exchange, in order, until the next exchange (first pass only)
+static void gemm_fold_learn(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * w2) {
+    auto & st = gemm_fold_pf[ctx.device];
+    if (st.learning != nullptr) {
+        auto & v = st.next[st.learning];
+        for (const ggml_tensor * t : {w, w2}) {
+            if (t != nullptr && (int) v.size() < gemm_fold_prefetch_max() && ggml_get_to_fp16_cuda(t->type) != nullptr &&
+                    t->type != GGML_TYPE_F16) {
+                v.push_back(t);
+            }
+        }
+    }
+}
+
+// an exchanged matmul: it ends the list being learned and starts its own (unless already known)
+static void gemm_fold_trigger(ggml_backend_cuda_context & ctx, const void * w) {
+    auto & st = gemm_fold_pf[ctx.device];
+    st.trigger  = w;
+    st.learning = st.next.count(w) ? nullptr : w;
+    if (st.learning != nullptr) {
+        st.next[w].clear();
+    }
+}
+
+// Pairing (see gemm-fold.cuh): the graph loop names the next node; fold_try runs it too when it is a
+// fold matmul on the same activations.
+static thread_local ggml_tensor * gemm_fold_partner      = nullptr;
+static thread_local bool          gemm_fold_partner_done = false;
+
+void ggml_cuda_gemm_fold_set_partner(ggml_tensor * next) {
+    static const bool on = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD_PAIR", 1) != 0;
+    gemm_fold_partner      = on ? next : nullptr;
+    gemm_fold_partner_done = false;
+}
+
+bool ggml_cuda_gemm_fold_take_partner_done() {
+    const bool d = gemm_fold_partner_done;
+    gemm_fold_partner      = nullptr;
+    gemm_fold_partner_done = false;
+    return d;
+}
+
 bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                              ggml_tensor * dst) {
     const int mode = ggml_cuda_gemm_fold_mode();
@@ -418,7 +604,10 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     const half * W16 = (const half *) src0->data;
     ggml_cuda_pool_alloc<half> w_alloc(ctx.pool());
-    if (to_fp16) {
+    const half * w_pf = to_fp16 ? gemm_fold_prefetched(ctx, src0) : nullptr;
+    if (w_pf != nullptr) {
+        W16 = w_pf;
+    } else if (to_fp16) {
         w_alloc.alloc(ggml_nelements(src0));
         to_fp16(src0->data, w_alloc.get(), ggml_nelements(src0), stream);
         W16 = w_alloc.get();
@@ -426,8 +615,22 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     ggml_cuda_pool_alloc<half>  x_alloc(ctx.pool(), N*K);
     ggml_cuda_pool_alloc<float> s_alloc(ctx.pool(), N);
-    gemm_fold_prescale<<<N, 256, 0, stream>>>((const float *) src1->data, src1->nb[1]/sizeof(float),
-                                              x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
+    {
+        // one read of X (same outputs); GGML_CUDA_FOLD_PRESCALE_V=0: the two-pass kernel
+        static const bool pv = ggml_cuda_gemm_fold_env("GGML_CUDA_FOLD_PRESCALE_V", 1) != 0;
+        const float * xs = (const float *) src1->data;
+        const int64_t s1 = src1->nb[1]/sizeof(float);
+        const bool vec = pv && K % 4 == 0 && s1 % 4 == 0 && ((uintptr_t) xs) % 16 == 0;
+        if (vec && K <= 1024*4) {
+            gemm_fold_prescale_v<4><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
+        } else if (vec && K <= 1024*6) {
+            gemm_fold_prescale_v<6><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
+        } else if (vec && K <= 1024*9) {
+            gemm_fold_prescale_v<9><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
+        } else {
+            gemm_fold_prescale<<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
+        }
+    }
 
     const dim3 grid((M + BM - 1)/BM, (N + BN - 1)/BN);
     const int64_t sy = dst->nb[1]/sizeof(float);
@@ -448,6 +651,47 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // GGML_CUDA_GEMM_FOLD_U2=0 falls back to gemm_fold_kernel (bit-identical, slower)
     static const bool u2_env = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD_U2", 1) != 0;
     const bool u2 = u2_env && o16 && K % 64 == 0 && ggml_cuda_gemm_fold_k2() == 128;
+
+    // gate/up style pair: one prescale (above) and one launch over both weights' rows
+    ggml_tensor * pt = gemm_fold_partner;
+    gemm_fold_partner = nullptr;
+    // pairing holds both f16 weights at once (+ one weight of pool); only with room to spare (262k runs
+    // leave GPU0 ~0.5 GB, and GPU0 also drives the desktop)
+    static int pair_room[GGML_CUDA_MAX_DEVICES] = {0};   // 0 unknown, 1 yes, -1 no
+    if (pt != nullptr && pair_room[ctx.device] == 0) {
+        size_t free_b = 0, total_b = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        pair_room[ctx.device] = free_b > ((size_t) 3 << 29) ? 1 : -1;
+    }
+    if (pt != nullptr && (pair_room[ctx.device] < 0 || gemm_fold_pf[ctx.device].broken)) {
+        pt = nullptr;
+    }
+    if (pt != nullptr && u2 && !ctx.xchg_want && M % BM == 0 && pt->op == GGML_OP_MUL_MAT && pt->src[1] == src1 &&
+            pt->type == GGML_TYPE_F32 && pt->src[0]->type == src0->type && pt->src[0]->ne[0] == K &&
+            pt->src[0]->ne[1] >= ggml_cuda_gemm_fold_min_rows() && pt->src[0]->ne[1] % 4 == 0 &&
+            pt->src[0]->ne[1] + M <= INT_MAX && pt->ne[1] == N && pt->op_params[0] == dst->op_params[0] &&
+            ggml_cuda_gemm_fold_eligible(ctx, pt->src[0], src1, pt) && ggml_is_contiguous(pt->src[0]) &&
+            ggml_is_contiguous(pt) && pt->src[0]->ne[2] == 1 && pt->src[0]->ne[3] == 1) {
+        const int64_t M2 = pt->src[0]->ne[1];
+        const half * W2 = (const half *) pt->src[0]->data;
+        ggml_cuda_pool_alloc<half> w2_alloc(ctx.pool());
+        gemm_fold_learn(ctx, src0, pt->src[0]);
+        const half * w2_pf = to_fp16 ? gemm_fold_prefetched(ctx, pt->src[0]) : nullptr;
+        if (w2_pf != nullptr) {
+            W2 = w2_pf;
+        } else if (to_fp16) {
+            w2_alloc.alloc(ggml_nelements(pt->src[0]));
+            to_fp16(pt->src[0]->data, w2_alloc.get(), ggml_nelements(pt->src[0]), stream);
+            W2 = w2_alloc.get();
+        }
+        const dim3 gp((M + M2 + BM - 1)/BM, (N + BN - 1)/BN);
+        gemm_fold_kernel_u2<true><<<gp, 256, 0, stream>>>(W16, X16, cs, Y, (int) (M + M2), N, K, sy,
+            W2, (float *) pt->data, (int) M, pt->nb[1]/sizeof(float));
+        CUDA_CHECK(cudaGetLastError());
+        gemm_fold_partner_done = true;
+        return true;
+    }
+    gemm_fold_learn(ctx, src0, nullptr);
     if (ctx.xchg_want && xchg_direct && peer != nullptr && ctx.peer_f16_ok == 1 && N >= 512 && o16 &&
             ggml_cuda_gemm_fold_k2() == 128 && capturing == cudaStreamCaptureStatusNone && ggml_is_contiguous(dst)) {
         auto & xc = ctx.xchg;
@@ -476,6 +720,16 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (ctx.xchg_want && xchg_chunks > 1 && N >= 512 && o16 && ggml_cuda_gemm_fold_k2() == 128 &&
             capturing == cudaStreamCaptureStatusNone && ggml_is_contiguous(dst)) {
+        // The exchange's f16 narrowing kernels run on the copy stream. At default priority they wait
+        // behind compute-stream work (the next GEMM chunk, prefetch dequants) for free SMs; high
+        // priority lets the block scheduler dispatch them first. Scheduling only.
+        static const bool xchg_prio = ggml_cuda_gemm_fold_env("GGML_CUDA_XCHG_PRIO", 1) != 0;
+        if (xchg_prio && ctx.copy_stream == nullptr) {
+            int lo = 0, hi = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&ctx.copy_stream, cudaStreamNonBlocking, hi));
+        }
+        gemm_fold_trigger(ctx, src0->data);
         const int64_t nb   = (N + BN - 1)/BN;
         const int     nch  = (int) std::min<int64_t>(xchg_chunks, nb);
         auto & xc = ctx.xchg;
@@ -491,7 +745,7 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             const int64_t n0 = xc.col[c], nc = xc.col[c + 1] - n0;
             const dim3 gc((M + BM - 1)/BM, (nc + BN - 1)/BN);
             if (u2) {
-                gemm_fold_kernel_u2<<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy);
+                gemm_fold_kernel_u2<false><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy, nullptr, nullptr, 0, 0);
             } else {
                 gemm_fold_kernel<128, true><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy, nullptr);
             }
@@ -504,7 +758,7 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
 
     if (u2) {
-        gemm_fold_kernel_u2<<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy);
+        gemm_fold_kernel_u2<false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr, nullptr, 0, 0);
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
