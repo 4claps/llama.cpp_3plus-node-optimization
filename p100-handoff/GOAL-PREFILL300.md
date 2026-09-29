@@ -146,3 +146,19 @@ also not helping, the ~14% of the no-barrier ablation looks like the benefit of 
 lockstep (staggered LDS bursts), which any per-tile handoff re-synchronises. Open idea: stagger the
 warps deliberately (e.g. half the warps start at k2 = 8) with a 3-stage ring so no CTA-wide barrier
 is needed per tile.
+
+## 2026-09-28 night: team results (agents hit the rate limit ~25 min in; salvaged by hand)
+
+- GEMM (team/gemm/k3.cuh) -> gemm_fold_kernel_u2, committed (OPTLOG 238): pp2048 d0 ~413 -> ~449 t/s
+  (+8.5%), gates pass (tg256 32.17, PPL 2.6101). Not bit-identical only because the old fold lost values
+  to FTZ under -use_fast_math; NMSE vs fp64 equal.
+- Delta-net (team/gdn/gdn_chunked_v2.cuh + harness_v2.cu, precision knobs TG/TA/TB/TC/TF): all-float
+  1.75-1.92 ms vs shipped 6.6-7.3 (3.8-4.2x). Accuracy vs fp64: mode 0 4x better; mode 3 (model-like)
+  ~tied (out nmse 3.40e-14 vs 3.35e-14, state maxabs/rms 2.8e-6 vs 2.0e-6). All-double: 4.37 ms, still
+  not better on every metric. NEXT: check modes 1-2 / more seeds, then integrate into gated_delta_net.cu
+  (interface gdn_ch_params / gdn_ch_launch, scratch per chunk) and judge on real PPL/KLD.
+- Attention (worktree team/wt-attn, uncommitted diff in fattn-gemm.cu): pv2 (128-thread PV, 2 CTAs/SM)
+  + 2-stream head split: FLASH_ATTN_EXT kv 65536 nb 1024 68.3 -> 66.6 ms (~2.5%). Op runs ~12 TFLOPS.
+- Open question: 260k measured 106 t/s but kernel rates predict ~150; the gap is outside the FA kernel
+  (suspects: MTP draft prefill at -ubd 64 re-reading the full KV per 64 tokens, sustained clocks). Profile
+  a depth run before more kernel work.
