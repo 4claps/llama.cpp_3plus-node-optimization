@@ -8833,3 +8833,14 @@ reference from the same dequantized K/V):
 | 3 | 7.4e-7 | 3.6e-5 |
 
 8-49x worse (consistent with attempt 151's "8x" for the long-context path). Not allowed as a new change.
+
+## Attempt 250: warp-per-row RMS norm for rows of 32..256 floats - KEPT (bit-exact)
+
+rms_norm_f32<256, ...> gave each 128-float row (delta-net gated norm: 24 heads x 2048 tokens; q/k norms)
+a 256-thread block: 0.91 ms for 50 MB (~55 GB/s); ~71 ms per pp2048 pass across the small-row calls.
+rms_norm_f32_warp: one warp per row, 8 rows per block. Lane l holds x[32w + l]^2 per "virtual warp" w,
+reduces each with the block's per-warp butterfly, then runs the block's second butterfly over the NW
+sums (empty warps = exact zeros); outputs use the same expressions. All six 256-thread launch sites
+(plain, mul, mul+add, scale, pair-scale, gate) try it first. GGML_CUDA_NORM_WARP=0: off.
+KLD vs base: -0.000006 / max 0.000004 / top 100% (bit-exact); test-backend-ops RMS_NORM passes.
+pp2048 -ub 2048 A/B/B/A single runs: 479.1 vs 474.6 (+0.9%). tg128 ABBA cool: 31.83 vs 31.82.
