@@ -8862,3 +8862,11 @@ Two-source same-bank HFMA2s: 813 -> 401 (PAIR 0), 807 -> 362 (PAIR 1); 255 regs 
 tools/gate.sh runs `u2cubin.py --check` (header built from a different kernel text -> fail).
 KLD -0.000006 / 0.000004 / 100% (floor, exact). pp2048 -ub 2048 ABBA: off 487.3/482.8, on
 491.4/489.9 (485.1 -> 490.7, +1.2%). tg128 31.74 (unchanged).
+
+## Attempt 253: HFMA2 multiplicand slot swap + reuse-flag rewrite on top of 252 - REVERTED (no gain)
+Viterbi over runs of adjacent HFMA2s choosing a/b slot order (fma(a,b,c) == fma(b,a,c)), reuse flags
+reset to "next instruction reads the same reg in the same slot". Model count 399 -> 321 / 357 -> 271;
+KLD floor (exact). pp2048 ABBAAB vs 252: 490.7 (252) vs 488.7 (swap). The model is wrong: ptxas sets
+reuse on operands read 2-3 instructions later (R76 at 0f90 -> 0fb8), so the cache persists past the
+next instruction and dropping those flags costs more than the swaps save. Warm vs cold cards moved
+single passes 487 -> 502; only same-session interleaved A/B means anything here.
