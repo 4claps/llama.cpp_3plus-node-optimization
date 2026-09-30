@@ -8981,3 +8981,7 @@ prompt 147.6 / 154.2 -> 147.5 / 155.3, and 148.8 / 154.8 in a second run (single
 Bit-exact at chunk 2048 (faacc hash c7943e877361c33a). Real shape (faacc nq 1479, nkv 261632, I32 mask):
 chunk 4096 370.0 vs chunk 2048 373.8 ms/call (compiled): -1% for +~147 MB of P scratch per GPU at N 8874;
 and at chunk 2048 the per-fold factor work made the default slower (with SASS 368.3 vs 366.0). Reverted.
+- 265 (reverted): qk2 epilogue folds the two row groups per warp with one shfl_xor(16) before the smem stage
+  (8 partials per column instead of 16): 184.2 / 185.1 vs ~182-184 ms/call compiled. No gain.
+- Clocks at 260k (nvidia-smi read-only, 250 ms samples while busy): GPU0 1303 MHz median, GPU1 1290, both at
+  the 175 W power cap (throttle 0x4 = SW power cap) but within 2% of max clock; 57-58 C.
