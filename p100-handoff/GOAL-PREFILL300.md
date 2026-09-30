@@ -180,3 +180,17 @@ Harness: +1.6-2.4% GEMM, bit-identical by construction (bankfix.py renames regis
 - runtime loader + 3 launch sites: p100-handoff/wip/u2-sass-launch.patch (apply after generating the header)
 - then: KLD floor check, pp2048 A/B, tg check, commit. Also queued: SwiGLU fused into the down prescale (~0.5%).
 260k: attention is 64% of the time at ~11 TFLOPS; exact ceiling ~150-160, 200 is not reachable with exact math.
+
+## 2026-09-29 (later): bank-fixed u2 SASS landed (pp2048 -ub 2048 ~485 -> ~491 warm, ~500 cold)
+- 252 KEPT: u2cubin.py + runtime cuModuleLoadData loader (gemm-fold-u2-sass.h). Exact (KLD floor), +1.2%.
+  gate.sh fails if the header is stale: after ANY edit to the u2 kernel text, rerun
+  `python3 p100-handoff/tools/sass-gemm/u2cubin.py` (~40 s) then rebuild ggml-cuda (~20 s).
+  GGML_CUDA_GEMM_FOLD_SASS=0 falls back to the compiled kernel.
+- 253 REVERTED: a/b slot swap + reuse-flag rewrite; the adjacent-only reuse model is wrong (ptxas relies on
+  the operand cache lasting 2-3 instructions). Left: 170/399 conflicts are A x B fragment pairs (LDS.128
+  groups, not renameable); only instruction reordering could remove them.
+- Temperature matters: single pp2048 passes read 502 at 41C and 487 at 60C on the same build. A/B only
+  interleaved (tools/ab-pp.sh A B B A; LD_LIBRARY_PATH=<dir with other libggml-cuda.so> as one arm).
+- NEXT: SwiGLU fused into the down-projection prescale (~0.4%, exact). Design issue found: the GLU node must
+  only be skipped when the next MUL_MAT is sure to take gemm_fold_try (dispatcher picks cuBLAS/fold for this
+  shape, but that must be decided at the GLU node, or materialize the GLU in every non-fold path).
