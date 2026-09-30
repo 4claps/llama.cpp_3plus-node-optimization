@@ -8900,3 +8900,7 @@ faacc NMSE vs fp64 (pv -> pv2): 512x16384 amp1 7.391e-6 = ; amp4 9.962e-5 -> 9.9
 5.738e-5 -> 5.737e-5; amp8 s3 1.623e-4 -> 1.622e-4; 1024x8192 amp4 s4 8.541e-5 -> 8.534e-5 (maxabs
 equal/lower except amp4 s1 5.574e-2 -> 5.622e-2). Model KLD vs the all-fp32 base (4 chunks, -ub 1024):
 0.001172 / top 98.937% -> 0.001186 / 98.858% (within the ±0.000025 s.e.; the fp32 base is not fp64).
+- 256b: pv2 prologue loads all tile maxima / sums at once (unrolled to MAXTILE; same arithmetic and order):
+  PV 259.6 -> 257.6 ms. 260k depth-bench (vision, -ub 2048): 133.7 / 140.1 t/s (goal start 126.4 / 131.6),
+  GPU0 min free 656 MiB. Chunk 1024 vs 2048 at op level: PV 275.2 vs 257.6 -> per-CTA fixed costs ~18 ms;
+  the rest of PV's gap to u2 is the main loop (~72% of peak at the op test's 1328 MHz).

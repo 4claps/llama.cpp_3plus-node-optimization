@@ -964,27 +964,39 @@ static __global__ void __launch_bounds__(256, 1) fa_fold_pv2(
             const int n = n0 + t;
             float M = -INFINITY, c = 0.0f;
             if (n < N) {
+                // all tile maxima loaded at once (independent loads; ntile <= MAXTILE)
+                float mm[MAXTILE];
+#pragma unroll
+                for (int tt = 0; tt < MAXTILE; tt++) {
+                    mm[tt] = tt < ntile ? mt[((int64_t) h*(C/TK) + tt)*N + n] : -INFINITY;
+                }
                 const float mo = m_in[(int64_t) h*N + n];
                 M = mo;
-                for (int tt = 0; tt < ntile; tt++) {
-                    M = fmaxf(M, mt[((int64_t) h*(C/TK) + tt)*N + n]);
+#pragma unroll
+                for (int tt = 0; tt < MAXTILE; tt++) {
+                    M = fmaxf(M, mm[tt]);
                 }
                 c = mo == -INFINITY ? 0.0f : exp2f(mo - M);
                 if (blockIdx.x == 0) {
                     float l = l_state[(int64_t) h*N + n]*c;
                     if (M != -INFINITY) {
+                        float lv[MAXTILE];
+#pragma unroll
+                        for (int tt = 0; tt < MAXTILE; tt++) {
+                            lv[tt] = tt < ntile ? lt[((int64_t) h*(C/TK) + tt)*N + n] : 0.0f;
+                        }
                         for (int tt = 0; tt < ntile; tt++) {
-                            const int64_t o = ((int64_t) h*(C/TK) + tt)*N + n;
-                            const float mm = mt[o];
-                            l += mm == -INFINITY ? 0.0f : lt[o]*exp2f(mm - M);
+                            l += mm[tt] == -INFINITY ? 0.0f : lv[tt]*exp2f(mm[tt] - M);
                         }
                     }
                     l_state[(int64_t) h*N + n] = l;
                     m_out[(int64_t) h*N + n]   = M;
                 }
-                for (int tt = 0; tt < ntile; tt++) {
-                    const float mm = mt[((int64_t) h*(C/TK) + tt)*N + n];
-                    fac[tt][t] = (mm == -INFINITY || M == -INFINITY) ? 0.0f : exp2f(mm - M);
+#pragma unroll
+                for (int tt = 0; tt < MAXTILE; tt++) {
+                    if (tt < ntile) {
+                        fac[tt][t] = (mm[tt] == -INFINITY || M == -INFINITY) ? 0.0f : exp2f(mm[tt] - M);
+                    }
                 }
             } else {
                 for (int tt = 0; tt < ntile; tt++) {
