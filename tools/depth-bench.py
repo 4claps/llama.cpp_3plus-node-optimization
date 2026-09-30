@@ -112,6 +112,8 @@ def main():
     ap.add_argument("--extra-chars", type=int, default=0,
                     help="restore mode: insert this many characters of corpus text before the question, "
                          "to time prefill at the snapshot's depth (~4100 chars is ~1k tokens)")
+    ap.add_argument("--ub", type=int, default=0, help="override the server's -ub (default 1024)")
+    ap.add_argument("--mmdev", default="", help="device for the vision encoder, e.g. CUDA1 (server -mmdev)")
     ap.add_argument("--graphs", default="3", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 3, single-token graphs only)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--fill", metavar="DIR")
@@ -122,6 +124,10 @@ def main():
     slot_dir = a.fill or a.restore
 
     args = list(SERVER_ARGS)
+    if a.ub:
+        args[args.index("-ub") + 1] = str(a.ub)
+    if a.mmdev:
+        args += ["-mmdev", a.mmdev]
     if a.server_n_max:
         args[args.index("--spec-draft-n-max") + 1] = str(a.server_n_max)
     if a.server_p_min >= 0:

@@ -35,6 +35,17 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
+    // compact causal mask: I32 [n_tokens] of kept-prefix lengths (llama_kv_cache::kq_mask_prefix)
+    if (cparams.flash_attn && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn)) {
+        ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_tokens, 1, 1, 1);
+        ggml_set_input(res);
+        ggml_set_name(res, "attn_inp_kq_mask");
+        // the full mask's ne[0] is what makes graph reuse notice a changed n_kv (the K/V views depend
+        // on it); the compact one carries n_kv here instead
+        res->op_params[0] = (int32_t) n_kv;
+        return res;
+    }
+
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
@@ -53,6 +64,12 @@ static bool can_reuse_kq_mask(
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    const bool compact = cparams.flash_attn && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn);
+    if (compact || kq_mask->type == GGML_TYPE_I32) {
+        return compact && kq_mask->type == GGML_TYPE_I32 && kq_mask->ne[0] == n_tokens &&
+               kq_mask->op_params[0] == (int32_t) n_kv;
+    }
 
     bool res = true;
 

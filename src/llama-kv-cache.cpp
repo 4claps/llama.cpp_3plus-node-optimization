@@ -1866,6 +1866,78 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+bool llama_kv_cache::kq_mask_compact_static() const {
+    static const bool on = [] { const char * e = getenv("LLAMA_KQ_MASK_COMPACT"); return !e || atoi(e) != 0; }();
+    return on && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && v_cells.size() == 1;
+}
+
+bool llama_kv_cache::kq_mask_prefix(const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn, int32_t * L) const {
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+    if (!kq_mask_compact_static() || !causal_attn || ubatch->n_tokens == 0) {
+        return false;
+    }
+    const auto & cells = v_cells[0];
+    if (n_kv > cells.size()) {
+        return false;
+    }
+    const llama_pos * cpos = cells.pos_data();
+    const bool is_2d = ubatch->is_pos_2d();
+
+    // The mask keeps cell j for token (p, x, y) iff pos_j >= 0 && pos_j <= p, and with M-RoPE not
+    // (pos_j == p && (y_j, x_j) > (y, x)) (set_input_kq_mask_impl). If the used cells come first, in
+    // non-decreasing position and, within one position, strictly increasing (y, x), every kept set
+    // is a prefix of the cells.
+    uint32_t n_used = 0;
+    while (n_used < n_kv && cpos[n_used] >= 0) {
+        if (n_used > 0 && cpos[n_used] < cpos[n_used - 1]) {
+            return false;
+        }
+        if (n_used > 0 && is_2d && cpos[n_used] == cpos[n_used - 1]) {
+            const auto & a = cells.ext_get(n_used - 1);
+            if (!cells.ext_get(n_used).is_2d_gt(a.x, a.y)) {
+                return false;
+            }
+        }
+        n_used++;
+    }
+    for (uint32_t j = n_used; j < n_kv; ++j) {
+        if (cpos[j] >= 0) {
+            return false;
+        }
+    }
+
+    const uint32_t n_tokens = ubatch->n_tokens;
+    int64_t L0 = 0;
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        if (ubatch->n_seq_id[t] != 1) {
+            return false;
+        }
+        const llama_pos p  = ubatch->pos[t];
+        const llama_pos * lo = std::lower_bound(cpos, cpos + n_used, p);
+        const llama_pos * hi = std::upper_bound(cpos, cpos + n_used, p);
+        int64_t Lt = hi - cpos;
+        if (is_2d && hi > lo) {
+            const llama_pos py = ubatch->pos[t + n_tokens];
+            const llama_pos px = ubatch->pos[t + n_tokens*2];
+            Lt = lo - cpos;
+            while (cpos + Lt < hi && !cells.ext_get((uint32_t) Lt).is_2d_gt(px, py)) {
+                Lt++;
+            }
+        }
+        if (t == 0) {
+            L0 = Lt;
+        } else if (Lt != L0 + t) {
+            return false;
+        }
+        if (L != nullptr) {
+            L[t] = (int32_t) Lt;
+        }
+    }
+    return true;
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2751,6 +2823,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+    reserve = true;
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2876,7 +2949,50 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (dst->type == GGML_TYPE_I32) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        GGML_ASSERT(dst->ne[0] == (int64_t) ubatch->n_tokens);
+        if (!kv->kq_mask_prefix(ubatch, n_kv, causal_attn, (int32_t *) dst->data)) {
+            GGML_ABORT("compact KQ mask chosen at graph build no longer holds");
+        }
+        static const bool dbg = getenv("LLAMA_KQ_MASK_DEBUG") != nullptr;
+        if (dbg) {
+            // compare with the full mask the normal path would have written
+            ggml_tensor tmp = *dst;
+            std::vector<ggml_fp16_t> full((size_t) n_kv*ubatch->n_tokens);
+            tmp.type = GGML_TYPE_F16; tmp.ne[0] = n_kv; tmp.ne[1] = ubatch->n_tokens; tmp.ne[2] = 1; tmp.ne[3] = 1;
+            tmp.nb[0] = 2; tmp.nb[1] = 2*n_kv; tmp.nb[2] = tmp.nb[1]*tmp.ne[1]; tmp.nb[3] = tmp.nb[2];
+            tmp.data = full.data();
+            kv->set_input_kq_mask(&tmp, ubatch, causal_attn);
+            const int32_t * L = (const int32_t *) dst->data;
+            int bad = 0;
+            for (uint32_t t = 0; t < ubatch->n_tokens; ++t) {
+                for (uint32_t j = 0; j < n_kv; ++j) {
+                    const bool keep = ggml_fp16_to_fp32(full[(size_t) t*n_kv + j]) == 0.0f;
+                    if (keep != ((int32_t) j < L[t]) && bad++ < 5) {
+                        fprintf(stderr, "KQMASK mismatch t %u j %u keep %d L %d\n", t, j, keep, L[t]);
+                    }
+                }
+            }
+            fprintf(stderr, "KQMASK n_kv %u n_tokens %u L0 %d Llast %d pos0 %d bad %d\n", n_kv, ubatch->n_tokens, L[0],
+                L[ubatch->n_tokens - 1], ubatch->pos[0], bad);
+        }
+        return;
+    }
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::kq_mask_compact(const llama_ubatch & ubatch, bool causal_attn) const {
+    // decode and MTP verify (a few tokens) keep the full mask: their mask is small, and their kernels
+    // would need it expanded on the GPU
+    static const uint32_t n_min = [] { const char * e = getenv("LLAMA_KQ_MASK_COMPACT_MIN"); return e ? (uint32_t) atoi(e) : 32u; }();
+    if (ubatch.n_tokens < n_min) {
+        return false;
+    }
+    if (reserve) {
+        return kv->kq_mask_compact_static() && causal_attn;
+    }
+    return kv->kq_mask_prefix(&ubatch, n_kv, causal_attn, nullptr);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

@@ -8783,3 +8783,32 @@ Idle per pass 148 -> 55-69 ms (the rest is GPU1's lag). KLD vs the unpaired base
 quantization floor): bit-exact. PPL 2.6099, FLASH_ATTN_EXT 3/3, tg128 ABBA 31.89 vs 31.87 (decode
 never takes these paths). 260k prefill 122.7/126.0 t/s (unchanged).
 Also tried: 128-thread 64x128 CTAs at 2/SM (k9): 13.1 vs 13.65 TFLOPS, reverted.
+
+## Attempt 248: compact causal KQ mask - KEPT (bit-exact; makes -ub 2048 fit at 262k with vision)
+
+The f16 KQ mask is [n_kv x n_tokens]: 512 MiB per GPU at 262144 cells and -ub 1024, 1 GiB at 2048, live
+for the whole graph (2/3 of the compute buffer), plus a host fill of n_kv*n_tokens entries and its H2D
+copy per ubatch. With one sequence, no SWA/ALiBi, and position-ordered cells (2-D order within equal
+M-RoPE positions), query t keeps exactly the first L_t cells, L_t = L_0 + t.
+- llama: llama_kv_cache::kq_mask_prefix() checks that cell by cell (O(n_kv) per ubatch) and returns L_t;
+  build_attn_inp_kq_mask then makes the mask I32 [n_tokens] (n_kv in op_params[0]: graph reuse relied on
+  the full mask's ne[0] to notice a changed n_kv). Ubatches under 32 tokens (decode, MTP verify) and
+  anything irregular keep the full mask. LLAMA_KQ_MASK_COMPACT=0: off; LLAMA_KQ_MASK_DEBUG=1 compares
+  every L_t with the full mask.
+- ggml: ggml_flash_attn_ext accepts an I32 mask (compact semantics).
+- CUDA: support/alloc/kernel choice are made on an equivalent f16 descriptor; the GEMM path reads a
+  staircase (B[k] = k-(nt-1) < L_0 ? 0 : -inf, row stride -1: nkv+nt halfs, same values at the same
+  (row, key)); other kernels get the full mask expanded in pool scratch (few queries or few keys).
+- First try was wrong (KLD 0.63): the compact reuse check ignored n_kv. Fixed as above.
+
+KLD vs the full-mask base: -0.000006 / max 0.000004 / top 100% (the base file's floor): bit-exact.
+Server, 262144 ctx, vision (mmproj on GPU0), MTP, 260k snapshot + 1479 tokens:
+
+| config | compute buffer | GPU0 min free | GPU1 min free | prefill at 260k |
+|---|---|---|---|---|
+| -ub 1024, full mask (before) | 756 MiB | 508 MiB | - | 122.7 / 126.0 |
+| -ub 2048, full mask | 1512 MiB | does not fit with vision on GPU0 | | |
+| -ub 2048, compact | 488 MiB | 732 MiB | 1346 MiB | 127.6 / 130.1 |
+Gates: PPL 2.6099, FLASH_ATTN_EXT 3/3; tg128 ABBA on cool cards 32.10 (compact on) vs 32.08 (off): decode
+unchanged (it never takes the compact path). depth-bench.py gained --ub and --mmdev (vision encoder
+device; -mmdev CUDA1 frees ~850 MiB on GPU0 if ever needed).

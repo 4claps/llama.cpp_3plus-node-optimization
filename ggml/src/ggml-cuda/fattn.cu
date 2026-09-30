@@ -6,6 +6,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include <vector>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -712,8 +713,48 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// Compact causal mask (I32 [nq], ggml_flash_attn_ext): query t keeps its first L_t keys. Every
+// kernel choice and size check below is made on the equivalent f16 [nkv x nq] mask descriptor, so
+// they answer exactly as for the full mask. The GEMM path reads the compact form directly
+// (fattn-gemm.cu); the other kernels get the full mask expanded into pool scratch, which is small
+// for them (few queries, or few keys).
+static bool fattn_mask_is_compact(const ggml_tensor * dst) {
+    return dst->src[3] != nullptr && dst->src[3]->type == GGML_TYPE_I32;
+}
+
+static void fattn_mask_f16_view(const ggml_tensor * dst, ggml_tensor & d2, ggml_tensor & m2, void * data) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    d2 = *dst;
+    m2 = *dst->src[3];
+    m2.type  = GGML_TYPE_F16;
+    m2.ne[0] = K->ne[1];
+    m2.ne[1] = Q->ne[1];
+    m2.ne[2] = 1;
+    m2.ne[3] = 1;
+    m2.nb[0] = sizeof(half);
+    m2.nb[1] = m2.nb[0]*m2.ne[0];
+    m2.nb[2] = m2.nb[1]*m2.ne[1];
+    m2.nb[3] = m2.nb[2];
+    m2.data  = data;
+    d2.src[3] = &m2;
+}
+
+static __global__ void fattn_mask_expand(const int32_t * __restrict__ L, half * __restrict__ M, const int64_t nkv) {
+    const int64_t t = blockIdx.y;
+    const int32_t l = L[t];
+    for (int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; j < nkv; j += (int64_t) gridDim.x*blockDim.x) {
+        M[t*nkv + j] = j < l ? __float2half(0.0f) : __float2half(-INFINITY);
+    }
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    if (fattn_mask_is_compact(dst)) {
+        ggml_tensor d2, m2;
+        fattn_mask_f16_view(dst, d2, m2, nullptr);
+        return ggml_cuda_flash_attn_ext_get_alloc_size(device, &d2);
+    }
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -768,8 +809,32 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (fattn_mask_is_compact(dst)) {
+        ggml_tensor d2, m2;
+        fattn_mask_f16_view(dst, d2, m2, nullptr);
+        if (ggml_cuda_fa_gemm_enabled() && ggml_cuda_flash_attn_ext_gemm_supported(&d2) &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA) {
+            ggml_cuda_flash_attn_ext_gemm(ctx, dst);   // reads the compact mask itself
+            return;
+        }
+        const int64_t nkv = m2.ne[0];
+        const int64_t nq  = m2.ne[1];
+        ggml_cuda_pool_alloc<half> full(ctx.pool(), nkv*nq);
+        fattn_mask_expand<<<dim3((unsigned) std::min<int64_t>((nkv + 255)/256, 256), (unsigned) nq), 256, 0, ctx.stream()>>>(
+            (const int32_t *) dst->src[3]->data, full.get(), nkv);
+        CUDA_CHECK(cudaGetLastError());
+        m2.data = full.get();
+        ggml_cuda_flash_attn_ext_dispatch(ctx, &d2);
+        return;
+    }
+    ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     // cuBLAS-GEMM attention for pre-Volta. On Pascal the tile kernel runs at 18.6%
     // of peak while cuBLAS reaches 13-15 TFLOPS at these same shapes; attention is ~86% of
@@ -805,5 +870,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (fattn_mask_is_compact(dst)) {
+        ggml_tensor d2, m2;
+        fattn_mask_f16_view(dst, d2, m2, nullptr);
+        return ggml_cuda_get_best_fattn_kernel(device, &d2) != BEST_FATTN_KERNEL_NONE;
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

@@ -37,6 +37,36 @@
 #include <mutex>
 #include <vector>
 
+// A compact causal mask (I32 [nt], ggml_flash_attn_ext) keeps the first L_t keys of query t, with
+// L_t = L_0 + t (llama_kv_cache::kq_mask_prefix). That f16 mask is a staircase: row t, key j is
+// 0 iff j - t < L_0. So one vector B[k] = (k - (nt-1) < L_0 ? 0 : -inf), read with a row stride of
+// -1 from B + nt - 1, gives every kernel below exactly the values of the full [nkv x nt] mask at the
+// same (row, key) positions, in nkv + nt halfs instead of nkv*nt.
+static __global__ void fattn_gemm_mask_stair(const int32_t * __restrict__ L, half * __restrict__ B, const int64_t n, const int64_t nt) {
+    const int64_t k = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (k < n) {
+        B[k] = k - (nt - 1) < (int64_t) L[0] ? __float2half(0.0f) : __float2half(-INFINITY);
+    }
+}
+
+struct fattn_gemm_mask_view {
+    const half * data;
+    int64_t      s;      // row stride in halfs (may be negative)
+};
+
+static fattn_gemm_mask_view fattn_gemm_mask_get(const ggml_tensor * mask, const int64_t nt, const int64_t nkv,
+        ggml_cuda_pool_alloc<half> & stair, cudaStream_t stream) {
+    if (mask->type != GGML_TYPE_I32) {
+        return { (const half *) mask->data, (int64_t) (mask->nb[1]/sizeof(half)) };
+    }
+    const int64_t n = nkv + nt - 1;
+    stair.alloc(n);
+    fattn_gemm_mask_stair<<<(n + 255)/256, 256, 0, stream>>>((const int32_t *) mask->data, stair.get(), n, nt);
+    CUDA_CHECK(cudaGetLastError());
+    return { stair.get() + (nt - 1), -1 };
+}
+
+
 // Precision, chosen at runtime.
 //
 //   default -- COMPUTE_16F for both GEMMs: fp16 scores and probabilities, and an fp16 PV partial
@@ -1087,9 +1117,11 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
 
     const int64_t dst_s1 = dst->nb[1]/sizeof(float);
     const int64_t dst_s2 = dst->nb[2]/sizeof(float);
-    const int64_t s_mask = mask->nb[1]/sizeof(half);
+    ggml_cuda_pool_alloc<half> mask_stair(pool);
+    const fattn_gemm_mask_view mview = fattn_gemm_mask_get(mask, nt, nkv, mask_stair, stream);
+    const int64_t s_mask = mview.s;
 
-    fattn_gemm_mask_first_nz<256><<<nt, 256, 0, stream>>>((const half *) mask->data, mask_first.ptr, s_mask, (int) nkv);
+    fattn_gemm_mask_first_nz<256><<<nt, 256, 0, stream>>>(mview.data, mask_first.ptr, s_mask, (int) nkv);
     CUDA_CHECK(cudaGetLastError());
 
     // GGML_CUDA_FA_DUMP=dir (diagnostic): for calls with >= GGML_CUDA_FA_DUMP_MIN_NKV keys (default
@@ -1191,7 +1223,7 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
                 fa_fold_dequant<<<dim3((npairs + kpb - 1)/kpb, nz, 1), kpb*nb, 0, stream>>>(
                     (const char *) K->data + s*K->nb[3], (const char *) V->data + s*V->nb[3],
                     K16.ptr, Vp.ptr, K->nb[1], K->nb[2], V->nb[1], V->nb[2], (int) D, g, (int) C);
-                fa_fold_qk2<<<dim3(ntile, (N + BN - 1)/BN, nz), 256, 0, stream>>>(K16.ptr, Qf16.ptr, (const half *) mask->data,
+                fa_fold_qk2<<<dim3(ntile, (N + BN - 1)/BN, nz), 256, 0, stream>>>(K16.ptr, Qf16.ptr, mview.data,
                     mask_first.ptr, s_mask, P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g);
                 fa_oracle_max<<<dim3((N + 127)/128, nhkv, 1), 128, 0, stream>>>(mt.ptr, Mq.ptr, (int) N, (int) C, ntile, (int) nsplit, (int) nz);
                 CUDA_CHECK(cudaGetLastError());
@@ -1213,7 +1245,7 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
             }
             {
                 const dim3 grid(ntile, (N + BN - 1)/BN, nz);
-                fa_fold_qk2<<<grid, 256, 0, stream>>>(K16.ptr, Qf16.ptr, (const half *) mask->data, mask_first.ptr, s_mask,
+                fa_fold_qk2<<<grid, 256, 0, stream>>>(K16.ptr, Qf16.ptr, mview.data, mask_first.ptr, s_mask,
                     P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g);
                 CUDA_CHECK(cudaGetLastError());
             }
@@ -1418,13 +1450,15 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     const int64_t dst_s1 = dst->nb[1]/sizeof(float);
     const int64_t dst_s2 = dst->nb[2]/sizeof(float);
-    const int64_t s_mask = mask->nb[1]/sizeof(half);
+    ggml_cuda_pool_alloc<half> mask_stair(pool);
+    const fattn_gemm_mask_view mview = fattn_gemm_mask_get(mask, nt, nkv, mask_stair, stream);
+    const int64_t s_mask = mview.s;
 
     // Where each mask row stops being zero; the mask is shared by every sequence and head.
     {
         dim3 grid(nt, 1, 1);
         fattn_gemm_mask_first_nz<256><<<grid, 256, 0, stream>>>(
-            (const half *) mask->data, mask_first.ptr, s_mask, (int) nkv);
+            mview.data, mask_first.ptr, s_mask, (int) nkv);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1555,11 +1589,11 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                     dim3 grid(nt, gqa, 1);
                     if (prec32) {
                         fattn_gemm_softmax<256, float><<<grid, 256, 0, stream>>>(
-                            S32.ptr, P32.ptr, (const half *) mask->data, mask_first.ptr,
+                            S32.ptr, P32.ptr, mview.data, mask_first.ptr,
                             m_state.ptr, l_state.ptr, corr.ptr, nkv_c, c, nt, s_mask, nkv_c*nt);
                     } else {
                         fattn_gemm_softmax<256, half><<<grid, 256, 0, stream>>>(
-                            S.ptr, P.ptr, (const half *) mask->data, mask_first.ptr,
+                            S.ptr, P.ptr, mview.data, mask_first.ptr,
                             m_state.ptr, l_state.ptr, corr.ptr, nkv_c, c, nt, s_mask, nkv_c*nt);
                     }
                     CUDA_CHECK(cudaGetLastError());
