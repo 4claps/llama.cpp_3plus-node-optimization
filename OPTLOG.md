@@ -8976,3 +8976,8 @@ puts blocks >= 4 MiB on 2 MiB-aligned memory advised MADV_HUGEPAGE (THP is in ma
 0 ms, copy 49 ms (the faults now land in the copy, 512x fewer). ~0.1 s per 262k prompt.
 depth-bench 260k (--n-predict 16, seed 1234): text identical for both questions, draft 12/12, 12/11;
 prompt 147.6 / 154.2 -> 147.5 / 155.3, and 148.8 / 154.8 in a second run (single runs move ~1%).
+
+## Attempt 264: pv2 tile factors computed at each fold (no fac table) + MAXTILE 32 (chunk 4096 possible) - REVERTED
+Bit-exact at chunk 2048 (faacc hash c7943e877361c33a). Real shape (faacc nq 1479, nkv 261632, I32 mask):
+chunk 4096 370.0 vs chunk 2048 373.8 ms/call (compiled): -1% for +~147 MB of P scratch per GPU at N 8874;
+and at chunk 2048 the per-fold factor work made the default slower (with SASS 368.3 vs 366.0). Reverted.
