@@ -8941,3 +8941,13 @@ So qk3 (257, 257b) is removed and facubin.py builds qk2 (capped at 128 regs, 443
 (800 -> 255). Real shape, ABBA: SASS off 370.0 / 370.6, on 365.5 / 366.5 ms/call (-1.2%).
 faacc output hash identical SASS 0/1 and f16/i32 mask (c7943e877361c33a, amp 4). faacc also caches its
 fp64 reference now (ref-*.bin; seconds per accuracy run instead of ~60 s).
+
+## Attempt 260: fa_fold_qk4 - qk2 with double-buffered smem (epilogue buffers inside the 32 KiB tiles) - REVERTED
+Bit-identical to qk2 (faacc hash c7943e877361c33a), but on the model's shape (fa-prof2.sh: faacc nq 1479,
+nkv 261632, I32 mask, nsys per kernel) slower: u2-style x2 unroll 194.7 ms (128 regs, 88 B stack spill),
+runtime buffer index 187.8 ms (16 B spill) vs qk2 183.6 ms. At 2 CTAs/SM the second CTA already covers the
+single buffer's barrier and the register cap can't hold the extra live state.
+Real-shape breakdown for the record: qk2 182 ms/call (main loop alone 165: the epilogue is ~9% here, not
+the 40% the test-backend-ops perf case suggested), pv2 181 ms/call. Server 260k prompt window (GPU0, nsys):
+fold attention ~6.0 s, fold GEMM 2.85 s (~13.5 TFLOPS in-model, the same efficiency as the attention
+kernels), idle ~0.18 s in the prompt (127 exchange waits ~1 ms each + one 47 ms gap), rest ~0.5 s.
