@@ -197,3 +197,8 @@ Harness: +1.6-2.4% GEMM, bit-identical by construction (bankfix.py renames regis
 - 254 KEPT: SwiGLU fused into the fold prescale (exact, +0.5%): pp2048 -ub 2048 ~500.5 in an interleaved A/B
   at 44-54C (off 498.0). 260k serving run: prompt 128.4 t/s, GPU0 min free 732 MiB (fit unchanged), no assert.
   Full suite (gate.sh --full) not yet run on 252-254. 260k: exact ceiling ~150-160; 200 needs non-exact math.
+- NEXT LEAD (op profile, GGML_CUDA_OP_PROFILE=2, pp2048 -ub 2048, warmup+run): fused:RMS_NORM n=24 [norm-N]
+  (delta-net gated output norm) = 452 ms / 96 calls = 4.7 ms each, 5.9% of op time, for ~25 MB of data.
+  Either it absorbs the chunked GDN's async work (GDN itself shows only 1.9 ms/call) or the fused norm
+  kernel is badly shaped for [128, 24, 2048]. Isolate with test-backend-ops perf / nsys first; if real, ~5%.
+  Top ops: fold GEMMs 5120x8704 40.8%, 8704x5120 21.7%, 5120x5120 9.6%, 3072x5120 7.8%.
