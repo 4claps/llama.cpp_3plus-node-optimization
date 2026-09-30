@@ -8844,3 +8844,11 @@ sums (empty warps = exact zeros); outputs use the same expressions. All six 256-
 (plain, mul, mul+add, scale, pair-scale, gate) try it first. GGML_CUDA_NORM_WARP=0: off.
 KLD vs base: -0.000006 / max 0.000004 / top 100% (bit-exact); test-backend-ops RMS_NORM passes.
 pp2048 -ub 2048 A/B/B/A single runs: 479.1 vs 474.6 (+0.9%). tg128 ABBA cool: 31.83 vs 31.82.
+
+## Attempt 251: tiled dim-0 concat for a transposed src1 (delta-net conv input) - KEPT (exact, small)
+
+conv_input = concat(conv_states, transpose(qkv_mixed), 0): the row-per-block kernel read src1 one row
+(20 KB) apart per thread: 0.6 ms per call, ~29 ms per pp2048 pass. concat_dim0_tiled: 32x32 shared
+tile, reads along src1's contiguous dim 1, writes along dst dim 0. GGML_CUDA_CONCAT_TILED=0: off.
+KLD -0.000006 / 0.000004 / 100% (exact); test-backend-ops CONCAT passes. pp2048 A/B/B/A (hot cards):
+472.1 vs 470.8 (+0.3%).
