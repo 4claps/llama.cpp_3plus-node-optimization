@@ -8852,3 +8852,13 @@ conv_input = concat(conv_states, transpose(qkv_mixed), 0): the row-per-block ker
 tile, reads along src1's contiguous dim 1, writes along dst dim 0. GGML_CUDA_CONCAT_TILED=0: off.
 KLD -0.000006 / 0.000004 / 100% (exact); test-backend-ops CONCAT passes. pp2048 A/B/B/A (hot cards):
 472.1 vs 470.8 (+0.3%).
+
+## Attempt 252: register-bank-fixed SASS for gemm_fold_kernel_u2 - KEPT (bit-exact, +1.2% pp2048)
+p100-handoff/tools/sass-gemm/u2cubin.py compiles each u2 instance (PAIR 0/1) alone for sm_60,
+renames registers over the HFMA2 block with bankfix.py (a permutation of names), reassembles, and
+writes ggml/src/ggml-cuda/gemm-fold-u2-sass.h. gemm_fold_launch_u2 loads it per device with
+cuModuleLoadData and falls back to the compiled kernel; GGML_CUDA_GEMM_FOLD_SASS=0 turns it off.
+Two-source same-bank HFMA2s: 813 -> 401 (PAIR 0), 807 -> 362 (PAIR 1); 255 regs both.
+tools/gate.sh runs `u2cubin.py --check` (header built from a different kernel text -> fail).
+KLD -0.000006 / 0.000004 / 100% (floor, exact). pp2048 -ub 2048 ABBA: off 487.3/482.8, on
+491.4/489.9 (485.1 -> 490.7, +1.2%). tg128 31.74 (unchanged).

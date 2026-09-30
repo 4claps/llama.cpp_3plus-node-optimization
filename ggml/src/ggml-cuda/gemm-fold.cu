@@ -29,7 +29,9 @@
 
 #include <unordered_map>
 #include <vector>
+#include <cuda.h>
 #include "convert.cuh"
+#include "gemm-fold-u2-sass.h"
 
 #include <algorithm>
 
@@ -418,6 +420,45 @@ static int ggml_cuda_gemm_fold_env(const char * name, int def) {
     return s ? atoi(s) : def;
 }
 
+// gemm_fold_kernel_u2 through its register-bank-fixed SASS (gemm-fold-u2-sass.h, built from this file's
+// kernel by p100-handoff/tools/sass-gemm/u2cubin.py): ptxas leaves ~40% of the HFMA2s with two
+// operands in one register bank; renaming registers removes most of those stalls without changing any
+// instruction. Loaded once per device; if it fails to load (or GGML_CUDA_GEMM_FOLD_SASS=0), the
+// compiled kernel runs instead.
+static void gemm_fold_launch_u2(const bool pair, const dim3 grid, cudaStream_t stream,
+        const half * W, const half * X, const float * cs, float * Y, int M, int N, int K, int64_t sy,
+        const half * W2, float * Y2, int Ms, int64_t sy2) {
+    static const bool sass_env = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD_SASS", 1) != 0;
+    static int        state[GGML_CUDA_MAX_DEVICES][2] = {};   // 0 not tried, 1 loaded, -1 unavailable
+    static CUfunction fn[GGML_CUDA_MAX_DEVICES][2]    = {};
+    if (sass_env) {
+        int dev = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        int & st = state[dev][pair];
+        if (st == 0) {
+            CUmodule mod;
+            const void * img  = pair ? (const void *) gemm_fold_u2_sass_1 : (const void *) gemm_fold_u2_sass_0;
+            const char * name = pair ? gemm_fold_u2_sass_name_1 : gemm_fold_u2_sass_name_0;
+            st = cuModuleLoadData(&mod, img) == CUDA_SUCCESS && cuModuleGetFunction(&fn[dev][pair], mod, name) == CUDA_SUCCESS ? 1 : -1;
+            if (st < 0) {
+                GGML_LOG_WARN("%s: bank-fixed u2 SASS unavailable, using the compiled kernel\n", __func__);
+            }
+        }
+        if (st > 0) {
+            void * args[] = {&W, &X, &cs, &Y, &M, &N, &K, &sy, &W2, &Y2, &Ms, &sy2};
+            if (cuLaunchKernel(fn[dev][pair], grid.x, grid.y, grid.z, 256, 1, 1, 0, stream, args, nullptr) != CUDA_SUCCESS) {
+                GGML_ABORT("cuLaunchKernel failed for the u2 SASS");
+            }
+            return;
+        }
+    }
+    if (pair) {
+        gemm_fold_kernel_u2<true><<<grid, 256, 0, stream>>>(W, X, cs, Y, M, N, K, sy, W2, Y2, Ms, sy2);
+    } else {
+        gemm_fold_kernel_u2<false><<<grid, 256, 0, stream>>>(W, X, cs, Y, M, N, K, sy, W2, Y2, Ms, sy2);
+    }
+}
+
 static int ggml_cuda_gemm_fold_mode() {
     // 0: off (cuBLAS), 1: on, fp32 outputs, 2: on, outputs rounded to f16 (keeps the f16 peer exchange)
     static const int v = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD", 2);
@@ -685,8 +726,8 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             W2 = w2_alloc.get();
         }
         const dim3 gp((M + M2 + BM - 1)/BM, (N + BN - 1)/BN);
-        gemm_fold_kernel_u2<true><<<gp, 256, 0, stream>>>(W16, X16, cs, Y, (int) (M + M2), N, K, sy,
-            W2, (float *) pt->data, (int) M, pt->nb[1]/sizeof(float));
+        gemm_fold_launch_u2(true, gp, stream, W16, X16, cs, Y, (int) (M + M2), (int) N, (int) K, sy,
+            W2, (float *) pt->data, (int) M, (int64_t) (pt->nb[1]/sizeof(float)));
         CUDA_CHECK(cudaGetLastError());
         gemm_fold_partner_done = true;
         return true;
@@ -745,7 +786,7 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             const int64_t n0 = xc.col[c], nc = xc.col[c + 1] - n0;
             const dim3 gc((M + BM - 1)/BM, (nc + BN - 1)/BN);
             if (u2) {
-                gemm_fold_kernel_u2<false><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy, nullptr, nullptr, 0, 0);
+                gemm_fold_launch_u2(false, gc, stream, W16, X16 + n0*K, cs + n0, Y + n0*sy, (int) M, (int) nc, (int) K, sy, nullptr, nullptr, 0, 0);
             } else {
                 gemm_fold_kernel<128, true><<<gc, 256, 0, stream>>>(W16, X16 + n0*K, cs + n0, Y + n0*sy, M, (int) nc, K, sy, nullptr);
             }
@@ -758,7 +799,7 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
 
     if (u2) {
-        gemm_fold_kernel_u2<false><<<grid, 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy, nullptr, nullptr, 0, 0);
+        gemm_fold_launch_u2(false, grid, stream, W16, X16, cs, Y, (int) M, (int) N, (int) K, sy, nullptr, nullptr, 0, 0);
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
