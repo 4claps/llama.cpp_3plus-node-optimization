@@ -8916,3 +8916,7 @@ store ~6 ms, reductions ~5 ms) each small, the rest latency (one CTA's epilogue 
 faacc vs fp64 (now with a cached fp64 reference, seconds per run): identical to qk2 (7.391e-6; 9.945e-5).
 test-backend-ops FLASH_ATTN_EXT q4_0 kv 4096/16384/65536 x nb 512/1024/2048: 6/6 OK.
 KLD vs the all-fp32 base (4 chunks, -ub 1024): 0.001183 / 98.852% (pv2 alone 0.001186 / 98.858%).
+- 257b: qk3 lane pairs swap a 4-key half so P goes out as 16-byte stores (same P): QK 303.9 -> 301.9 ms.
+  Diagnosis on qk3 (temporary builds): no exp2f 305.8 (no change), no P stores 285.6, no shuffles 302.4;
+  launch_bounds(256,1) 384.0. ~55 ms over the main-loop-only time stays unattributed (register pressure
+  at the 128 cap is the suspect).

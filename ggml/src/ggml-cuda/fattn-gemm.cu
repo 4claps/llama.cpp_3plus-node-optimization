@@ -981,6 +981,7 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk3(
     for (int j = 0; j < 8; j++) {
         const int c = fa_fold3_col(j);
         csum[j] = 0.0f;
+        uint2 pk[2];
 #pragma unroll
         for (int ih = 0; ih < 2; ih++) {
             half pp[4];
@@ -990,9 +991,18 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk3(
                 pp[q] = __float2half(p);
                 csum[j] += p;
             }
-            const int key = ih*64 + kg*4;
-            *(uint2 *) (Pb + ((key >> 5)*BN + c)*32 + (key & 31)) = *(const uint2 *) pp;
+            pk[ih] = *(const uint2 *) pp;
         }
+        // lane pairs (kg, kg^1) swap one 4-key half: the even lane then holds keys kg*4..+7 of the first
+        // 64, the odd lane keys 64 + (kg-1)*4..+7 of the second, each stored as one 16-byte write
+        const bool odd = kg & 1;
+        const uint2 snd = odd ? pk[0] : pk[1];
+        uint2 rcv;
+        rcv.x = __shfl_xor_sync(0xFFFFFFFF, snd.x, 1, 32);
+        rcv.y = __shfl_xor_sync(0xFFFFFFFF, snd.y, 1, 32);
+        const uint4 v = odd ? make_uint4(rcv.x, rcv.y, pk[1].x, pk[1].y) : make_uint4(pk[0].x, pk[0].y, rcv.x, rcv.y);
+        const int key = odd ? 64 + (kg - 1)*4 : kg*4;
+        *(uint4 *) (Pb + ((key >> 5)*BN + c)*32 + (key & 31)) = v;
 #pragma unroll
         for (int o = 1; o < 16; o <<= 1) {
             csum[j] += __shfl_xor_sync(0xFFFFFFFF, csum[j], o, 32);
