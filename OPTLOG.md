@@ -8889,3 +8889,14 @@ all-fp32 base (kld-fp32-0925, -ub 1024, 4 chunks) 0.001175 / top 98.876% (1024) 
 New exactness base for this build: /mnt/fast/p100-scratch/kld-c2048.bin (4 chunks, -c 4096, default -ub).
 Op profile at 262k: FLASH_ATTN 66.5% (fa_fold_qk2 326 ms + fa_fold_pv 318 ms per kv=262144 nb=2048 call,
 ~10 TFLOPS each at the op test's 1328 MHz = ~53% of fp16 peak; the fold GEMM runs ~88%).
+
+## Attempt 256: fa_fold_pv2 - PV with the u2 GEMM main loop - KEPT (PV -14%; better vs fp64)
+Same products, 128-key fp16 chains and fold points as fa_fold_pv; changes as u2 (238): offsets once,
+tile loop unrolled x2 with compile-time smem buffers, HMUL2 chain restart, fold as HADD2 -> f32 with no
+2^-112 scaling. The old scaled accumulator flushed (fast-math FTZ) every contribution below 2^-14 in real
+units; pv2 keeps them. GGML_CUDA_FA_PV2=0: fa_fold_pv.
+Op kv=262144 nb=2048 (fa-prof.sh, nsys): PV 301.8 -> 259.6 ms/call; op 10.42 -> 11.21 TFLOPS.
+faacc NMSE vs fp64 (pv -> pv2): 512x16384 amp1 7.391e-6 = ; amp4 9.962e-5 -> 9.945e-5; amp2 s2
+5.738e-5 -> 5.737e-5; amp8 s3 1.623e-4 -> 1.622e-4; 1024x8192 amp4 s4 8.541e-5 -> 8.534e-5 (maxabs
+equal/lower except amp4 s1 5.574e-2 -> 5.622e-2). Model KLD vs the all-fp32 base (4 chunks, -ub 1024):
+0.001172 / top 98.937% -> 0.001186 / 98.858% (within the ±0.000025 s.e.; the fp32 base is not fp64).
