@@ -8951,3 +8951,9 @@ Real-shape breakdown for the record: qk2 182 ms/call (main loop alone 165: the e
 the 40% the test-backend-ops perf case suggested), pv2 181 ms/call. Server 260k prompt window (GPU0, nsys):
 fold attention ~6.0 s, fold GEMM 2.85 s (~13.5 TFLOPS in-model, the same efficiency as the attention
 kernels), idle ~0.18 s in the prompt (127 exchange waits ~1 ms each + one 47 ms gap), rest ~0.5 s.
+
+## Attempt 261: gate/up pairing + weight prefetch at 262k (VRAM thresholds 1.5 GB / 1 GB -> 256 MiB) - REJECTED
+260k depth-bench back to back: thresholds lowered 141.3 / 146.6 t/s, GPU0 min free 536 MiB; shipped
+140.4 / 145.1 t/s, min free 792 MiB. ~+0.8% for ~256 MiB of GPU0 headroom: not worth it.
+Current build at 260k (vision, -ub 2048): 140.4 / 145.1 t/s (goal start: 126.4 / 131.6).
+KV split count on the real shape (faacc): split 1 365.1, 2 363.6/364.8, 4 363.3 ms/call: no change.
