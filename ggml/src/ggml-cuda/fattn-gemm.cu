@@ -1139,9 +1139,9 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
 
     cudaStream_t stream = ctx.stream();
 
-    // 1024 keys per chunk: 2048 was ~3% faster at 262k but held ~55 MiB more scratch per GPU, and
-    // GPU0's margin at full context is what limits the MTP draft head copy (OPTLOG 226)
-    static const int chunk_env  = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_CHUNK", 1024);
+    // 2048 keys per chunk: +2.2% prefill at 262k over 1024. OPTLOG 226 had cut it to 1024 for VRAM; the
+    // compact causal mask (OPTLOG 248) gave that back: GPU0 min free at 262k, vision, -ub 2048: 656 MiB
+    static const int chunk_env  = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_CHUNK", 2048);
     static const int nsplit_env = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD_SPLIT", 2);
     const int64_t nsplit = std::max(1, std::min(8, nsplit_env));
     const int64_t Lsp = ((nkv + nsplit - 1)/nsplit + TK - 1)/TK*TK;   // keys per split

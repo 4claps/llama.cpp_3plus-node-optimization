@@ -8879,3 +8879,13 @@ GLU kernel's expression. Saves the f32 GLU write + re-read per layer. Asserts th
 (ggml_can_fuse can't be used: it requires equal shapes; ggml_node_has_n_uses(i, 1) instead.)
 GGML_CUDA_FOLD_GLU=0: off. KLD -0.000006 / 0.000004 / 100% (floor, exact). pp2048 -ub 2048 ABBA:
 off 500.8/495.1, on 500.6/500.4 (498.0 -> 500.5). tg128 ABBA 31.30/31.28 both ways (decode unaffected).
+
+## Attempt 255: fold attention chunk 1024 -> 2048 keys (default) - KEPT (+2.2% at 262k, accuracy equal/better)
+OPTLOG 226 cut GGML_CUDA_FA_FOLD_CHUNK to 1024 for VRAM; the compact mask (248) gave that room back.
+260k depth-bench (vision, -ub 2048, 1479 new tokens), same session: chunk 1024 126.4/131.6 t/s, GPU0 min
+free 732 MiB; chunk 2048 129.3/134.3, min free 656 MiB. Not bit-exact (chunk merge order): KLD vs the
+all-fp32 base (kld-fp32-0925, -ub 1024, 4 chunks) 0.001175 / top 98.876% (1024) vs 0.001172 / 98.937%
+(2048); faacc vs fp64 (512 x 16384): amp 1 equal (7.391e-6), amp 4 9.969e-5 -> 9.962e-5.
+New exactness base for this build: /mnt/fast/p100-scratch/kld-c2048.bin (4 chunks, -c 4096, default -ub).
+Op profile at 262k: FLASH_ATTN 66.5% (fa_fold_qk2 326 ms + fa_fold_pv 318 ms per kv=262144 nb=2048 call,
+~10 TFLOPS each at the op test's 1328 MHz = ~53% of fp16 peak; the fold GEMM runs ~88%).
