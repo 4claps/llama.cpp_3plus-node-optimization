@@ -210,3 +210,18 @@ Harness: +1.6-2.4% GEMM, bit-identical by construction (bankfix.py renames regis
   RETRACTED 21:30: the "fused:RMS_NORM n=24" entry is the rms_norm*w*silu(z) fusion (ggml-cuda.cu ~4805), which
   runs the z-gate MUL_MAT inside it: ~64 GFLOP at ~14 TFLOPS = the 4.6 ms. Not a slow norm; it is GEMM time.
   So ~88% of the pass is fold GEMM; the remaining non-GEMM ops are each <3.5%.
+
+## 2026-09-30: goal "200 t/s at 260k" (exact math) - 131.6 -> ~155 t/s so far
+260k = depth-bench --restore, 1479 new tokens, vision, -ub 2048 (second question's prompt t/s).
+- 255 fold attention chunk 1024 -> 2048 (+2.2%; VRAM fine since the compact mask)
+- 256 fa_fold_pv2 (u2 main loop in PV): PV -14% at op level
+- 258/259 register-bank-fixed SASS for qk2 + pv2 (facubin.py; gate checks it), -1.2% on the real shape
+- 262 server: prompt checkpoints no longer save the MTP draft's whole KV (292 MiB, ~0.3 s x 2 per prompt): +5-6%
+- 263 checkpoint buffers without zero fill on huge pages: 100 -> 49 ms per checkpoint
+Rejected: qk3 (slower on the real shape), qk4 double buffer, pairing/prefetch at 262k (+0.8% for 256 MiB).
+FAST LOOPS: /mnt/fast/p100-scratch/fa-prof2.sh (per-kernel ms on the model's attention shape, 12 s);
+faacc (FAACC_TIME / FAACC_I32; accuracy vs a cached fp64 reference in seconds); depth-bench 260k ~60 s.
+The test-backend-ops FLASH_ATTN_EXT perf case misleads (random mask): don't tune on it.
+Where the ~9.6 s prompt goes (GPU0): fold attention ~5.9 s (qk2 182 + pv2 181 ms per call, ~13 TFLOPS,
+~70-75% of fp16 peak), fold GEMM 2.85 s (~13.5 TFLOPS), checkpoints 2 x 49 ms, MTP prompt pass 62 ms,
+4-token tail batch ~80 ms, exchange waits ~0.13 s, rest ~0.4 s.
