@@ -162,3 +162,21 @@ is needed per tile.
 - Open question: 260k measured 106 t/s but kernel rates predict ~150; the gap is outside the FA kernel
   (suspects: MTP draft prefill at -ubd 64 re-reading the full KV per 64 tokens, sustained clocks). Profile
   a depth run before more kernel work.
+
+## 2026-09-29: session summary (pp2048 -ub 2048: 437 -> ~482 t/s; 260k: ~123 -> ~130)
+
+Kept, all gated (exact = KLD at the base floor -0.000006 / 0.000004 / 100% unless noted):
+- 239 chunked delta net (KLD vs fp64 tied with the recurrence): +6.3%
+- 244-247 gate/up pairing, exchange-wait weight prefetch, high-priority copy stream, one-pass prescale: ~+2.8%
+- 248 compact causal KQ mask: -ub 2048 now fits at 262k with vision (GPU0 min free 732 MiB vs 508 at -ub 1024 before)
+- 249 fold-attention skip of fully masked tiles (exact); fold path at 0 context REJECTED (8-49x worse NMSE vs fp64)
+- 250 warp-per-row RMS norm (+0.9%), 251 tiled transposed concat (+0.3%)
+Rejected: k8/k9 GEMM variants, exchange splits, 2-stream chunks, side-stream prefetch.
+User rules added: -ub 2048 is the max; it must fit vision + 262k with headroom (now true).
+
+Next (in progress): register-bank-fixed SASS for gemm_fold_kernel_u2 (GEMM is 83% of the pass).
+Harness: +1.6-2.4% GEMM, bit-identical by construction (bankfix.py renames registers only).
+- generator: p100-handoff/tools/sass-gemm/u2cubin.py (writes ggml/src/ggml-cuda/gemm-fold-u2-sass.h; not run yet)
+- runtime loader + 3 launch sites: p100-handoff/wip/u2-sass-launch.patch (apply after generating the header)
+- then: KLD floor check, pp2048 A/B, tg check, commit. Also queued: SwiGLU fused into the down prescale (~0.5%).
+260k: attention is 64% of the time at ~11 TFLOPS; exact ceiling ~150-160, 200 is not reachable with exact math.
