@@ -8,7 +8,8 @@ conflict). A global permutation of register names changes no arithmetic: the out
 bit-identical by construction. This pass only moves *scalar* registers (never part of a 64/128-bit
 operand anywhere in the kernel) and prefers free registers, so vector alignment is untouched.
 
-usage: bankfix.py in.cuasm out.cuasm <loop start hex> <loop end hex>
+usage: bankfix.py in.cuasm out.cuasm <loop start hex> <loop end hex> [max registers, default 255]
+(the cap keeps a kernel's occupancy: e.g. 128 for two 256-thread CTAs per SM)
 """
 import re, sys
 from collections import defaultdict
@@ -118,7 +119,8 @@ def main():
                 if slot == 2:
                     acc.add(r)
     acc -= vec
-    free = [r for r in range(0, 255) if r not in used]
+    cap = int(sys.argv[5]) if len(sys.argv) > 5 else 255
+    free = [r for r in range(0, cap) if r not in used]
     pool = sorted(acc | set(free))
     print(f"accumulators to place: {len(acc)}; pool {len(pool)} (free {len(free)})")
 

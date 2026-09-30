@@ -33,6 +33,8 @@
 #include "convert.cuh"
 
 #include <cublas_v2.h>
+#include <cuda.h>
+#include "fattn-fold-sass.h"
 #include <algorithm>
 #include <mutex>
 #include <vector>
@@ -984,14 +986,15 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk3(
         uint2 pk[2];
 #pragma unroll
         for (int ih = 0; ih < 2; ih++) {
-            half pp[4];
+            float p[4];
 #pragma unroll
             for (int q = 0; q < 4; q++) {
-                const float p = exp2f(acc[ih*4 + q][j] - cmax[j]);
-                pp[q] = __float2half(p);
-                csum[j] += p;
+                p[q] = exp2f(acc[ih*4 + q][j] - cmax[j]);
+                csum[j] += p[q];
             }
-            pk[ih] = *(const uint2 *) pp;
+            const half2 p01 = __halves2half2(__float2half(p[0]), __float2half(p[1]));
+            const half2 p23 = __halves2half2(__float2half(p[2]), __float2half(p[3]));
+            pk[ih] = make_uint2(*(const uint32_t *) &p01, *(const uint32_t *) &p23);
         }
         // lane pairs (kg, kg^1) swap one 4-key half: the even lane then holds keys kg*4..+7 of the first
         // 64, the odd lane keys 64 + (kg-1)*4..+7 of the second, each stored as one 16-byte write
@@ -1464,6 +1467,37 @@ static int ggml_cuda_fa_fold_env(const char * name, int def) {
     return s ? atoi(s) : def;
 }
 
+// fa_fold_qk3 / fa_fold_pv2 through their register-bank-fixed SASS (fattn-fold-sass.h, built from the
+// fa_fold namespace by p100-handoff/tools/sass-gemm/facubin.py; bit-identical, only register names
+// differ). Loaded once per device; false (run the compiled kernel) if unavailable or GGML_CUDA_FA_SASS=0.
+static bool fa_fold_sass_launch(const int which, const dim3 grid, cudaStream_t stream, void ** args) {
+    static const bool on = ggml_cuda_fa_fold_env("GGML_CUDA_FA_SASS", 1) != 0;
+    static int        state[GGML_CUDA_MAX_DEVICES][2] = {};
+    static CUfunction fn[GGML_CUDA_MAX_DEVICES][2]    = {};
+    if (!on) {
+        return false;
+    }
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    int & st = state[dev][which];
+    if (st == 0) {
+        CUmodule mod;
+        const void * img  = which == 0 ? (const void *) fattn_fold_sass_qk3 : (const void *) fattn_fold_sass_pv2;
+        const char * name = which == 0 ? fattn_fold_sass_name_qk3 : fattn_fold_sass_name_pv2;
+        st = cuModuleLoadData(&mod, img) == CUDA_SUCCESS && cuModuleGetFunction(&fn[dev][which], mod, name) == CUDA_SUCCESS ? 1 : -1;
+        if (st < 0) {
+            GGML_LOG_WARN("%s: bank-fixed fold attention SASS unavailable, using the compiled kernel\n", __func__);
+        }
+    }
+    if (st < 0) {
+        return false;
+    }
+    if (cuLaunchKernel(fn[dev][which], grid.x, grid.y, grid.z, 256, 1, 1, 0, stream, args, nullptr) != CUDA_SUCCESS) {
+        GGML_ABORT("cuLaunchKernel failed for the fold attention SASS");
+    }
+    return true;
+}
+
 static bool ggml_cuda_fa_fold_usable(const ggml_tensor * dst) {
     static const int mode = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD", 1);
     const ggml_tensor * Q = dst->src[0];
@@ -1729,8 +1763,15 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
             {
                 const dim3 grid(ntile, (N + BN - 1)/BN, nz);
                 static const bool qk3 = ggml_cuda_fa_fold_env("GGML_CUDA_FA_QK3", 1) != 0;
-                (qk3 ? fa_fold_qk3 : fa_fold_qk2)<<<grid, 256, 0, stream>>>(K16.ptr, Qf16.ptr, mview.data, mask_first.ptr, s_mask,
-                    P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g, prefix);
+                const half * a_k = K16.ptr; const half * a_q = Qf16.ptr; const half * a_m = mview.data;
+                const float * a_mf = mask_first.ptr; int64_t a_sm = s_mask; half * a_p = P.ptr;
+                float * a_mt = mt.ptr; float * a_lt = lt.ptr; int a_D = (int) D, a_N = (int) N, a_nt = (int) nt, a_C = (int) C;
+                fa_fold_split a_g = g; bool a_pf = prefix;
+                void * args[] = {&a_k, &a_q, &a_m, &a_mf, &a_sm, &a_p, &a_mt, &a_lt, &a_D, &a_N, &a_nt, &a_C, &a_g, &a_pf};
+                if (!qk3 || !fa_fold_sass_launch(0, grid, stream, args)) {
+                    (qk3 ? fa_fold_qk3 : fa_fold_qk2)<<<grid, 256, 0, stream>>>(a_k, a_q, a_m, a_mf, a_sm,
+                        a_p, a_mt, a_lt, a_D, a_N, a_nt, a_C, a_g, a_pf);
+                }
                 CUDA_CHECK(cudaGetLastError());
             }
             if (oracle) {
@@ -1766,8 +1807,15 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
             {
                 const dim3 grid(DV/BM, (N + BN - 1)/BN, nz);
                 static const bool pv2 = ggml_cuda_fa_fold_env("GGML_CUDA_FA_PV2", 1) != 0;
-                (pv2 ? fa_fold_pv2 : fa_fold_pv)<<<grid, 256, 0, stream>>>(Vp.ptr, P.ptr, mt.ptr, lt.ptr, m_cur, m_nxt, l_state.ptr,
-                    O_cur, O_nxt, (int) DV, (int) N, (int) C, ntile, mask_first.ptr, (int) nt, g, prefix);
+                const half2 * a_v = Vp.ptr; const half * a_p = P.ptr; const float * a_mt = mt.ptr; const float * a_lt = lt.ptr;
+                const float * a_mi = m_cur; float * a_mo = m_nxt; float * a_l = l_state.ptr;
+                const float * a_oi = O_cur; float * a_oo = O_nxt; int a_DV = (int) DV, a_N = (int) N, a_C = (int) C, a_nti = ntile;
+                const float * a_mf = mask_first.ptr; int a_nt = (int) nt; fa_fold_split a_g = g; bool a_pf = prefix;
+                void * args[] = {&a_v, &a_p, &a_mt, &a_lt, &a_mi, &a_mo, &a_l, &a_oi, &a_oo, &a_DV, &a_N, &a_C, &a_nti, &a_mf, &a_nt, &a_g, &a_pf};
+                if (!pv2 || !fa_fold_sass_launch(1, grid, stream, args)) {
+                    (pv2 ? fa_fold_pv2 : fa_fold_pv)<<<grid, 256, 0, stream>>>(a_v, a_p, a_mt, a_lt, a_mi, a_mo, a_l,
+                        a_oi, a_oo, a_DV, a_N, a_C, a_nti, a_mf, a_nt, a_g, a_pf);
+                }
                 CUDA_CHECK(cudaGetLastError());
             }
             std::swap(O_cur, O_nxt);

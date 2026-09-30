@@ -25,6 +25,7 @@ if [ ! -f "$CORPUS" ]; then echo "missing gate corpus: $CORPUS" >&2; exit 2; fi
 # the prebuilt bank-fixed u2 GEMM SASS must match the u2 kernel source (repo layout only)
 if [ -f p100-handoff/tools/sass-gemm/u2cubin.py ]; then
     python3 p100-handoff/tools/sass-gemm/u2cubin.py --check || exit 1
+    python3 p100-handoff/tools/sass-gemm/facubin.py --check || exit 1
 fi
 
 stray=$(pgrep -f "$BIN/llama-" | wc -l)

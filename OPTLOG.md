@@ -8920,3 +8920,12 @@ KLD vs the all-fp32 base (4 chunks, -ub 1024): 0.001183 / 98.852% (pv2 alone 0.0
   Diagnosis on qk3 (temporary builds): no exp2f 305.8 (no change), no P stores 285.6, no shuffles 302.4;
   launch_bounds(256,1) 384.0. ~55 ms over the main-loop-only time stays unattributed (register pressure
   at the 128 cap is the suspect).
+
+## Attempt 258: register-bank-fixed SASS for fa_fold_qk3 / fa_fold_pv2 - KEPT (bit-identical, op -2%)
+p100-handoff/tools/sass-gemm/facubin.py (as u2cubin.py): cuts namespace fa_fold, compiles each kernel alone
+(the others demoted to __device__), renames registers with bankfix.py (now in the repo, with a register cap:
+qk3 stays at 128 for 2 CTAs/SM) and writes ggml/src/ggml-cuda/fattn-fold-sass.h; loaded with
+cuModuleLoadData, GGML_CUDA_FA_SASS=0 = compiled kernels; gate.sh runs `facubin.py --check`.
+Same-bank HFMA2 source pairs: qk3 460 -> 406 (cap-limited), pv2 800 -> 255.
+Op kv=262144 nb=2048: qk3 301.9 -> 296.5, pv2 257.6 -> 251.7 ms; op 11.67 -> 11.87 TFLOPS.
+faacc output hash identical SASS=0/1 (amp 1: 19359a4d291dfa42, amp 4: 763d529cfbd26bdd).
