@@ -9000,3 +9000,7 @@ Same trick as 266 on gemm_fold_kernel_u2: same-bank source pairs after bankfix 4
 (PAIR 0 / 1; j-outer alone 216 / 209, swap alone 402 / 361). KLD vs the previous build (4 chunks): -0.000008 /
 0.000004 / 100% (the 4-chunk floor: exact). pp2048 -ub 2048 ABBA: old 513.2 / 509.4, new 515.8 / 512.7 t/s.
 0-context pp2048 now reads 510-516 t/s at 37-49 C (the earlier 500 goal clears).
+- 268 (diagnosis, nothing kept): pv2 main loop alone 170.8 vs full 183.9 ms/call compiled (prologue + O update
+  ~7%); all three GEMM-style loops (qk2, pv2, u2) sit at ~75% of fp16 peak in the main loop. Partial k2
+  unroll in qk2 (to test instruction-cache pressure): unroll 4 187.0, unroll 8 184.9 vs full 182.0: not it.
+  260k end to end after 266/267: 147.3 / 154.7 t/s, text identical (both kernel gains ~1%, inside run noise).
