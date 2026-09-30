@@ -225,3 +225,14 @@ The test-backend-ops FLASH_ATTN_EXT perf case misleads (random mask): don't tune
 Where the ~9.6 s prompt goes (GPU0): fold attention ~5.9 s (qk2 182 + pv2 181 ms per call, ~13 TFLOPS,
 ~70-75% of fp16 peak), fold GEMM 2.85 s (~13.5 TFLOPS), checkpoints 2 x 49 ms, MTP prompt pass 62 ms,
 4-token tail batch ~80 ms, exchange waits ~0.13 s, rest ~0.4 s.
+
+### 2026-09-30 wrap-up (goal: 200 t/s at 260k, exact math)
+Now: 260k prompt ~147 / 155 t/s (1st / 2nd question; goal start 126.4 / 131.6). 0 context pp2048 -ub 2048:
+510-516 t/s (was ~500). Text identical to the pre-change server on both 260k questions (seed 1234).
+Since the last note: 266 qk2 j-outer/b-first (bit-identical, QK -2.3%), 267 same for u2 GEMM (bit-identical,
++0.6% pp2048). Diagnosis: all three GEMM-style loops (qk2, pv2, u2) run ~75% of fp16 peak; u2's loop has
+2714 issue-stall cycles per 2112 FP ops per warp (ptxas: 27 LDS.128 with 13-cycle stalls, HFMA2s on scoreboard
+barriers). Icache (partial unroll) ruled out. The remaining big lever is hand-scheduled SASS for the 8x8 HFMA2
+main loop (maxas-style); estimate +15-20% on attention + GEMM if it reaches ~90%.
+NOT DONE: tools/gate.sh was interrupted before PPL finished (tg + KLD vs fp32 checked by hand: tg128 33.35,
+KLD 0.001186); run ./tools/gate.sh and ./tools/gate.sh --full before merging.
