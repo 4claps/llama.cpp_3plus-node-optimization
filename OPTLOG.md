@@ -8870,3 +8870,12 @@ KLD floor (exact). pp2048 ABBAAB vs 252: 490.7 (252) vs 488.7 (swap). The model 
 reuse on operands read 2-3 instructions later (R76 at 0f90 -> 0fb8), so the cache persists past the
 next instruction and dropping those flags costs more than the swaps save. Warm vs cold cards moved
 single passes 487 -> 502; only same-session interleaved A/B means anything here.
+
+## Attempt 254: SwiGLU fused into the fold GEMM's activation prescale - KEPT (exact, +0.5% pp2048)
+A split SWIGLU whose only use is the next MUL_MAT is skipped when that matmul will take the fold path
+(ggml_cuda_mul_mat_is_cublas_f16 mirrors the dispatcher's routing; ggml_cuda_gemm_fold_glu_ok the fold's
+shape checks); gemm_fold_prescale_v<NV, GLU=true> reads gate and up and evaluates silu(g)*u with the
+GLU kernel's expression. Saves the f32 GLU write + re-read per layer. Asserts the handoff is consumed.
+(ggml_can_fuse can't be used: it requires equal shapes; ggml_node_has_n_uses(i, 1) instead.)
+GGML_CUDA_FOLD_GLU=0: off. KLD -0.000006 / 0.000004 / 100% (floor, exact). pp2048 -ub 2048 ABBA:
+off 500.8/495.1, on 500.6/500.4 (498.0 -> 500.5). tg128 ABBA 31.30/31.28 both ways (decode unaffected).

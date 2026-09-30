@@ -25,3 +25,12 @@ bool ggml_cuda_gemm_fold_take_partner_done();
 // (learned per device); the next fold matmul uses them if the weight pointer matches. Same dequant,
 // only earlier: it fills the exchange wait. GGML_CUDA_FOLD_PREFETCH=0: off.
 void ggml_cuda_gemm_fold_prefetch(ggml_backend_cuda_context & ctx);
+
+// SwiGLU fusion: for a split SwiGLU whose only consumer is the next node, a MUL_MAT that will take the
+// fold path (the caller also checks the dispatcher routes it to cuBLAS f16), glu_ok() is true; the
+// graph loop then skips the GLU and calls set_glu(glu), and the fold's prescale computes
+// silu(gate)*up itself (same expression as the GLU kernel: exact). glu_pending() after the MUL_MAT
+// must be false. GGML_CUDA_FOLD_GLU=0: off.
+bool ggml_cuda_gemm_fold_glu_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, const ggml_tensor * mm);
+void ggml_cuda_gemm_fold_set_glu(const ggml_tensor * glu);
+bool ggml_cuda_gemm_fold_glu_pending();
