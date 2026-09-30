@@ -194,3 +194,6 @@ Harness: +1.6-2.4% GEMM, bit-identical by construction (bankfix.py renames regis
 - NEXT: SwiGLU fused into the down-projection prescale (~0.4%, exact). Design issue found: the GLU node must
   only be skipped when the next MUL_MAT is sure to take gemm_fold_try (dispatcher picks cuBLAS/fold for this
   shape, but that must be decided at the GLU node, or materialize the GLU in every non-fold path).
+- 254 KEPT: SwiGLU fused into the fold prescale (exact, +0.5%): pp2048 -ub 2048 ~500.5 in an interleaved A/B
+  at 44-54C (off 498.0). 260k serving run: prompt 128.4 t/s, GPU0 min free 732 MiB (fit unchanged), no assert.
+  Full suite (gate.sh --full) not yet run on 252-254. 260k: exact ceiling ~150-160; 200 needs non-exact math.
