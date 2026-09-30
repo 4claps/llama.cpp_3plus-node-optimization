@@ -361,13 +361,15 @@ __global__ void __launch_bounds__(256, 1) gemm_fold_kernel_u2(
             const uint4 b1 = *(const uint4 *) &Bs[buf][k2][bo[k2 >> 2] + 64];
             const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
             const uint32_t b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+            // j outer and b in the first slot: the same chains (bit-identical), but ptxas then leaves ~210
+            // instead of ~380 same-bank source pairs after bankfix (OPTLOG 267)
 #pragma unroll
-            for (int i = 0; i < 8; i++) {
+            for (int j = 0; j < 8; j++) {
 #pragma unroll
-                for (int j = 0; j < 8; j++) {
+                for (int i = 0; i < 8; i++) {
                     const half2 ai = *(const half2 *) &a[i];
                     const half2 bj = *(const half2 *) &b[j];
-                    h[i][j] = k2 == 0 && restart ? __hmul2(ai, bj) : __hfma2(ai, bj, h[i][j]);
+                    h[i][j] = k2 == 0 && restart ? __hmul2(bj, ai) : __hfma2(bj, ai, h[i][j]);
                 }
             }
         }

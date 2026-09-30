@@ -8994,3 +8994,9 @@ accumulator names ptxas also uses as LDS.128 fragment destinations and 64-bit ma
 cannot move; qk2's main-loop efficiency (~77%) matched 1/(1 + conflict rate). Same variants on pv2: 255 ->
 247 conflicts, 181.6 -> 180.5..181.3 ms: noise, pv2 unchanged. bankfix.py: BANKFIX_WIDE=1 (also displace
 other scalar registers) added, no gain (300 -> 297), kept as an option.
+
+## Attempt 267: u2 fold GEMM loop j-outer, b-first - KEPT (bit-identical, +0.6% pp2048)
+Same trick as 266 on gemm_fold_kernel_u2: same-bank source pairs after bankfix 402 / 361 -> 214 / 207
+(PAIR 0 / 1; j-outer alone 216 / 209, swap alone 402 / 361). KLD vs the previous build (4 chunks): -0.000008 /
+0.000004 / 100% (the 4-chunk floor: exact). pp2048 -ub 2048 ABBA: old 513.2 / 509.4, new 515.8 / 512.7 t/s.
+0-context pp2048 now reads 510-516 t/s at 37-49 C (the earlier 500 goal clears).
