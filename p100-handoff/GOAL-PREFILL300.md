@@ -207,3 +207,6 @@ Harness: +1.6-2.4% GEMM, bit-identical by construction (bankfix.py renames regis
   Suspects: fused rms_norm+mul(+mul) with a strided/broadcast operand (gate z view) read uncoalesced, or a
   launch geometry that bypasses the warp-per-row path. Start: dump the fused node's srcs (ne/nb) and
   reproduce in test-backend-ops perf -o RMS_NORM.
+  RETRACTED 21:30: the "fused:RMS_NORM n=24" entry is the rms_norm*w*silu(z) fusion (ggml-cuda.cu ~4805), which
+  runs the z-gate MUL_MAT inside it: ~64 GFLOP at ~14 TFLOPS = the 4.6 ms. Not a slow norm; it is GEMM time.
+  So ~88% of the pass is fold GEMM; the remaining non-GEMM ops are each <3.5%.
