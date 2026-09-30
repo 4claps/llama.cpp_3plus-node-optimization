@@ -2404,7 +2404,14 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // A draft whose memory truncates at any position (a plain KV cache, e.g. the MTP head) needs no saved
+        // state: a restore ends in slot.mem.seq_rm(pos_next, -1) on both contexts, and the draft's entries
+        // below that position are the ones computed from the same tokens. PARTIAL_ONLY does not apply to a
+        // plain KV cache, so saving it wrote the whole cache (~292 MiB for the MTP head at 262k, ~0.3 s per
+        // checkpoint). The speculative-decoding checkpoints already skip it the same way.
+        if (ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 

@@ -8957,3 +8957,14 @@ kernels), idle ~0.18 s in the prompt (127 exchange waits ~1 ms each + one 47 ms 
 140.4 / 145.1 t/s, min free 792 MiB. ~+0.8% for ~256 MiB of GPU0 headroom: not worth it.
 Current build at 260k (vision, -ub 2048): 140.4 / 145.1 t/s (goal start: 126.4 / 131.6).
 KV split count on the real shape (faacc): split 1 365.1, 2 363.6/364.8, 4 363.3 ms/call: no change.
+
+## Attempt 262: server - prompt checkpoints skip the draft's state when it truncates by position - KEPT (+5-6% at 260k, exact)
+The 260k "prompt" time held ~0.8 s of context checkpoints: two per prompt (at the new user message and 4
+tokens before the end), each saving the target's recurrent state (149.6 MiB, ~100 ms) AND the MTP draft's
+state (291.6 MiB, 265-330 ms): LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY is ignored by a plain KV cache, so the
+draft's whole 262k single-layer cache was copied to host each time. A draft with seq_rm type PART needs no
+saved state (a restore ends in slot.mem.seq_rm(pos_next, -1) on both contexts; the speculative checkpoints
+already skip it the same way), so create_checkpoint no longer saves it.
+depth-bench 260k (vision, -ub 2048, --n-predict 16, seed 1234): prompt 139.9 / 145.1 -> 147.6 / 154.2 t/s;
+generated text identical for both questions (q1 restores a checkpoint: LCP 0.994), draft 12/12 and 12/11
+both ways. (Found with nsys: 229 MB D2H per GPU + ~3700 stream syncs between the prompt's last batch and decode.)
