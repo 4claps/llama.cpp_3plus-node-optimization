@@ -8929,3 +8929,15 @@ cuModuleLoadData, GGML_CUDA_FA_SASS=0 = compiled kernels; gate.sh runs `facubin.
 Same-bank HFMA2 source pairs: qk3 460 -> 406 (cap-limited), pv2 800 -> 255.
 Op kv=262144 nb=2048: qk3 301.9 -> 296.5, pv2 257.6 -> 251.7 ms; op 11.67 -> 11.87 TFLOPS.
 faacc output hash identical SASS=0/1 (amp 1: 19359a4d291dfa42, amp 4: 763d529cfbd26bdd).
+
+## Attempt 259: qk3 REVERTED (slower on the real shape); SASS now for qk2 + pv2 - KEPT
+The test-backend-ops perf case (kv 262144, nb 2048) is NOT representative: its mask sends every tile
+through the per-element mask path, where qk3's epilogue wins. On the model's shape qk3 is slower. New fast
+harness: /mnt/fast/p100-scratch/faacc (FAACC_TIME=reps FAACC_I32=1 ./faacc 1479 261632: the per-GPU
+in-model call with the compact prefix mask, ~9 s; reads 373 ms/call = the server's nsys 189 + 185 ms).
+  nq 1479, i32 mask: qk2 371.2, qk3 375.3; nq 2048: qk2 509.5, qk3 515.4 ms/call.
+Server nsys at 260k (32 calls/GPU): qk2 5926 ms vs qk3 6062 ms; pv2 SASS 5915 vs compiled 5932.
+So qk3 (257, 257b) is removed and facubin.py builds qk2 (capped at 128 regs, 443 -> 300 conflicts) + pv2
+(800 -> 255). Real shape, ABBA: SASS off 370.0 / 370.6, on 365.5 / 366.5 ms/call (-1.2%).
+faacc output hash identical SASS 0/1 and f16/i32 mask (c7943e877361c33a, amp 4). faacc also caches its
+fp64 reference now (ref-*.bin; seconds per accuracy run instead of ~60 s).

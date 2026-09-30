@@ -814,216 +814,6 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk2(
     }
 }
 
-// fa_fold_qk2 with each warp owning 16 whole query columns (lane: key group kg = lane & 15, column group
-// cg = lane >> 4): the per-column max and sum over the tile's 128 keys are 16-lane shuffles instead of
-// smem reductions behind CTA barriers, and P goes from registers straight to its [key/32][128][32]
-// blocks (16 lanes write 64 contiguous bytes of each column). Same products, chains, fold, logits and
-// exponentials as fa_fold_qk2; only the order of the 16 partial row sums (l_t) differs.
-// GGML_CUDA_FA_QK3=0: fa_fold_qk2.
-static __device__ __forceinline__ int fa_fold3_row(const int i) { return (i < 4 ? 0 : 64) + (threadIdx.x & 15)*4 + (i & 3); }
-static __device__ __forceinline__ int fa_fold3_col(const int j) {
-    return (threadIdx.x >> 5)*16 + (j < 4 ? 0 : 8) + ((threadIdx.x >> 4) & 1)*4 + (j & 3);
-}
-
-static __global__ void __launch_bounds__(256, 2) fa_fold_qk3(
-        const half * __restrict__ K16, const half * __restrict__ Q16,
-        const half * __restrict__ mask, const float * __restrict__ mask_first, const int64_t s_mask,
-        half * __restrict__ P, float * __restrict__ mt, float * __restrict__ lt,
-        const int D, const int N, const int nt, const int C, const fa_fold_split g, const bool prefix = false) {
-    __shared__ __align__(16) uint32_t As[BK2][BM];
-    __shared__ __align__(16) uint32_t Bs[BK2][BN];
-    __shared__ int colq[BN];
-
-    const int h   = blockIdx.z;
-    const int m0  = blockIdx.x*TK;
-    const int n0  = blockIdx.y*BN;
-    const int t   = threadIdx.x;
-    const int kg  = t & 15;
-    const int cb  = (t >> 5)*16 + ((t >> 4) & 1)*4;   // first column of this thread
-    const int nkv_c  = fa_fold_nkv_c(g, h, C);
-    const int kv_off = fa_fold_kv_off(g, h);
-
-    int cq = -1;
-    if (t < BN) {
-        const int n  = n0 + t;
-        const int tq = n < N ? n % nt : 0;
-        cq = n < N && (float) (kv_off + m0 + TK) > mask_first[tq] ? tq : -1;
-        colq[t] = cq;
-    }
-    const bool any_mask = __syncthreads_or(cq >= 0);
-    const bool ragged   = m0 + TK > nkv_c;
-
-    if (prefix) {
-        bool cskip = true;
-        if (t < BN) {
-            const int n = n0 + t;
-            cskip = n >= N || mask_first[n % nt] <= (float) (kv_off + m0);
-        }
-        if (__syncthreads_and(cskip)) {
-#pragma unroll
-            for (int ih = 0; ih < 2; ih++) {
-#pragma unroll
-                for (int k = 0; k < 4; k++) {
-                    const int idx = t + 256*k;
-                    const int kbl = idx >> 9;
-                    const int r   = (idx >> 2) & 127;
-                    *(uint4 *) (P + (((int64_t) (h*gridDim.y + blockIdx.y)*(C/32) + m0/32 + ih*2 + kbl)*BN + r)*32 + (idx & 3)*8) =
-                        make_uint4(0, 0, 0, 0);
-                }
-            }
-            if (t < BN && n0 + t < N) {
-                const int64_t o = ((int64_t) h*(C/TK) + blockIdx.x)*N + n0 + t;
-                mt[o] = -INFINITY;
-                lt[o] = 0.0f;
-            }
-            return;
-        }
-    }
-
-    const half * A = K16 + ((int64_t) h*C + m0)*D;
-    const half * B = Q16 + ((int64_t) (h / g.nsplit)*N + n0)*D;
-    const int nB = N - n0;
-
-    half2 hh[8][8];
-#pragma unroll
-    for (int i = 0; i < 8; i++) {
-#pragma unroll
-        for (int j = 0; j < 8; j++) {
-            hh[i][j] = make_half2(0.0f, 0.0f);
-        }
-    }
-    uint4 ra[2], rb[2];
-    auto gload = [&](const int k0) {
-#pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const int l = t + 256*i;
-            const int r = l >> 2;
-            const int c = l & 3;
-            ra[i] = *(const uint4 *) (A + (int64_t) r*D + k0 + c*8);
-            rb[i] = r < nB ? *(const uint4 *) (B + (int64_t) r*D + k0 + c*8) : make_uint4(0, 0, 0, 0);
-        }
-    };
-    const int nit = D / (2*BK2);
-    gload(0);
-    for (int it = 0; it < nit; it++) {
-        if (it > 0) {
-            __syncthreads();
-        }
-#pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const int l  = t + 256*i;
-            const int r  = l >> 2;
-            const int c  = l & 3;
-            const int rs = r ^ (c << 3);
-            As[c*4 + 0][rs] = ra[i].x; As[c*4 + 1][rs] = ra[i].y;
-            As[c*4 + 2][rs] = ra[i].z; As[c*4 + 3][rs] = ra[i].w;
-            Bs[c*4 + 0][rs] = rb[i].x; Bs[c*4 + 1][rs] = rb[i].y;
-            Bs[c*4 + 2][rs] = rb[i].z; Bs[c*4 + 3][rs] = rb[i].w;
-        }
-        __syncthreads();
-        if (it + 1 < nit) {
-            gload((it + 1)*2*BK2);
-        }
-#pragma unroll
-        for (int k2 = 0; k2 < BK2; k2++) {
-            const int   sw = (k2 >> 2) << 3;
-            const uint4 a0 = *(const uint4 *) &As[k2][(kg*4) ^ sw];
-            const uint4 a1 = *(const uint4 *) &As[k2][(64 + kg*4) ^ sw];
-            const uint4 b0 = *(const uint4 *) &Bs[k2][cb ^ sw];
-            const uint4 b1 = *(const uint4 *) &Bs[k2][(cb + 8) ^ sw];
-            const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-            const uint32_t b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
-#pragma unroll
-            for (int i = 0; i < 8; i++) {
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const half2 ai = *(const half2 *) &a[i];
-                    const half2 bj = *(const half2 *) &b[j];
-                    hh[i][j] = __hfma2(ai, bj, hh[i][j]);
-                }
-            }
-        }
-    }
-
-    float acc[8][8];
-    float cmax[8];
-#pragma unroll
-    for (int j = 0; j < 8; j++) {
-        cmax[j] = -FLT_MAX/2.0f;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            acc[i][j] = fold_h(hh[i][j]) * (0x1p114f*1.44269504088896341f);
-        }
-        if (any_mask || ragged) {
-            const int tq = colq[fa_fold3_col(j)];
-#pragma unroll
-            for (int i = 0; i < 8; i++) {
-                const int key = fa_fold3_row(i);
-                if (m0 + key >= nkv_c) {
-                    acc[i][j] = -INFINITY;
-                } else if (tq >= 0) {
-                    acc[i][j] += 1.44269504088896341f*__half2float(mask[(int64_t) tq*s_mask + kv_off + m0 + key]);
-                }
-            }
-        }
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            cmax[j] = fmaxf(cmax[j], acc[i][j]);
-        }
-#pragma unroll
-        for (int o = 1; o < 16; o <<= 1) {
-            cmax[j] = fmaxf(cmax[j], __shfl_xor_sync(0xFFFFFFFF, cmax[j], o, 32));
-        }
-        cmax[j] += 3.0f;   // FATTN_KQ_MAX_OFFSET (3 ln 2) in log2 units: every p <= 1/8
-    }
-
-    half * Pb = P + ((int64_t) (h*gridDim.y + blockIdx.y)*(C/32) + m0/32)*BN*32;
-    float csum[8];
-#pragma unroll
-    for (int j = 0; j < 8; j++) {
-        const int c = fa_fold3_col(j);
-        csum[j] = 0.0f;
-        uint2 pk[2];
-#pragma unroll
-        for (int ih = 0; ih < 2; ih++) {
-            float p[4];
-#pragma unroll
-            for (int q = 0; q < 4; q++) {
-                p[q] = exp2f(acc[ih*4 + q][j] - cmax[j]);
-                csum[j] += p[q];
-            }
-            const half2 p01 = __halves2half2(__float2half(p[0]), __float2half(p[1]));
-            const half2 p23 = __halves2half2(__float2half(p[2]), __float2half(p[3]));
-            pk[ih] = make_uint2(*(const uint32_t *) &p01, *(const uint32_t *) &p23);
-        }
-        // lane pairs (kg, kg^1) swap one 4-key half: the even lane then holds keys kg*4..+7 of the first
-        // 64, the odd lane keys 64 + (kg-1)*4..+7 of the second, each stored as one 16-byte write
-        const bool odd = kg & 1;
-        const uint2 snd = odd ? pk[0] : pk[1];
-        uint2 rcv;
-        rcv.x = __shfl_xor_sync(0xFFFFFFFF, snd.x, 1, 32);
-        rcv.y = __shfl_xor_sync(0xFFFFFFFF, snd.y, 1, 32);
-        const uint4 v = odd ? make_uint4(rcv.x, rcv.y, pk[1].x, pk[1].y) : make_uint4(pk[0].x, pk[0].y, rcv.x, rcv.y);
-        const int key = odd ? 64 + (kg - 1)*4 : kg*4;
-        *(uint4 *) (Pb + ((key >> 5)*BN + c)*32 + (key & 31)) = v;
-#pragma unroll
-        for (int o = 1; o < 16; o <<= 1) {
-            csum[j] += __shfl_xor_sync(0xFFFFFFFF, csum[j], o, 32);
-        }
-    }
-    if (kg == 0) {
-#pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const int n = n0 + fa_fold3_col(j);
-            if (n < N) {
-                const int64_t o = ((int64_t) h*(C/TK) + blockIdx.x)*N + n;
-                mt[o] = cmax[j] <= -FLT_MAX/8.0f ? -INFINITY : cmax[j];
-                lt[o] = csum[j];
-            }
-        }
-    }
-}
-
 // grid (DV/BM, ceil(N/BN), nhkv).  O_out = O_in*corr + sum_t exp(m_t - M) * V P_t
 static __global__ void __launch_bounds__(256, 1) fa_fold_pv(
         const half2 * __restrict__ Vp, const half * __restrict__ P,
@@ -1467,7 +1257,7 @@ static int ggml_cuda_fa_fold_env(const char * name, int def) {
     return s ? atoi(s) : def;
 }
 
-// fa_fold_qk3 / fa_fold_pv2 through their register-bank-fixed SASS (fattn-fold-sass.h, built from the
+// fa_fold_qk2 / fa_fold_pv2 through their register-bank-fixed SASS (fattn-fold-sass.h, built from the
 // fa_fold namespace by p100-handoff/tools/sass-gemm/facubin.py; bit-identical, only register names
 // differ). Loaded once per device; false (run the compiled kernel) if unavailable or GGML_CUDA_FA_SASS=0.
 static bool fa_fold_sass_launch(const int which, const dim3 grid, cudaStream_t stream, void ** args) {
@@ -1482,8 +1272,8 @@ static bool fa_fold_sass_launch(const int which, const dim3 grid, cudaStream_t s
     int & st = state[dev][which];
     if (st == 0) {
         CUmodule mod;
-        const void * img  = which == 0 ? (const void *) fattn_fold_sass_qk3 : (const void *) fattn_fold_sass_pv2;
-        const char * name = which == 0 ? fattn_fold_sass_name_qk3 : fattn_fold_sass_name_pv2;
+        const void * img  = which == 0 ? (const void *) fattn_fold_sass_qk2 : (const void *) fattn_fold_sass_pv2;
+        const char * name = which == 0 ? fattn_fold_sass_name_qk2 : fattn_fold_sass_name_pv2;
         st = cuModuleLoadData(&mod, img) == CUDA_SUCCESS && cuModuleGetFunction(&fn[dev][which], mod, name) == CUDA_SUCCESS ? 1 : -1;
         if (st < 0) {
             GGML_LOG_WARN("%s: bank-fixed fold attention SASS unavailable, using the compiled kernel\n", __func__);
@@ -1762,14 +1552,13 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
             }
             {
                 const dim3 grid(ntile, (N + BN - 1)/BN, nz);
-                static const bool qk3 = ggml_cuda_fa_fold_env("GGML_CUDA_FA_QK3", 1) != 0;
                 const half * a_k = K16.ptr; const half * a_q = Qf16.ptr; const half * a_m = mview.data;
                 const float * a_mf = mask_first.ptr; int64_t a_sm = s_mask; half * a_p = P.ptr;
                 float * a_mt = mt.ptr; float * a_lt = lt.ptr; int a_D = (int) D, a_N = (int) N, a_nt = (int) nt, a_C = (int) C;
                 fa_fold_split a_g = g; bool a_pf = prefix;
                 void * args[] = {&a_k, &a_q, &a_m, &a_mf, &a_sm, &a_p, &a_mt, &a_lt, &a_D, &a_N, &a_nt, &a_C, &a_g, &a_pf};
-                if (!qk3 || !fa_fold_sass_launch(0, grid, stream, args)) {
-                    (qk3 ? fa_fold_qk3 : fa_fold_qk2)<<<grid, 256, 0, stream>>>(a_k, a_q, a_m, a_mf, a_sm,
+                if (!fa_fold_sass_launch(0, grid, stream, args)) {
+                    fa_fold_qk2<<<grid, 256, 0, stream>>>(a_k, a_q, a_m, a_mf, a_sm,
                         a_p, a_mt, a_lt, a_D, a_N, a_nt, a_C, a_g, a_pf);
                 }
                 CUDA_CHECK(cudaGetLastError());
