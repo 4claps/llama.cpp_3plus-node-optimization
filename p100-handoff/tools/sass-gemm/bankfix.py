@@ -11,7 +11,7 @@ operand anywhere in the kernel) and prefers free registers, so vector alignment 
 usage: bankfix.py in.cuasm out.cuasm <loop start hex> <loop end hex> [max registers, default 255]
 (the cap keeps a kernel's occupancy: e.g. 128 for two 256-thread CTAs per SM)
 """
-import re, sys
+import os, re, sys
 from collections import defaultdict
 
 INS_RE = re.compile(r'^(\s*\[[^\]]*\]\s*/\*([0-9a-f]+)\*/\s*)(.*)$')
@@ -121,7 +121,12 @@ def main():
     acc -= vec
     cap = int(sys.argv[5]) if len(sys.argv) > 5 else 255
     free = [r for r in range(0, cap) if r not in used]
-    pool = sorted(acc | set(free))
+    pool = set(acc) | set(free)
+    if os.environ.get('BANKFIX_WIDE') == '1':
+        # also let accumulators take the place of any other scalar register (pointers, counters, ...): those
+        # move into the vacated accumulator registers, still a permutation of names
+        pool |= {r for r in used if r < cap and r not in vec}
+    pool = sorted(pool)
     print(f"accumulators to place: {len(acc)}; pool {len(pool)} (free {len(free)})")
 
     # greedy: place accumulators one at a time into the bank that adds the fewest conflicts

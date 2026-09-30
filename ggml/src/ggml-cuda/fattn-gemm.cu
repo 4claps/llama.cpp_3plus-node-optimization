@@ -699,13 +699,15 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk2(
             const uint4 b1 = *(const uint4 *) &sm.t.Bs[k2][(64 + tx*4) ^ sw];
             const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
             const uint32_t b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+            // j outer and b in the first slot: same products per chain (bit-identical), but ptxas then leaves
+            // 163 instead of 300 same-bank source pairs after bankfix (qk2 181.8 -> 177.7 ms on the model shape)
 #pragma unroll
-            for (int i = 0; i < 8; i++) {
+            for (int j = 0; j < 8; j++) {
 #pragma unroll
-                for (int j = 0; j < 8; j++) {
+                for (int i = 0; i < 8; i++) {
                     const half2 ai = *(const half2 *) &a[i];
                     const half2 bj = *(const half2 *) &b[j];
-                    hh[i][j] = __hfma2(ai, bj, hh[i][j]);
+                    hh[i][j] = __hfma2(bj, ai, hh[i][j]);
                 }
             }
         }

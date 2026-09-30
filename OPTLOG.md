@@ -8985,3 +8985,12 @@ and at chunk 2048 the per-fold factor work made the default slower (with SASS 36
   (8 partials per column instead of 16): 184.2 / 185.1 vs ~182-184 ms/call compiled. No gain.
 - Clocks at 260k (nvidia-smi read-only, 250 ms samples while busy): GPU0 1303 MHz median, GPU1 1290, both at
   the 175 W power cap (throttle 0x4 = SW power cap) but within 2% of max clock; 57-58 C.
+
+## Attempt 266: qk2 main loop j-outer with b in the first HFMA2 slot - KEPT (bit-identical, QK -2.3%)
+Same products in the same order per chain (faacc hash c7943e877361c33a), but ptxas allocates differently:
+same-bank source pairs after bankfix 300 -> 163 (i-outer swap 288; j-outer 180; j-outer + swap 163).
+Real shape (fa-prof2.sh): qk2 181.8 -> 177.7 ms/call. Diagnosis: most of qk2's leftover conflicts were on
+accumulator names ptxas also uses as LDS.128 fragment destinations and 64-bit mask addresses, which bankfix
+cannot move; qk2's main-loop efficiency (~77%) matched 1/(1 + conflict rate). Same variants on pv2: 255 ->
+247 conflicts, 181.6 -> 180.5..181.3 ms: noise, pv2 unchanged. bankfix.py: BANKFIX_WIDE=1 (also displace
+other scalar registers) added, no gain (300 -> 297), kept as an option.
