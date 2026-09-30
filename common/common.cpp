@@ -5,6 +5,10 @@
 #include "common.h"
 #include "fit.h"
 #include "log.h"
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2268,6 +2272,30 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+}
+
+void * common_ckpt_alloc(size_t n) {
+    constexpr size_t huge = (size_t) 2 << 20;
+    if (n < 2*huge) {
+        void * p = malloc(n);
+        if (p == nullptr) {
+            throw std::bad_alloc();
+        }
+        return p;
+    }
+    const size_t sz = (n + huge - 1)/huge*huge;
+    void * p = aligned_alloc(huge, sz);
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    madvise(p, sz, MADV_HUGEPAGE);   // advisory: ignored where transparent huge pages are off
+#endif
+    return p;
+}
+
+void common_ckpt_free(void * p) {
+    free(p);
 }
 
 void common_prompt_checkpoint::update_pos(

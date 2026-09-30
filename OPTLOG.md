@@ -8968,3 +8968,11 @@ already skip it the same way), so create_checkpoint no longer saves it.
 depth-bench 260k (vision, -ub 2048, --n-predict 16, seed 1234): prompt 139.9 / 145.1 -> 147.6 / 154.2 t/s;
 generated text identical for both questions (q1 restores a checkpoint: LCP 0.994), draft 12/12 and 12/11
 both ways. (Found with nsys: 229 MB D2H per GPU + ~3700 stream syncs between the prompt's last batch and decode.)
+
+## Attempt 263: checkpoint buffers without zero fill, on transparent huge pages - KEPT (checkpoint 100 -> 49 ms, exact)
+The target's checkpoint (149.6 MiB, twice per 262k prompt): std::vector resize (zero fill + ~38k 4 KiB page
+faults) 68 ms, state copy 31 ms. common_ckpt_buffer (common.h): an allocator that default-initializes and
+puts blocks >= 4 MiB on 2 MiB-aligned memory advised MADV_HUGEPAGE (THP is in madvise mode here): resize
+0 ms, copy 49 ms (the faults now land in the copy, 512x fewer). ~0.1 s per 262k prompt.
+depth-bench 260k (--n-predict 16, seed 1234): text identical for both questions, draft 12/12, 12/11;
+prompt 147.6 / 154.2 -> 147.5 / 155.3, and 148.8 / 154.8 in a second run (single runs move ~1%).
