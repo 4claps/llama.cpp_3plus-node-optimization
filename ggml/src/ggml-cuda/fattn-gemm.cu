@@ -583,7 +583,7 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk2(
         const half * __restrict__ K16, const half * __restrict__ Q16,
         const half * __restrict__ mask, const float * __restrict__ mask_first, const int64_t s_mask,
         half * __restrict__ P, float * __restrict__ mt, float * __restrict__ lt,
-        const int D, const int N, const int nt, const int C, const fa_fold_split g) {
+        const int D, const int N, const int nt, const int C, const fa_fold_split g, const bool prefix = false) {
     union smem_t {
         struct { uint32_t As[BK2][BM]; uint32_t Bs[BK2][BN]; } t;
         float red[16][BN];
@@ -613,6 +613,36 @@ static __global__ void __launch_bounds__(256, 2) fa_fold_qk2(
     // (under a causal mask only the diagonal chunk does; everything else takes the plain path)
     const bool any_mask = __syncthreads_or(cq >= 0);
     const bool ragged   = m0 + TK > nkv_c;
+
+    // prefix mask (compact causal): a key at or past mask_first[t] is masked for query t, so a tile
+    // whose first key is past every column's mask_first computes to exactly P = 0, m_t = -inf,
+    // l_t = 0 (see the end of this kernel). Write those without the GEMM.
+    if (prefix) {
+        bool cskip = true;
+        if (t < BN) {
+            const int n = n0 + t;
+            cskip = n >= N || mask_first[n % nt] <= (float) (kv_off + m0);
+        }
+        if (__syncthreads_and(cskip)) {
+#pragma unroll
+            for (int ih = 0; ih < 2; ih++) {
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const int idx = t + 256*k;
+                    const int kbl = idx >> 9;
+                    const int r   = (idx >> 2) & 127;
+                    *(uint4 *) (P + (((int64_t) (h*gridDim.y + blockIdx.y)*(C/32) + m0/32 + ih*2 + kbl)*BN + r)*32 + (idx & 3)*8) =
+                        make_uint4(0, 0, 0, 0);
+                }
+            }
+            if (t < BN && n0 + t < N) {
+                const int64_t o = ((int64_t) h*(C/TK) + blockIdx.x)*N + n0 + t;
+                mt[o] = -INFINITY;
+                lt[o] = 0.0f;
+            }
+            return;
+        }
+    }
 
     const half * A = K16 + ((int64_t) h*C + m0)*D;
     const half * B = Q16 + ((int64_t) (h / g.nsplit)*N + n0)*D;
@@ -788,7 +818,8 @@ static __global__ void __launch_bounds__(256, 1) fa_fold_pv(
         const float * __restrict__ mt, const float * __restrict__ lt,
         const float * __restrict__ m_in, float * __restrict__ m_out, float * __restrict__ l_state,
         const float * __restrict__ O_in, float * __restrict__ O_out,
-        const int DV, const int N, const int C, const int ntile) {
+        const int DV, const int N, const int C, const int ntile,
+        const float * __restrict__ mask_first = nullptr, const int nt = 0, const fa_fold_split g = {}, const bool prefix = false) {
     __shared__ __align__(16) fa_fold_tiles<true> sm;
     __shared__ float corr[BN];
     __shared__ float fac[MAXTILE][BN];   // exp(m_t - M) per tile and column
@@ -842,10 +873,26 @@ static __global__ void __launch_bounds__(256, 1) fa_fold_pv(
             acc[i][j] = 0.0f;
         }
     }
+    // prefix mask: tiles past this column block's last visible key hold P = 0 (fa_fold_qk2), and
+    // their factor is 0: stop before them (at least one tile, so the loop shape is unchanged)
+    int ntile_run = ntile;
+    if (prefix) {
+        __shared__ int kmax;
+        if (threadIdx.x == 0) {
+            kmax = 0;
+        }
+        __syncthreads();
+        if (threadIdx.x < BN && n0 + (int) threadIdx.x < N) {
+            atomicMax(&kmax, (int) mask_first[(n0 + threadIdx.x) % nt]);
+        }
+        __syncthreads();
+        const int vis = kmax - fa_fold_kv_off(g, h);   // visible keys of this chunk for the block
+        ntile_run = max(1, min(ntile, (vis + TK - 1)/TK));
+    }
     fa_fold_mainloop<true, TK/2, true>(sm,
         (const half *) (Vp + (int64_t) h*(C/2)*DV + m0), DV, BM,
         P + ((int64_t) h*gridDim.y + blockIdx.y)*C*BN, C, N - n0,
-        ntile*TK, acc, [&](int tt, float (&a)[8][8], half2 (&hh)[8][8]) {
+        ntile_run*TK, acc, [&](int tt, float (&a)[8][8], half2 (&hh)[8][8]) {
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const float f = fac[tt][fa_fold_col(j)];
@@ -1120,6 +1167,9 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_pool_alloc<half> mask_stair(pool);
     const fattn_gemm_mask_view mview = fattn_gemm_mask_get(mask, nt, nkv, mask_stair, stream);
     const int64_t s_mask = mview.s;
+    // compact mask: every row is a prefix, so fully masked tiles may be skipped (GGML_CUDA_FA_PREFIX_SKIP=0: off)
+    static const bool prefix_env = ggml_cuda_fa_fold_env("GGML_CUDA_FA_PREFIX_SKIP", 1) != 0;
+    const bool prefix = prefix_env && mask->type == GGML_TYPE_I32;
 
     fattn_gemm_mask_first_nz<256><<<nt, 256, 0, stream>>>(mview.data, mask_first.ptr, s_mask, (int) nkv);
     CUDA_CHECK(cudaGetLastError());
@@ -1246,7 +1296,7 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
             {
                 const dim3 grid(ntile, (N + BN - 1)/BN, nz);
                 fa_fold_qk2<<<grid, 256, 0, stream>>>(K16.ptr, Qf16.ptr, mview.data, mask_first.ptr, s_mask,
-                    P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g);
+                    P.ptr, mt.ptr, lt.ptr, (int) D, (int) N, (int) nt, (int) C, g, prefix);
                 CUDA_CHECK(cudaGetLastError());
             }
             if (oracle) {
@@ -1282,7 +1332,7 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
             {
                 const dim3 grid(DV/BM, (N + BN - 1)/BN, nz);
                 fa_fold_pv<<<grid, 256, 0, stream>>>(Vp.ptr, P.ptr, mt.ptr, lt.ptr, m_cur, m_nxt, l_state.ptr,
-                    O_cur, O_nxt, (int) DV, (int) N, (int) C, ntile);
+                    O_cur, O_nxt, (int) DV, (int) N, (int) C, ntile, mask_first.ptr, (int) nt, g, prefix);
                 CUDA_CHECK(cudaGetLastError());
             }
             std::swap(O_cur, O_nxt);
@@ -1323,7 +1373,8 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(const ggml_tensor * dst) {
         return false;
     }
     // Only worth it once attention dominates; short contexts keep the tile kernel.
-    if (Q->ne[1] < 128 || K->ne[1] < 4096) {
+    static const int64_t min_kv = [] { const char * e = getenv("GGML_CUDA_FA_GEMM_MINKV"); return e ? (int64_t) atoll(e) : (int64_t) 4096; }();
+    if (Q->ne[1] < 128 || K->ne[1] < min_kv) {
         return false;
     }
     float max_bias = 0.0f, logit_softcap = 0.0f;

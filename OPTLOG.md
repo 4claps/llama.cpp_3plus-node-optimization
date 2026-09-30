@@ -8812,3 +8812,24 @@ Server, 262144 ctx, vision (mmproj on GPU0), MTP, 260k snapshot + 1479 tokens:
 Gates: PPL 2.6099, FLASH_ATTN_EXT 3/3; tg128 ABBA on cool cards 32.10 (compact on) vs 32.08 (off): decode
 unchanged (it never takes the compact path). depth-bench.py gained --ub and --mmdev (vision encoder
 device; -mmdev CUDA1 frees ~850 MiB on GPU0 if ever needed).
+
+## Attempt 249: skip fully masked tiles in fold attention (prefix masks) - KEPT (exact); fold at 0 context - REJECTED (accuracy)
+
+With the compact mask (248) every row is a prefix, so a (key tile, query tile) of fa_fold_qk2 whose keys
+all start at or past each column's first masked key computes to exactly P = 0, m_t = -inf, l_t = 0: it
+now writes those without the GEMM, and fa_fold_pv stops at the block's last visible tile (>= 1).
+GGML_CUDA_FA_PREFIX_SKIP=0: off. KLD skip vs no-skip (fold forced at short context, 4 chunks):
+-0.000008 / max 0.000004 / top 100% = bit-exact. Only the diagonal chunk of a long-context ubatch
+benefits (small).
+
+Using the fold path at 0 context too (GGML_CUDA_FA_GEMM_MINKV=1024, new knob, default 4096 unchanged):
+pp2048 -ub 2048 +1.3% (479.9 vs 473.6), but op accuracy vs fp64 (new harness
+/mnt/fast/p100-scratch/faacc: the ggml CUDA op on D 256, 12/2 heads, q4_0, 2048x2048 causal, fp64
+reference from the same dequantized K/V):
+
+| query scale | tile kernel NMSE | fold path NMSE |
+|---|---|---|
+| 1 | 6.2e-7 | 4.8e-6 |
+| 3 | 7.4e-7 | 3.6e-5 |
+
+8-49x worse (consistent with attempt 151's "8x" for the long-context path). Not allowed as a new change.
