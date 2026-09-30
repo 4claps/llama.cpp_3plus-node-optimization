@@ -8904,3 +8904,15 @@ equal/lower except amp4 s1 5.574e-2 -> 5.622e-2). Model KLD vs the all-fp32 base
   PV 259.6 -> 257.6 ms. 260k depth-bench (vision, -ub 2048): 133.7 / 140.1 t/s (goal start 126.4 / 131.6),
   GPU0 min free 656 MiB. Chunk 1024 vs 2048 at op level: PV 275.2 vs 257.6 -> per-CTA fixed costs ~18 ms;
   the rest of PV's gap to u2 is the main loop (~72% of peak at the op test's 1328 MHz).
+
+## Attempt 257: fa_fold_qk3 - QK + softmax with warp-owned columns - KEPT (QK -5.4%, accuracy equal)
+Each warp owns 16 whole query columns (lane = key group kg + column group), so the tile's per-column max
+and row sum over 128 keys are 16-lane shuffles (no smem reductions, no CTA barriers after the main loop)
+and P is stored from registers (16 lanes write 64 contiguous bytes per column; no smem staging). Same
+products, chains, fold, logits and exponentials; only the combine order of the 16 partial l_t differs.
+GGML_CUDA_FA_QK3=0: fa_fold_qk2. Op kv=262144 nb=2048: QK 321.4 -> 303.9 ms; op 11.21 -> 11.57 TFLOPS.
+Diagnosis first (temporary builds): qk2 main loop alone 231 ms; the epilogue's pieces (exp2f ~5 ms, P
+store ~6 ms, reductions ~5 ms) each small, the rest latency (one CTA's epilogue leaves the SM to the other).
+faacc vs fp64 (now with a cached fp64 reference, seconds per run): identical to qk2 (7.391e-6; 9.945e-5).
+test-backend-ops FLASH_ATTN_EXT q4_0 kv 4096/16384/65536 x nb 512/1024/2048: 6/6 OK.
+KLD vs the all-fp32 base (4 chunks, -ub 1024): 0.001183 / 98.852% (pv2 alone 0.001186 / 98.858%).
