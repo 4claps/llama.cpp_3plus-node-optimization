@@ -202,3 +202,8 @@ Harness: +1.6-2.4% GEMM, bit-identical by construction (bankfix.py renames regis
   Either it absorbs the chunked GDN's async work (GDN itself shows only 1.9 ms/call) or the fused norm
   kernel is badly shaped for [128, 24, 2048]. Isolate with test-backend-ops perf / nsys first; if real, ~5%.
   Top ops: fold GEMMs 5120x8704 40.8%, 8704x5120 21.7%, 5120x5120 9.6%, 3072x5120 7.8%.
+  CONFIRMED 21:26: with GGML_CUDA_GDN_CHUNKED=0 the norm still reads 449.9 ms / 96 -> the fused norm chain itself
+  is slow (~4.7 ms for [128, 24, 2048]; memory time should be ~0.1-0.2 ms). Real target: ~5% of the pass.
+  Suspects: fused rms_norm+mul(+mul) with a strided/broadcast operand (gate z view) read uncoalesced, or a
+  launch geometry that bypasses the warp-per-row path. Start: dump the fused node's srcs (ne/nb) and
+  reproduce in test-backend-ops perf -o RMS_NORM.
