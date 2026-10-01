@@ -9004,3 +9004,17 @@ Same trick as 266 on gemm_fold_kernel_u2: same-bank source pairs after bankfix 4
   ~7%); all three GEMM-style loops (qk2, pv2, u2) sit at ~75% of fp16 peak in the main loop. Partial k2
   unroll in qk2 (to test instruction-cache pressure): unroll 4 187.0, unroll 8 184.9 vs full 182.0: not it.
   260k end to end after 266/267: 147.3 / 154.7 t/s, text identical (both kernel gains ~1%, inside run noise).
+- 269 (diagnosis + tooling, no kernel change kept), 09-30 evening, faacc model shape (nq 1479, nkv 261632):
+  - Ceiling: register-only HFMA2 microbench 17.9 TFLOPS (94% of 19.0 at 1328 MHz). An LDS-fed 8x8 half2
+    tile (2+2 LDS.128 per k2, fa_fold layout, no staging) gives 17.5-17.8 at both 2 and 1 CTA/SM
+    (sass-gemm/ubench-*.cu). qk2/pv2 run at 13.1-13.3 TFLOPS, so the main-loop pattern is NOT the cap.
+    The ~25% loss is around it: global->smem staging + barriers (pv2 with gload/sstore/sync removed:
+    164.6 vs ~184 ms, timing only, wrong output) and prologue/epilogue.
+  - Yield-flag removal + full .reuse post-pass (yieldreuse.py): conflicts qk2 328->276, pv2 322->256;
+    362.3 vs 363.5 ms, noise. Not kept. Bank conflicts are not the limiter either.
+  - LDS.128 S13 -> S02/S06: kernel faults. The S13 after LDS.128 is required on sm_60.
+  - Fold cost in pv2: ~0.5% (fold only once: 184.9 vs 185.9).
+  - Tooling: GGML_CUDA_FA_SASS_DIR loads qk2/pv2.cubin from a directory; facubin FACUBIN_DIR/FACUBIN_ONLY;
+    sass-gemm/fa-exp.sh = patch the fa_fold source, build the cubin, time on the model shape, ~40 s, no lib rebuild.
+  - Next: add the staging step to ubench-lds-tile.cu and find the cheapest structure that stays above ~16
+    TFLOPS (STS spread across the k2 loop, earlier LDG, fewer barriers), then port it to pv2/qk2/u2.

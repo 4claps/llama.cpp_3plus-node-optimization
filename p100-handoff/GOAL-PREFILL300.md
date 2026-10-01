@@ -236,3 +236,11 @@ barriers). Icache (partial unroll) ruled out. The remaining big lever is hand-sc
 main loop (maxas-style); estimate +15-20% on attention + GEMM if it reaches ~90%.
 NOT DONE: tools/gate.sh was interrupted before PPL finished (tg + KLD vs fp32 checked by hand: tg128 33.35,
 KLD 0.001186); run ./tools/gate.sh and ./tools/gate.sh --full before merging.
+
+## 09-30 evening (OPTLOG 269)
+- The main loop is not the cap: the same LDS-fed 8x8 HFMA2 tile runs at 17.5-17.8 TFLOPS in a microbench
+  (raw peak 17.9). The fold kernels run at 13.2, so about 25% is lost to staging, barriers and prologue/epilogue.
+  At 17 TFLOPS attention would take ~4.5 s instead of 5.8 s per 260k prompt.
+- Fast loop: `p100-handoff/tools/sass-gemm/fa-exp.sh TAG pv2 patch.py` (~40 s, no library rebuild).
+- Next step: extend ubench-lds-tile.cu with the staging (LDG->regs, STS, bar.sync per 16 k2) and find a cheap
+  structure, then port it.
