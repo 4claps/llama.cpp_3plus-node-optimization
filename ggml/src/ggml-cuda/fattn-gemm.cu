@@ -1276,7 +1276,16 @@ static bool fa_fold_sass_launch(const int which, const dim3 grid, cudaStream_t s
         CUmodule mod;
         const void * img  = which == 0 ? (const void *) fattn_fold_sass_qk2 : (const void *) fattn_fold_sass_pv2;
         const char * name = which == 0 ? fattn_fold_sass_name_qk2 : fattn_fold_sass_name_pv2;
-        st = cuModuleLoadData(&mod, img) == CUDA_SUCCESS && cuModuleGetFunction(&fn[dev][which], mod, name) == CUDA_SUCCESS ? 1 : -1;
+        // GGML_CUDA_FA_SASS_DIR (development): load qk2.cubin / pv2.cubin from a directory instead
+        const char * dir = getenv("GGML_CUDA_FA_SASS_DIR");
+        CUresult r;
+        if (dir) {
+            const std::string path = std::string(dir) + (which == 0 ? "/qk2.cubin" : "/pv2.cubin");
+            r = cuModuleLoad(&mod, path.c_str());
+        } else {
+            r = cuModuleLoadData(&mod, img);
+        }
+        st = r == CUDA_SUCCESS && cuModuleGetFunction(&fn[dev][which], mod, name) == CUDA_SUCCESS ? 1 : -1;
         if (st < 0) {
             GGML_LOG_WARN("%s: bank-fixed fold attention SASS unavailable, using the compiled kernel\n", __func__);
         }
