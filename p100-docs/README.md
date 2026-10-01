@@ -11,20 +11,20 @@ It tracks upstream by merging. The last merge was upstream `f46bc30cb`
 
 | | upstream at the fork point | this fork |
 |---|---|---|
-| decode, `tg256` (no MTP) | 17.51 t/s | **31.2 t/s** |
+| decode, `tg256` (no MTP) | 17.51 t/s | **32.6 t/s** |
 | decode with MTP, 2k context | — | **52 t/s** |
 | decode with MTP, 260k context | — | **28-34 t/s** |
-| prefill at 260k context | — | **100 t/s** |
-| perplexity (gate corpus, `-c 4096`) | — | **2.6096** |
+| prefill at 260k context (vision loaded) | — | **153 t/s** |
+| perplexity (gate corpus, `-c 4096`) | — | **2.6101** |
 
 [QUICKSTART.md](QUICKSTART.md) has the full table from 2k to 260k and the exact server command.
 
 The speed didn't cost accuracy. The P100 multiplies in fp16 at twice its fp32 rate, and this fork
 uses that everywhere the work is compute-bound (prefill matmuls, the MTP verify matvec, decode and
 verify attention), but never accumulates long sums in fp16: partial sums move into fp32 every few
-dozen values. Against an all-fp32 run, the prefill path now reads KLD 0.00122 where upstream's fp16
+dozen values. Against an all-fp32 run, the prefill path now reads KLD 0.00119 where upstream's fp16
 cuBLAS reads 0.00152, and fp32 itself scatters 0.0006-0.001 just from summing in a different order.
-Perplexity 2.6096, all-fp32 2.6095. [CHANGES.md §11](CHANGES.md) has the method.
+Perplexity 2.6101, all-fp32 2.6095; at this size perplexity can't separate them, KLD can. [CHANGES.md §11](CHANGES.md) has the method.
 
 ## Documents
 

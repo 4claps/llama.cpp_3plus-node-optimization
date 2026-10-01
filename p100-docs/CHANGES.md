@@ -233,8 +233,9 @@ loss of accuracy. OPTLOG 223-228.
 | launch fusions: residual ADD into RMS_NORM+MUL, delta-net gate and l2 norms, alpha/beta matvec epilogues, conv-state CONCAT+CPY, gated norm | bit-identical; ~330 fewer launches per verify pass |
 | host: fusion-check cache, 1-token attention inside the single-token CUDA graphs | draft-step enqueue 0.61 -> 0.45 ms |
 
-`qwen-server` keeps `-ub 2048` for text only and switches to `-ub 1024` with `--mmproj`: with the
-draft head and the fold scratch, `-ub 2048` plus the vision projector leaves GPU0 162 MiB at 262k. Tried and reverted: CUDA graphs for the verify
+`qwen-server` kept `-ub 2048` for text only and switched to `-ub 1024` with `--mmproj`: with the
+draft head and the fold scratch, `-ub 2048` plus the vision projector left GPU0 162 MiB at 262k
+(§14's compact mask removed that limit). Tried and reverted: CUDA graphs for the verify
 (slower, +100 MiB), register prefetch in the big matvec (slower).
 
 ## 13. Ideas from other projects, round 3 (2026-09-26)
@@ -254,6 +255,50 @@ width identical to every printed digit, full op suite 16324/16324 on both GPUs. 
 build, ABBA through the server: MTP cycle time 2k 56.6 -> 53.8 ms (-5%), 260k 90.1 -> 84.3 ms (-6%),
 prefill unchanged within noise (these changes don't touch prefill). Draft top-p
 (`LLAMA_SPEC_DRAFT_TOPP`) is available but showed no gain.
+
+## 14. Prefill, round 4 (2026-09-27 to 10-01)
+
+Goal: prefill at 260k toward 200 t/s, exact math only (no sparse or approximate attention).
+OPTLOG 236-272; `p100-handoff/GOAL-PREFILL300.md` has the analysis.
+
+| commit | change | effect | math |
+|---|---|---|---|
+| `1f92a1b48` | overlap the prefill tensor-parallel exchange with the matmul, in token chunks | pp2048 +4.5% | bit-identical |
+| `01f08ae73` | fold GEMM with cheaper bookkeeping | pp2048 +8.5% | same math |
+| `77e05601d` | chunked gated delta net for prefill | pp2048 +3.8% | KLD vs fp64 tied with the recurrence |
+| `4f261d20b` | fill the exchange wait with the next weights' dequant; gate/up paired; one-pass prescale | pp2048 ~465 -> ~478 | bit-exact |
+| `9f7b27a8f` | **compact causal KQ mask**: per-row prefix lengths instead of an n_kv x n_tokens f16 mask | `-ub 2048` now fits at 262k with vision (GPU0 732 MiB free, measured with the desktop on it) | bit-exact |
+| `26fc1e193` | fold attention skips fully masked tiles | | exact |
+| `c5d1110a2`, `dd24ec3b8` | warp-per-row RMS norm for short rows; tiled concat for the delta-net conv input | +0.9%, +0.3% | bit-exact |
+| `6339691f2`, `e7d85e3b5` | fold GEMM: register-bank-fixed SASS (`gemm-fold-u2-sass.h`), j-outer loop | +1.2%, +0.6% | bit-identical |
+| `cceb8641e` | SwiGLU fused into the fold GEMM's activation prescale | +0.5% | exact |
+| `a740e7c76` | fold attention in 2048-key chunks | 260k prefill +2.2% | KLD vs fp32 0.001175 -> 0.001172 |
+| `030210e2b`, `838b87d51` | `fa_fold_pv2`: PV on the fold GEMM's main loop | PV -14% at 262k | NMSE vs fp64 equal or better |
+| `05aa500bb`, `cda08dde0` | bank-fixed SASS for the fold attention kernels (`fattn-fold-sass.h`); QK loop j-outer | -1.2%, QK -2.3% | bit-identical |
+| `c704addc5`, `4fd8612ed` | server: prompt checkpoints skip the draft's state when it truncates by position; checkpoint buffers without zero fill, on huge pages | 260k prompt +5-6%; checkpoint 100 -> 49 ms | output identical |
+| `188086d8e`, `526106acd` | pin the MTP output buffer once at setup, not inside the first prompt | first 260k question ~148 -> ~153 t/s | host only |
+
+`tools/gate.sh` now also checks that both SASS headers match their kernel source
+(`u2cubin.py --check`, `facubin.py --check`).
+
+Against the 2026-09-26 release, same session, both with vision loaded:
+
+| | 09-26 release | this build |
+|---|---|---|
+| prefill at 260k, 1479-token prompt (1st / 2nd question) | 120 / 124 t/s (`-ub 1024`) | 153 / 155 t/s (`-ub 2048`) |
+| `pp2048` at 0 context, `-ub 2048` | 385 t/s | 493 t/s |
+| GPU0 free at 262k | 508 MiB | 792 MiB |
+| KLD vs fp32, mean / max (4 chunks) | 0.001215 / 0.134 | 0.001186 / 0.115 |
+| same top token as fp32 | 98.80% | 98.86% |
+
+The release can't run `-ub 2048` with vision at 262k (GPU0 ran out), so it is shown at its
+shipped `-ub 1024`. A fill from empty to 260k drops from about 23.5 to about 18.5 minutes
+(estimated from the depth curve, not timed end to end).
+
+**What limits it now.** The three big prefill kernels (fold GEMM, QK, PV) run at the cards' 175 W
+power cap, not at an instruction limit: at the cap the clock settles at ~1290 MHz and they reach
+~13 TFLOPS. Removing yields or bank conflicts doesn't help, because the cost is energy per flop.
+At that cap, an estimated ~176 t/s is the ceiling at 260k with exact math.
 
 ## Known gaps
 

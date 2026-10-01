@@ -18,13 +18,15 @@ built-in MTP head. Build first: see [BUILD.md](BUILD.md).
       --jinja --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 \
       --host 0.0.0.0 --port 8080
 
-**With vision:** the same command, plus the projector, with the ubatch lowered to 1024:
+**With vision:** the same command, plus the projector:
 
-      --mmproj /path/to/mmproj-Qwen3.8-27B-Q8_0.gguf -ub 1024
+      --mmproj /path/to/mmproj-Qwen3.8-27B-Q8_0.gguf
 
 ## What to expect
 
-Prefill, and decode with MTP, at each context depth:
+Prefill, and decode with MTP, at each context depth. This sweep was measured on the 2026-09-26
+release. The current build is faster at every depth; at 260k, prefill is now **~153 t/s** with
+vision loaded (1479-token prompt, `-ub 2048`), where the same test on the 09-26 release read 120 t/s.
 
 | depth | prefill | decode |
 |---|---|---|
@@ -52,7 +54,7 @@ creative writing. Cards that have been under sustained load read ~5-10% lower.
 | `-c 262144` | the model's full context. Reserving it costs nothing until it fills |
 | `-np 1` | one server slot. Each slot allocates its own full KV cache |
 | `-b 32768` | **needed for MTP at long context.** A larger batch turns a long prompt into one huge batch, and draft acceptance collapses |
-| `-ub 2048` / `-ub 1024` | tokens per GPU pass. 2048 for text (faster prefill); 1024 with vision, which needs the VRAM headroom |
+| `-ub 2048` | tokens per GPU pass. 2048 is the fastest prefill that still leaves VRAM headroom at 262k, with or without vision |
 | `--spec-type draft-mtp` | speculative decoding with the model's built-in MTP head |
 | `--spec-draft-n-max 4 --spec-draft-p-min 0.2` | draft up to 4 tokens; stop below 20% confidence. Use 3 if you mostly work past ~150k context |
 | `-ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0` | the draft layer on the GPU, with its own small ubatch and a q4_0 cache. Without `-ubd 64` the draft runs out of memory at full context |
@@ -68,9 +70,8 @@ tighter card because the vision projector loads onto it.
 
 | configuration | GPU0 free at full context |
 |---|---|
-| text only, `-ub 2048` | ~1.1 GiB (estimated) |
-| vision, `-ub 1024` | ~1 GiB |
-| vision, `-ub 2048` | ~0.5 GiB: too tight |
+| text only, `-ub 2048` | ~1.7 GiB (estimated: the vision figure plus the projector's ~600 MiB) |
+| vision, `-ub 2048` | ~1.1 GiB (measured 732-792 MiB with ~392 MiB of desktop streaming also on GPU0) |
 
 VRAM use grows as the context fills, so check it with a full prompt, not a short one. If GPU0
 also drives a display or runs other programs, subtract what they use. Lowering `-ub` is the

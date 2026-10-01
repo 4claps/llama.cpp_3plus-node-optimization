@@ -9044,3 +9044,13 @@ Same trick as 266 on gemm_fold_kernel_u2: same-bank source pairs after bankfix 4
   get_tensor calls, sync-latency bound, 157 MB moved in 14 ms of DMA); the first question also pays
   147 ms for cuBLAS lazy-loading maxwell_sgemm_128x64_tn (fp32 K/V projection). Each remaining non-kernel
   item is <=1-2%. The checkpoint split at n-4 is upstream behaviour (PR 20288), left as is.
+
+## 273 — gate before merge (2026-10-01)
+
+`tools/gate.sh --full` on HEAD of goal/prefill300: tg256 **32.58 +/- 0.16** (cold, 34/32 C),
+PPL **2.6101 +/- 0.01982** (in band; same as earlier gate runs on this branch), full op suite
+**16324/16324** on both GPUs, both SASS headers current. KLD vs the fp32 base (4 chunks): 0.001186,
+against 0.001215 for the 09-26 release, and identical to the previous commits.
+Docs (README, bundle-README, QUICKSTART, CHANGES §14) updated; qwen-server keeps `-ub 2048` with
+vision (compact mask, attempt 248: GPU0 732-792 MiB free at 262k with the desktop on it).
+`/mnt/fast/p100-scratch/build-stock` is not stock: it is fork commit d886a5eb9 (pp2048 355 t/s).

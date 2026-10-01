@@ -52,11 +52,10 @@ cat > "$BIN/qwen-server" <<'EOF'
 #     2048 137.43 t/s  25.53 t/s     0.98058        757 MiB
 # +15% prefill for identical acceptance and decode at the time. The margin is the thing to watch:
 # run163 died from a 136 MiB swing in other GPU use.
-# -ub depends on vision since 2026-09-26. With the fold prefill attention's scratch (OPTLOG 225)
-# and the MTP draft head copy (OPTLOG 226, ~112 MiB per GPU), -ub 2048 plus --mmproj leaves GPU0
-# 162 MiB free at 262k, which does not fit; -ub 1024 plus --mmproj keeps 620-646 MiB. Text only
-# has the projector's ~600 MiB back, so it keeps -ub 2048 for faster prefill. The wrapper picks
-# 1024 when --mmproj is among the arguments; an explicit -ub still wins.
+# From 2026-09-26 to 10-01 the wrapper dropped to -ub 1024 with --mmproj: -ub 2048 plus the projector
+# left GPU0 162 MiB at 262k (OPTLOG 225, 226). The compact causal mask (OPTLOG 248) removed the
+# n_kv x ubatch f16 mask, and -ub 2048 with vision now keeps GPU0 at 732-792 MiB at 262k, the
+# same margin text-only had before. So -ub 2048 always; an explicit -ub still wins.
 # See OPTLOG attempts 165, 169, 171 and 229.
 # -ubd 64 is strictly faster than 256 (23.03 vs 21.43). -ctkd/-ctvd q4_0 put the draft KV cache
 # at 151 MB instead of 537 and cost nothing measurable: acceptance 0.58170 vs 0.58361 for f16.
@@ -82,7 +81,6 @@ MODEL="${QWEN_MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}"
 
 UB=2048
 MCP=()
-for a in "$@"; do [ "$a" = "--mmproj" ] && UB=1024; done
 [ -f "$HOME/mcp-servers.json" ] && MCP=(--mcp-servers-config "$HOME/mcp-servers.json")
 
 LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" export LD_LIBRARY_PATH
