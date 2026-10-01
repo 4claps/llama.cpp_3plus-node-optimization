@@ -9018,3 +9018,11 @@ Same trick as 266 on gemm_fold_kernel_u2: same-bank source pairs after bankfix 4
     sass-gemm/fa-exp.sh = patch the fa_fold source, build the cubin, time on the model shape, ~40 s, no lib rebuild.
   - Next: add the staging step to ubench-lds-tile.cu and find the cheapest structure that stays above ~16
     TFLOPS (STS spread across the k2 loop, earlier LDG, fewer barriers), then port it to pv2/qk2/u2.
+  - UPDATE (same session): the ubench ceilings above used zero data. With pv2-style staging (LDG->STS,
+    bar.sync per 16 k2, 1 CTA/SM, ubench-staged-tile.cu) it's 17.2 TFLOPS on zeros, but 15.4 TFLOPS on
+    random fp16 (AMP 0.01 or 1): the card sits at the 175 W cap (throttle 0x4) at 1189 MHz. HFMA2 power is
+    data-dependent. The real ceiling is ~15.4, and qk2/pv2 at 13.2 are ~86% of it. Remaining headroom:
+    ~15% on attention (~0.8 s of 9.6 s at 260k), less on u2. Energy per FMA (fewer extra instructions and
+    LDS/STS, fewer conflicts) now matters as much as issue slots, because a lower-power kernel clocks higher.
+    Power-bound estimate for 260k at 175 W: attention 76 TFLOP / 15.4 = 4.9 s, GEMM 2.6 s, rest 0.9 s ->
+    ~8.4 s per 1479 tokens, ~176 t/s.

@@ -244,3 +244,7 @@ KLD 0.001186); run ./tools/gate.sh and ./tools/gate.sh --full before merging.
 - Fast loop: `p100-handoff/tools/sass-gemm/fa-exp.sh TAG pv2 patch.py` (~40 s, no library rebuild).
 - Next step: extend ubench-lds-tile.cu with the staging (LDG->regs, STS, bar.sync per 16 k2) and find a cheap
   structure, then port it.
+- CORRECTION: those ubench ceilings used zero data. On random fp16 the same loop is power-capped (175 W, 1189 MHz)
+  at ~15.4 TFLOPS. The fold kernels are at ~86% of that. Work toward 200 should look at energy per FMA: a
+  kernel with fewer non-FMA instructions and less smem traffic draws less power and runs at a higher clock.
+  Measure with ubench-staged-tile.cu (AMP=0.01) plus nvidia-smi clocks.
