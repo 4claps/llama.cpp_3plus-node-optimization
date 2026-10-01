@@ -46,7 +46,8 @@ where the second rounding lands). Details in FINDINGS.
 
 A cuBLAS-GEMM attention path for pre-Volta, on by default at batch ≥ 128 and KV ≥ 4096
 (`GGML_CUDA_FA_GEMM=0` turns it off). At these shapes the tile kernel reaches 18.6% of fp16 peak,
-while cuBLAS reaches 13-15 TFLOPS.
+while cuBLAS reaches 13-15 TFLOPS. With a q4_0 cache, the cuBLAS calls inside this path have since
+been replaced by the fold kernels (§12, §14); `GGML_CUDA_FA_FOLD=0` brings them back.
 
 | commit | change |
 |---|---|
@@ -292,8 +293,8 @@ Against the 2026-09-26 release, same session, both with vision loaded:
 | same top token as fp32 | 98.80% | 98.86% |
 
 The release can't run `-ub 2048` with vision at 262k (GPU0 ran out), so it is shown at its
-shipped `-ub 1024`. A fill from empty to 260k drops from about 23.5 to about 18.5 minutes
-(estimated from the depth curve, not timed end to end).
+shipped `-ub 1024`. A full fill from empty to 260k measured 24.9 minutes of prefill (09-26
+release: ~29, from its depth table). QUICKSTART has the 2k-260k sweep.
 
 **What limits it now.** The three big prefill kernels (fold GEMM, QK, PV) run at the cards' 175 W
 power cap, not at an instruction limit: at the cap the clock settles at ~1290 MHz and they reach
@@ -306,8 +307,8 @@ At that cap, an estimated ~176 t/s is the ceiling at 260k with exact math.
   4 of 8 identical runs gave NaN. It follows the GEMM attention path (`GGML_CUDA_FA_GEMM=0` is
   stable 5 of 5). Two physical GPUs are bit-stable, so nothing that ships is affected. OPTLOG
   attempt 153 §8c has the data.
-- **Deepest prefill is ~10% below its best measurement.** `pp2048` at `-d 262144` measured 95.1
-  t/s during tuning and 85.4 later. Possibly thermal; not bisected.
+- **Prefill at depth is power-bound.** The fold GEMM and attention kernels hold the cards at their
+  175 W cap (§14). Faster code in the same instructions doesn't help; less energy per flop would.
 - **Attention at depth is compute-bound, not bandwidth-bound.** q4p (§10, §11) runs the 5-token
   verify at 262144 in 2.68 ms per call with fp16 products; the cache read alone would take ~0.35.
   It is at 255 registers and one block per SM, so what is left is latency, not arithmetic. Time

@@ -12,10 +12,10 @@ It tracks upstream by merging. The last merge was upstream `f46bc30cb`
 | | upstream at the fork point | this fork |
 |---|---|---|
 | decode, `tg256` (no MTP) | 17.51 t/s | **32.6 t/s** |
-| decode with MTP, 2k context | — | **52 t/s** |
-| decode with MTP, 260k context | — | **28-34 t/s** |
+| decode with MTP, 2k context | — | **54 t/s** |
+| decode with MTP, 260k context | — | **29-35 t/s** |
 | prefill, `pp2048` at 0 context | ~250 t/s | **493 t/s** |
-| prefill at 260k context (vision loaded) | — | **153 t/s** |
+| prefill at 260k context (vision loaded) | — | **123 t/s** filling, **153 t/s** for a question on a loaded context |
 | perplexity (gate corpus, `-c 4096`) | — | **2.6101** |
 
 [QUICKSTART.md](QUICKSTART.md) has the full table from 2k to 260k and the exact server command.
@@ -44,7 +44,10 @@ Perplexity 2.6101, all-fp32 2.6095; at this size perplexity can't separate them,
 - **Flash attention.** The kernel no longer converts the whole quantized KV cache to f16 on every
   call, which cost 4.15 ms per call at 262144 context. Tile widths fit the speculative batch
   exactly instead of padding it, and fp16 accumulation is folded to fp32 once per tile.
-- **Long-context prefill** uses a cuBLAS-GEMM attention path.
+- **Long-context prefill.** Attention runs as two hand-written fp16 GEMM kernels with exact fp32
+  folds, reading the q4_0 cache directly, register-renamed in SASS to avoid bank conflicts. The
+  causal mask is per-row prefix lengths instead of an n_kv × n_tokens matrix, which saves ~1 GiB per
+  card at 262k and lets vision run at `-ub 2048`. The tensor-parallel exchange overlaps the matmuls.
 - **Tensor parallel.** Partials cross PCIe as f16 when that's lossless, on a dedicated copy stream.
 - **fp16 math with fp32 accumulation.** Prefill matmuls (`gemm-fold.cu`), the 2-5 token verify
   matvec (`mmvq-f16.cu`) and decode/verify attention (`fattn-q4p.cuh`) multiply on the fp16 pipe

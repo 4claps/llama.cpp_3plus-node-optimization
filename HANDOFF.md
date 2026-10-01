@@ -3,32 +3,29 @@
 Where the work stands, and what's worth doing next. For the project rules and gates, see
 `CLAUDE.md`. For the results and changes, see `p100-docs/`.
 
-## State (2026-09-25, morning)
+## State (2026-10-01)
 
-- Branch `p100-optimizations`, merged with upstream `f46bc30cb`.
-- **Sampling is the model card's:** temp 1.0, top-k 20, top-p 0.95, min-p 0. `qwen-server` and
-  `depth-bench.py` forced temp 0.3 before 2026-09-24, so every MTP figure before then is at the wrong
-  sampling (OPTLOG 201).
-- `tg256` ~31 t/s. Perplexity 2.6101 on the gate corpus (the prefill path is untouched since).
-- Real-world MTP, cold cards, `depth-bench.py --restore`, vision loaded, `-ub 1024`, model-card
-  sampling: **~29.6-30 t/s at 260k** (20 requests: 29.62, 105 ms per cycle, 3.1 tokens per cycle)
-  and **~49 t/s at 2k** (10 requests: 49.4, 60 ms, 3.0). The 2026-09-24 baseline at the same sampling
-  was 23.4 and 36.9. Per-request spread is +-10%, and a batch of 10 moves +-3%, so compare batches
-  of 20 or use ABBA. Hot cards read 10-15% lower.
-- Goal (user, 2026-09-24): 55 t/s at 2k and 31 at ~260k, with math as good as or better than before.
-  260k is ~3-4% short. 2k is ~11% short.
-- Gates on 3ba045898: tg256 32.02, perplexity 2.6101 (in band), FLASH_ATTN_EXT eval passes. The
-  verify path against an all-fp32 run: KLD 0.00162 (the integer path gave 0.00354).
-- **Next steps (agreed with the user 2026-09-25):**
-  1. Run `./tools/gate.sh --full` on this build. It was started and stopped at user request; the
-     quick gates (tg256 32.02, perplexity 2.6101, FLASH_ATTN_EXT) passed on 3ba045898.
-  2. Refresh the release bundle through `p100-handoff/release-sync/` (it is still d3a650552, so
-     `qwen-server` on PATH runs none of the 2026-09-24/25 work). The regenerated wrapper sets
-     `GGML_CUDA_GRAPHS_PRE_VOLTA=3`, `LLAMA_SPEC_SAMPLE_TEMP=1.0`, `LLAMA_SPEC_DRAFT_TOPK=20` and the
-     model-card sampling.
-  3. Optional, for the last 3-4% at 260k: a two-kernel q4p attention (score pass, then value pass)
-     so each fits more warps. The single kernel is at one 256-thread block per SM and ~255
-     registers; every 2-block and 512-thread variant spills (OPTLOG 204, 219, 220).
+- Branch `p100-optimizations` (fast-forwarded from `goal/prefill300`), upstream last merged at
+  `f46bc30cb` (2026-09-22). The public fork is at `781cb4220` until the user pushes.
+- **Sampling is the model card's:** temp 1.0, top-k 20, top-p 0.95, min-p 0.
+- Gates (OPTLOG 273): tg256 32.58, perplexity 2.6101, full op suite 16324/16324 on both GPUs, both
+  SASS headers current (`u2cubin.py --check`, `facubin.py --check`, run by `tools/gate.sh`).
+- KLD against an fp32 run: 0.001186 (09-26 release: 0.001215). Same top token 98.86% (98.80%).
+- Prefill at 260k with vision loaded, `-ub 2048`, 1479-token question: ~153 / 155 t/s (09-26
+  release, at its `-ub 1024`: 120 / 124). `pp2048` at 0 context 493 (release 385; stock ~250).
+- Depth sweep (OPTLOG 274, QUICKSTART): fill 0 -> 260k in 24.9 min of prefill; MTP decode 54 t/s
+  at 2k, 29-35 at 260k.
+- `qwen-server` runs `-ub 2048` with or without `--mmproj` (compact mask, OPTLOG 248). GPU0 min
+  free at 262k with vision: 732-792 MiB, with the desktop's ~392 MiB on it.
+- Round 4 (prefill at depth, OPTLOG 236-272) is written up in CHANGES §14 and, with the
+  analysis and every dead end, in `p100-handoff/GOAL-PREFILL300.md`.
+- **Next steps:**
+  1. The user pushes `p100-optimizations` and refreshes the release bundle
+     (`p100-handoff/release-sync/refresh-build.sh 2026-09-26`, then `sync.sh`).
+  2. Prefill at depth is at the 175 W power cap: the three big kernels need less energy per flop
+     (fewer shared-memory reads per HFMA2), not fewer stalls. Estimated ceiling ~176 t/s at 260k.
+     Cheap leftovers: one transfer for the 768 checkpoint copies (~60 ms), preload cuBLAS
+     (147 ms on the first request), the final partial batch and its syncs (~220 ms).
 
 ## What changed on 2026-09-24/25 (OPTLOG 201-218)
 
@@ -100,9 +97,8 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
    are bit-stable. OPTLOG attempt 153 §8c.
 7. **Fuse the all-reduce widen into the ADD** (~+1% prefill). It needs an accumulating-copy path
    in `ggml-backend-meta.cpp`.
-8. **`gated_delta_net`** is 7% of prefill and at ~15% issue efficiency. It resisted three attempts.
-9. **Deepest prefill regressed ~10%** (95.1 → 85.4 t/s at `-d 262144`). Possibly thermal; not
-   bisected.
+8. ~~`gated_delta_net` in prefill~~: done, chunked (`77e05601d`, +3.8%).
+9. ~~Deepest prefill regressed ~10%~~: obsolete; 260k prefill is now ~153 t/s.
 
 ## Closed: don't re-sweep without new information
 
@@ -136,7 +132,14 @@ use `tools/pmp/`, an LD_PRELOAD sampler; its header has the usage.
   fastdiv, DP4A, q4_0 dequant and norm changes). `p100-handoff/VERIFICATION.md` is the numerical
   audit.
 
-## Round 3, 2026-09-26 (resume here)
+## Round 4, 2026-09-27 to 10-01 (resume here)
+
+Prefill at depth: 260k 120 -> ~153 t/s, `pp2048` 385 -> 493, all exact. See CHANGES §14,
+`p100-handoff/GOAL-PREFILL300.md` and OPTLOG 236-273. Fast loops for the fold attention SASS:
+`p100-handoff/tools/sass-gemm/fa-exp.sh` (~40 s per experiment); prefill A/B screen:
+`tools/ab-pp.sh` (~1 min).
+
+## Round 3, 2026-09-26
 
 Ideas from other projects (six research agents; OPTLOG 230-235). Kept, all exact: one-kernel P2P
 AllReduce (GGML_CUDA_AR_P2P), FFN gate+up+SWIGLU fusion in mmvq-f16 (GGML_CUDA_FUSE_FFN_GLU), lazy

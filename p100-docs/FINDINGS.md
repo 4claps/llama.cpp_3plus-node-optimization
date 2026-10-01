@@ -16,6 +16,12 @@ that cost the most time. The change list is [CHANGES.md](CHANGES.md); the raw re
   with zero spills. So did three separate attempts to raise occupancy in the attention kernel.
 - **Achievable bandwidth is ~605 GB/s per card**, not the 732 on the spec sheet. Decode reaches
   ~490 GB/s effective. ECC costs nothing on HBM2, so leave it on.
+- **Long prefill is bound by power, not instructions.** The fold GEMM and attention kernels run
+  the cards at their 175 W cap, where the clock settles near 1290 MHz and they reach ~13 TFLOPS of
+  the fp16 pipe. A lean test kernel on random data does 15.4 TFLOPS in the same power, so the
+  remaining gap is energy per flop (shared-memory and register traffic per multiply-add), not
+  stalls. Removing yields and bank conflicts measured flat or slower. Benchmark these on random
+  data: on zeros the same kernel draws less power and reads 17-18 TFLOPS.
 - **Alignment is a wall.** Every quantized block is 2 mod 4 bytes, so a 4-byte quant word needs
   two loads. Four designs moved that cost around, and none removed it. Only repacking the weights
   would.
@@ -50,6 +56,16 @@ fp32. It doesn't fit the 36-wide tile in shared memory, and costs 17-90%.
 Don't also "fix" `fattn-vec.cuh`. Its `half2 VKQ` declaration looks like the same bug, but it's
 compiled only for HIP. CUDA builds already accumulate in `float2`. Trying it cost 16% of decode
 for nothing.
+
+**Don't materialise the causal mask.** The f16 attention mask is n_kv × n_tokens: 1 GiB per card at
+262k context and `-ub 2048`, two-thirds of the compute buffer. With one sequence in position order,
+query t sees exactly the first L₀ + t cells, so a list of prefix lengths carries the same
+information. That freed the room for `-ub 2048` with vision, bit-exact.
+
+**Hide the tensor-parallel exchange.** In prefill each card waited for the other's partial sums,
+about 7% of the time (nsys). Splitting the matmul into token chunks and sending each chunk while
+the next one computes recovered most of it (+4.5%), and filling what's left of the wait with the
+next layer's weight dequant gained a bit more, both bit-identical.
 
 **Pick the cuBLAS algorithm on Pascal.** The default picks a long-chain fp16 accumulator from
 ~256 rows up. `ALGO6` is 10x more accurate at every shape measured, and faster at 512-1024 rows.
@@ -129,6 +145,12 @@ What doesn't transfer directly: the tile configurations assume head size 256 wit
 draft-length advice follows from that tile geometry, and the AllReduce result is a PCIe result.
 
 ## Where the remaining time is
+
+**Prefill at 260k**, one 1479-token question (GPU0): fold attention ~5.8 s (PV 2.9, QK 2.9), the
+weight GEMM ~2.8 s, and ~0.5 s of everything else (the last partial batch, syncs, dequant,
+checkpoints). At the 175 W cap the exact-math ceiling is about 176 t/s against 153 measured.
+
+**Decode at depth.**
 
 Plain decode at 229k context is 46.6 ms per token: 22.9 for weights and everything else, 23.7 for
 attention. At that shape an f16 KV cache runs at the bandwidth limit (480 GB/s), while q4_0 manages

@@ -28,10 +28,10 @@ CORPUS = "/mnt/fast/p100-scratch/deep-corpus.txt"
 PORT = 8099
 FLOOR_MIB = 250
 
-# the user's serving flags (vision on, -ub 1024), minus --host/--tools/--mcp-servers-config
+# the user's serving flags (vision on, -ub 2048), minus --host/--tools/--mcp-servers-config
 SERVER_ARGS = [
     "-m", MODEL, "-ngl", "99", "-sm", "tensor", "-fa", "1", "-ctk", "q4_0", "-ctv", "q4_0",
-    "-c", "262144", "-b", "32768", "-ub", "1024", "-np", "1",
+    "-c", "262144", "-b", "32768", "-ub", "2048", "-np", "1",
     "--mmproj", "/mnt/fast/models/mmproj-Qwen3.8-27B-Q8_0.gguf",
     "--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--spec-draft-p-min", "0.2",
     "-ngld", "99", "-ubd", "64", "-ctkd", "q4_0", "-ctvd", "q4_0",
@@ -112,7 +112,7 @@ def main():
     ap.add_argument("--extra-chars", type=int, default=0,
                     help="restore mode: insert this many characters of corpus text before the question, "
                          "to time prefill at the snapshot's depth (~4100 chars is ~1k tokens)")
-    ap.add_argument("--ub", type=int, default=0, help="override the server's -ub (default 1024)")
+    ap.add_argument("--ub", type=int, default=0, help="override the server's -ub (default 2048)")
     ap.add_argument("--mmdev", default="", help="device for the vision encoder, e.g. CUDA1 (server -mmdev)")
     ap.add_argument("--graphs", default="3", help="GGML_CUDA_GRAPHS_PRE_VOLTA for the server (production: 3, single-token graphs only)")
     g = ap.add_mutually_exclusive_group()

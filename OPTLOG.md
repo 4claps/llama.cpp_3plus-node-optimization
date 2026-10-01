@@ -9054,3 +9054,27 @@ against 0.001215 for the 09-26 release, and identical to the previous commits.
 Docs (README, bundle-README, QUICKSTART, CHANGES §14) updated; qwen-server keeps `-ub 2048` with
 vision (compact mask, attempt 248: GPU0 732-792 MiB free at 262k with the desktop on it).
 `/mnt/fast/p100-scratch/build-stock` is not stock: it is fork commit d886a5eb9 (pp2048 355 t/s).
+
+## 274 — depth sweep on the gated build (2026-10-01)
+
+`tools/depth-bench.py` staircase (default server flags now `-ub 2048`, vision loaded, MTP), depths
+2k..260k in ~30k chunks, 2 questions per depth, cards hot. Run 31.5 min wall; prefill alone 24.9 min
+for the 278.5k-token fill (187 t/s average). GPU0 min free 542 MiB throughout (750 at 2k; the
+staircase's 32k-token requests set it, flat from 32k to 260k).
+
+| depth | chunk prefill | decode (2 q) | 09-26 release prefill |
+|---|---|---|---|
+| 2k | 375 | 53.7 | 316 |
+| 32k | 423 | 55.4 | 342 |
+| 62k | 342 | 46.0 | 257 |
+| 92k | 257 | 43.8 | 194 |
+| 122k | 206 | 37.9 | 162 |
+| 152k | 175 | 36.7 | 141 |
+| 182k | 156 | 37.7 | 125 |
+| 212k | 140 | 32.0 | 118 |
+| 242k | 127 | 28.7 | 108 |
+| 260k | 123 (20k chunk) | 32.5 | 100 |
+
+Questions at 260k in this staircase prefill at 111-141 t/s (hot, after checkpoint restore) against
+~153 for the restore-mode 1479-token question; the 09-26 release showed the same gap (100 vs 120).
+My earlier 18.5 min fill estimate (272) was low; measured 24.9.

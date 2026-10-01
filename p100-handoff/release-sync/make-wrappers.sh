@@ -79,7 +79,6 @@ MODEL="${QWEN_MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}"
 
 [ -f "$MODEL" ] || { echo "qwen-server: model not found: $MODEL" >&2; exit 1; }
 
-UB=2048
 MCP=()
 [ -f "$HOME/mcp-servers.json" ] && MCP=(--mcp-servers-config "$HOME/mcp-servers.json")
 
@@ -94,7 +93,7 @@ LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" export LD_LIBRARY_
 exec "$BUILD/llama-server" \
   -m "$MODEL" \
   -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-  -c 262144 -b 32768 -ub "$UB" -np 1 \
+  -c 262144 -b 32768 -ub 2048 -np 1 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
   -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
   --jinja --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 \
