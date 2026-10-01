@@ -1,5 +1,9 @@
-> **This is a fork of llama.cpp tuned for two Tesla P100s (sm_60).** Decode runs at 1.75x
-> upstream's speed on Qwen3.8-27B, with no loss of accuracy. It tracks upstream by merging.
+> **This is a fork of llama.cpp tuned for two Tesla P100s (sm_60).** On Qwen3.8-27B, plain decode
+> runs at 1.86x upstream's speed (17.5 -> 32.6 t/s), and ~3x with the model's built-in MTP head
+> (~52 t/s). Prefill runs at ~2x (250 -> 493 t/s at short context), and at 153 t/s at 260k context
+> with the full 262k window and vision loaded.
+> The math is at least as accurate as stock: KLD against an fp32 run 0.00119, where upstream's
+> fp16 path reads 0.00152. It tracks upstream by merging.
 > See **[p100-docs/](p100-docs/README.md)** for results, changes and how to run it.
 > Upstream's README follows.
 

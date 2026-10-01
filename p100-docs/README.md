@@ -14,6 +14,7 @@ It tracks upstream by merging. The last merge was upstream `f46bc30cb`
 | decode, `tg256` (no MTP) | 17.51 t/s | **32.6 t/s** |
 | decode with MTP, 2k context | — | **52 t/s** |
 | decode with MTP, 260k context | — | **28-34 t/s** |
+| prefill, `pp2048` at 0 context | ~250 t/s | **493 t/s** |
 | prefill at 260k context (vision loaded) | — | **153 t/s** |
 | perplexity (gate corpus, `-c 4096`) | — | **2.6101** |
 

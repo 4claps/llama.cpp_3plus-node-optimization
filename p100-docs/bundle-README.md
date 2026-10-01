@@ -8,6 +8,7 @@ The build includes upstream llama.cpp up to `f46bc30cb` (2026-09-22).
 |---|---|---|
 | decode, `tg256` | 17.51 t/s | **32.6 t/s** |
 | MTP decode through `qwen-server` | — | **49-52 t/s** at 2k, 28-34 at 260k |
+| prefill, `pp2048` at 0 context | ~250 t/s | **493 t/s** |
 | prefill at 260k context through `qwen-server` (vision loaded) | — | **153-155 t/s** |
 | perplexity (gate corpus, `-c 4096`) | — | **2.6101 ± 0.0198** (band 2.6209 ± 0.0199) |
 
