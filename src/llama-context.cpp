@@ -1228,8 +1228,16 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    const bool grows = value && (!cparams.embeddings_nextn || (cparams.embeddings_nextn_masked && !masked));
+
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // grow the (pinned) output buffer now, at setup, rather than inside the first decode: unmasked nextn
+    // rows take n_batch*n_embd floats (~640 MiB at -b 32768), ~0.3 s to pin and clear
+    if (grows && buf_output) {
+        output_reserve(n_seq_max());
+    }
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {

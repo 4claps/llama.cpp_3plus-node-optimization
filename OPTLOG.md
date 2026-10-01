@@ -9034,3 +9034,7 @@ Same trick as 266 on gemm_fold_kernel_u2: same-bank source pairs after bankfix 4
   Also seen in the profile: each restored question spends ~3.5 s copying ~5.6 GB host->device before prompt
   timing starts (checkpoint/slot restore path, pageable ~2.4 GB/s). It's outside the prompt t/s metric but in
   TTFT. Next to look at.
+- 271 (kept): set_embeddings_nextn grows the output buffer at setup when it turns on unmasked nextn rows.
+  Without this, the first decode re-pins and clears 644.7 MiB inside the first prompt (traced: output_reserve
+  from llama_context::decode, 328 ms cudaMallocHost in nsys). 260k first question 146-150 -> 152.8/153.7 t/s,
+  second unchanged (155.0/155.5), first-request gen 51-53 t/s. No math change (allocation timing only).
