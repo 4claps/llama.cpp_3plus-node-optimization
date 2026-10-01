@@ -9026,3 +9026,11 @@ Same trick as 266 on gemm_fold_kernel_u2: same-bank source pairs after bankfix 4
     LDS/STS, fewer conflicts) now matters as much as issue slots, because a lower-power kernel clocks higher.
     Power-bound estimate for 260k at 175 W: attention 76 TFLOP / 15.4 = 4.9 s, GEMM 2.6 s, rest 0.9 s ->
     ~8.4 s per 1479 tokens, ~176 t/s.
+- 270 (kept): output buffer reserves >= 64 rows (capped at n_outputs_max) at context creation. The buffer is
+  pinned host memory that also holds n_batch x n_embd nextn embeddings (~700 MB at -b 32768). Every growth of
+  n_outputs (1 -> n_draft+1 on the first speculative step) re-pinned and cleared all of it: nsys shows
+  cudaFreeHost 87 ms + cudaMallocHost 258 ms in the first request. 260k, first question: gen 20.2 -> 50.5 t/s,
+  prompt unchanged (150.6/156.8 vs 149.9/156.3, A/B same session). No math change (buffer capacity only).
+  Also seen in the profile: each restored question spends ~3.5 s copying ~5.6 GB host->device before prompt
+  timing starts (checkpoint/slot restore path, pageable ~2.4 GB/s). It's outside the prompt t/s metric but in
+  TTFT. Next to look at.

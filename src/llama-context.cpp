@@ -2164,7 +2164,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    // reserve at least 64 output rows up front: the buffer is pinned host memory that also holds the
+    // n_batch-sized nextn embeddings (~700 MB at -b 32768), and every growth (prompt -> speculative
+    // verification with n_draft+1 outputs) re-pins and clears all of it (~0.3 s each)
+    const int64_t n_outputs_max = std::max<int64_t>({(int64_t) n_outputs, (int64_t) n_seq_max(), std::min<int64_t>(64, cparams.n_outputs_max)});
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
