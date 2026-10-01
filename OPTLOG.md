@@ -9038,3 +9038,9 @@ Same trick as 266 on gemm_fold_kernel_u2: same-bank source pairs after bankfix 4
   Without this, the first decode re-pins and clears 644.7 MiB inside the first prompt (traced: output_reserve
   from llama_context::decode, 328 ms cudaMallocHost in nsys). 260k first question 146-150 -> 152.8/153.7 t/s,
   second unchanged (155.0/155.5), first-request gen 51-53 t/s. No math change (allocation timing only).
+- 272 (diagnosis): where a 260k question's ~9.5 s goes now (GPU0, nsys d2prof): fa_fold_pv2 2913 + qk2 2860 +
+  u2 2765 ms; q6_K dequant 100 (mostly per-ubatch weight dequant for the fold GEMM); 4-token tail batch ~130 ms
+  GPU (flash_attn_ext_q4p 63 + mmvq 61) plus ~90 ms syncs; checkpoint copy ~60 ms wall each (768 small
+  get_tensor calls, sync-latency bound, 157 MB moved in 14 ms of DMA); the first question also pays
+  147 ms for cuBLAS lazy-loading maxwell_sgemm_128x64_tn (fp32 K/V projection). Each remaining non-kernel
+  item is <=1-2%. The checkpoint split at n-4 is upstream behaviour (PR 20288), left as is.
