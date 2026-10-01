@@ -9064,7 +9064,7 @@ staircase's 32k-token requests set it, flat from 32k to 260k).
 
 | depth | chunk prefill | decode (2 q) | 09-26 release prefill |
 |---|---|---|---|
-| 2k | 375 | 53.7 | 316 |
+| 2k | 375 first request, 454 second | 53.7 | 316 (first request) |
 | 32k | 423 | 55.4 | 342 |
 | 62k | 342 | 46.0 | 257 |
 | 92k | 257 | 43.8 | 194 |

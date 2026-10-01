@@ -37,7 +37,7 @@ for comparison.
 
 | depth | prefill | decode | prefill, 09-26 release |
 |---|---|---|---|
-| 2k | 375 t/s | 54 t/s | 316 t/s |
+| 2k | 454 t/s ¹ | 54 t/s | 316 t/s (first request) |
 | 32k | 423 t/s | 55 t/s | 342 t/s |
 | 62k | 342 t/s | 46 t/s | 257 t/s |
 | 92k | 257 t/s | 44 t/s | 194 t/s |
@@ -47,6 +47,11 @@ for comparison.
 | 212k | 140 t/s | 32 t/s | 118 t/s |
 | 242k | 127 t/s | 29 t/s | 108 t/s |
 | 260k | 123 t/s | 33 t/s | 100 t/s |
+
+¹ On a warm server. The first request after startup reads 375 t/s: it also pays ~1.5 s of one-time
+setup (loading cuBLAS kernels and allocating buffers). The GPU itself prefills ~500 t/s at short
+context (`llama-bench` `pp2048`: 493); a server request adds the final partial batch, the MTP
+catch-up and a checkpoint save.
 
 Filling the whole 260k context takes ~25 minutes of prefill (09-26 release: ~29). A short question
 on top of an already-loaded 260k context runs faster than the fill rate: ~153 t/s for 1.5k tokens.
