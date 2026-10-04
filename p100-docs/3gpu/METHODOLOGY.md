@@ -20,7 +20,7 @@
 - **One run = one process in a fresh container.** The model is loaded from disk every time.
 - **Cool-down before every run:** wait until every GPU is at or below the limit, with a 10-minute cap; the wait and
   the start temperatures are logged. The limit was ≤45 °C or idle baseline + 2 °C (round 1), ≤45 °C (round 2), and
-  ≤48 °C with the fans at full speed (round 3 after its first three results).
+  ≤48 °C with the fans at full speed (round 3 after its first three results, and round 4).
 - **Warmup:** llama-bench's built-in warmup (discarded) on every throughput run. Server runs send a discarded warmup
   request first. Round 1's nvprof and op-profile runs used `--no-warmup`.
 - **Repetitions:** llama-bench `-r 3` per invocation unless stated; the tables give mean ± stdev of those
@@ -36,7 +36,7 @@
   while busy, no GPU memory in use for 10 minutes, a failed fan check, or a new kernel Xid. A new error in a run's
   stderr also stops the queue (round 1 only flagged it); an out-of-memory failure is recorded as "does not fit".
 - **Nothing else runs on the machine** during a measured run (no builds, quantization or large copies).
-- **Model load:** default (mmap) in round 1; `-lm none` in rounds 2 and 3. On this 16 GB-RAM machine mmap adds
+- **Model load:** default (mmap) in round 1; `-lm none` in rounds 2, 3 and 4. On this 16 GB-RAM machine mmap adds
   noise and a mean penalty to decode (RESULTS.md section 2.3) and roughly doubles load time.
 
 ## Command lines
@@ -104,6 +104,61 @@ The server check sent seven chat requests to one server (a prompt, a different p
 turn, a prompt of about 7,600 tokens, then a short one) with the default prompt cache, at `-c 32768` and `-c 65536`.
 
 **P2P and the shootout:** `scripts/p2pbench/` (see `scripts/README.md`).
+
+## Round 4
+
+**Server flags** (context fit and agent battery; A uses `build-opt`, B uses `build-nccl` with `NCCL_P2P_LEVEL=SYS`):
+
+```
+GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=3 LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20 \
+./bin/llama-server -m XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 \
+    -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none \
+    --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 \
+    --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0
+```
+
+**Context fit:** the server above at `-c 262144` and `-c 131072`. `scripts/context_fit_client.py` tokenizes
+wikitext-2 raw test through the server, sends the first 129,000 token ids as one completion request with the prompt
+cache off, generates 64 tokens, and records the server's own timings and the number of prompt tokens it processed.
+Peak memory is the maximum of the 1 Hz `nvidia-smi` log. Order A, B, B, A. The Q8_0 check ran at `-c 262144` only.
+
+**Q8_0 against the XL:** llama-bench `-r 3` for tg512, pp2048 and pp2048 at `-d 16384`, on A and B, order alternated
+per test (Q8_0 XL XL Q8_0). MTP: `llama-speculative-simple`, n-max 3, p-min 0.0, greedy, 256 tokens, the three
+prompts of round 3, three invocations per cell. `LLAMA_SPEC_SAMPLE_TEMP` and `LLAMA_SPEC_DRAFT_TOPK` were set for
+these runs.
+
+**MTP under sampling:** the same program and prompts with `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0`,
+`LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20`, n-max 3, p-min 0.0 / 0.5 / 0.75, `--seed 1`, `2`, `3`.
+
+**KLD at `-c 16384`** (corpus = wikitext-2 raw test, `wiki.test.raw`, unmodified):
+
+```
+./build-opt/bin/llama-perplexity -m XL.gguf -f wiki.test.raw -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 \
+    -c 16384 -b 16384 --chunks 4 -lm none -fit off -ub 2048 --kl-divergence-base a2048.bin      # also -ub 5 -> a5.bin
+NCCL_P2P_LEVEL=SYS build-nccl/bin/llama-perplexity <same arguments> -ub 2048 --kl-divergence-base b2048.bin
+kldpos a2048.bin b2048.bin 1024      # and: kldpos a2048.bin a5.bin 1024
+```
+
+Three save runs, then `scripts/kldpos.cpp` on pairs of saved files: overall mean, median, 99.9% and maximum KLD,
+top-token agreement, and the same per 1,024-position bucket. The tool was checked against llama-perplexity's own
+figure on the `-c 4096` files of round 3: mean KLD 0.002322 against 0.002313, the same 98.394% top-token agreement
+(the small difference is the files' 16-bit quantization of log-probabilities). llama-perplexity scores positions
+n_ctx/2 to n_ctx-2 of each chunk, so 4 chunks at `-c 16384` give 32,764 scored tokens.
+
+**Agent battery.** A tool-calling coding agent, driven by a separate A/B evaluation harness on a second machine,
+uses the server above over the LAN through its OpenAI-compatible endpoint. The harness and its tasks are not in this
+repository.
+
+- Tasks (9): `err_python_env`, `err_replay_patch`, `err_ambiguous_edit`, `err_case_search`, `err_hidden_search`,
+  `err_big_output`, `err_multi_dir`, `err_inline_script`, `err_big_file_read`. Each starts the agent in a fresh
+  working directory with one instruction, and a checker grades the final answer or the files left behind.
+- Limit: 600 s per task; a task still running then is killed and counted as failed.
+- The agent's configured context is 65,536 tokens; the harness sets no sampler parameters, so the server's apply.
+- One server process per block, started after the cool-down and stopped at the end of the block. Blocks: 1 A, 1 B,
+  2 B, 2 A, 3 A, 3 B, each one repetition of all nine tasks; then 4 B, 4 A, 5 A, 5 B, 6 B, 6 A, each one extra
+  repetition of `err_inline_script` and `err_big_file_read`. Tasks run one at a time.
+- Prefill and decode rates are sums over every request in the server logs (`prompt eval time` and `eval time`
+  lines): tokens divided by time. Pass or fail is the harness's verdict.
 
 ## The pure Q6_K file
 

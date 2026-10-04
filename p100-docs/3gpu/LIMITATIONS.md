@@ -16,16 +16,26 @@ Read this before quoting a number from this directory.
 - **2 GPUs against 3 GPUs is unresolved.** The only 2-GPU runs were in round 1, with CUDA graphs off and mmap
   loading. Both settings distort decode on this host, and the 2-GPU arms were not repeated. Round 1 showed 2 GPUs ahead
   of 3; that result should not be relied on in either direction. No 2-GPU run was made with NCCL.
-- **Serving context size is not covered.** Server runs used `-c 4096` to `-c 65536`. The fork's documented
-  `-c 262144` was not run on three cards with these files, and VRAM fit at that size is not measured.
-- **No agent-level or end-to-end results.** There is no multi-turn, tool-calling or mixed prefill/decode workload
-  here; only llama-bench, llama-perplexity, llama-speculative-simple and a few scripted server requests.
+- **`-c 262144` was run with a half-full context only.** One 129,000-token prompt per configuration completed
+  with over 5 GB free per card (RESULTS.md section 1.5). A prompt near 262,144 tokens was not run, and each cell is
+  a single run.
+- **The agent battery is small.** Nine tasks from one harness, 3 repetitions each (6 for two tasks), one model
+  file, one agent. Pass rates differ between A and B by two runs out of 33. The wall-time difference is consistent
+  across tasks; the pass-rate difference is not established.
+- **`err_big_file_read` hits the 600 s limit on both configurations** (6 of 6 runs on A, 4 of 6 on B). Why was not
+  investigated. It dominates the battery's mean wall time and all of its timeouts.
+- **The earlier battery run quoted for context used a different quant file** (UD-Q5_K_XL) and older settings. It is
+  not a controlled baseline.
+- **The serving configuration was not run through Docker Compose.** The battery servers were started by the run
+  harness with the flags in METHODOLOGY.md. No Compose file with these settings (NCCL build, `-lm none`, n-max 3 /
+  p-min 0.0) has been started.
 
 ## NCCL
 
-- **KLD was measured on one corpus at `-c 4096` only** (the fork's gate corpus, 32,768 tokens, q4_0 KV). Whether the
-  difference grows with position at long context (KV cache and delta-net state accumulation) is **not measured**. At
-  16,384 tokens only repeatability was checked.
+- **Long-context KLD was measured at `-c 16384` only** (wikitext-2, positions 8192–16382, 32,764 tokens), plus
+  `-c 4096` on the fork's gate corpus (16,376 tokens scored). `-c 65536` and beyond are **not measured**: stock
+  llama-perplexity needs about 32 GB of host memory there. The two context sizes used different corpora, so the
+  rise in mean KLD from 4k to 16k (0.0014 to 0.0031) is not a clean measure of growth with context.
 - **NCCL is not bit-exact for decode.** It is repeatable (identical hashes across runs) but differs from the
   non-NCCL path: 3.3% of saved-logit bytes differ, and greedy generations diverge. Any check that compares bytes or
   greedy text against a non-NCCL reference fails under NCCL.
@@ -39,10 +49,12 @@ Read this before quoting a number from this directory.
 
 ## MTP
 
-- **MTP settings were compared with greedy decoding** (`--temp 0 --top-k 1`), 256 tokens, three fixed prompts. The
-  fork's serving configuration samples (`--temp 1.0` with `LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20`).
-  The ranking of p-min values may not hold under sampling. The fork's own default (n-max 4, p-min 0.2) was not in the
-  grid.
+- **MTP settings were compared on three fixed prompts, 256 tokens**: greedy in round 3, and with the serving
+  sampler in round 4 (three seeds, n-max 3 only, p-min 0.0 / 0.5 / 0.75). Under sampling the seed-to-seed standard
+  deviation is up to 6 t/s, so only the p-min ranking is supported, not small differences between A and B. The
+  fork's own default (n-max 4, p-min 0.2) was not in either grid.
+- **Round 4's greedy MTP cells had the sampled-draft environment variables set** and are 4–9% below round 3's.
+  Compare within a round only.
 - Under greedy decoding, repetitions measure timing noise only: acceptance is fixed per configuration and prompt.
 - Differences between the NCCL and non-NCCL MTP results come partly from different generated text, not only speed.
 
@@ -65,7 +77,7 @@ Read this before quoting a number from this directory.
 ## Protocol deviations
 
 - **Cool-down** was "all GPUs ≤45 °C or ≤ idle baseline + 2 °C" in round 1, "≤45 °C" in round 2, and "≤48 °C" with
-  the fans at full speed for most of round 3. Start temperatures are recorded per run. The first three round-3
+  the fans at full speed for most of round 3 and all of round 4. Start temperatures are recorded per run. The first three round-3
   results were taken under the ≤45 °C rule.
 - **nvprof and op-profile runs in round 1 used `--no-warmup`.**
 - **llama-bench has no `-c`**; its context is prompt + generation + depth.
@@ -80,5 +92,5 @@ Read this before quoting a number from this directory.
   from Q8_0 is not the same as quantizing from full precision. Its quality was not measured.
 - **Upstream issue 29466** (second-request assert under `-sm tensor`) did not reproduce in four scripted server runs.
   That is not evidence that it is fixed.
-- **Raw data is incomplete for rounds 2 and 3**: see [results/README.md](results/README.md).
+- **Raw data is incomplete for rounds 2, 3 and 4**: see [results/README.md](results/README.md).
 - Times in logs are the test host's local time (EDT).

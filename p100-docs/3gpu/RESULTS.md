@@ -6,9 +6,11 @@ unsloth `UD-Q6_K_XL` quant; "Q8_0" is the unsloth pure Q8_0; "pure Q6_K" is a lo
 -b 32768 -ub 2048 -ngl 99`, `GGML_CUDA_P2P=1`, mean ± stdev of llama-bench repetitions. Read
 [LIMITATIONS.md](LIMITATIONS.md) before quoting anything.
 
-Three measurement rounds are reported. They are ordered here by how much weight the numbers deserve, not by date:
+Four measurement rounds are reported. They are ordered here by how much weight the numbers deserve, not by date:
 
 - **Part 1 (round 3, final):** graphs on (`GGML_CUDA_GRAPHS_PRE_VOLTA=3`), `-lm none`, with and without NCCL.
+- **Part 1b (round 4):** `-c 262144` fit, Q8_0 against the XL, MTP under sampling, NCCL KLD at `-c 16384`, and an
+  agent battery on A and B.
 - **Part 2 (round 2):** the decode budget, the AllReduce shootout, noise, layer split, MTP grid, `-ub`, the pure
   Q6_K, the thermal soak, and the first NCCL runs. Mixed settings; each table says which.
 - **Part 3 (round 1, decode numbers superseded):** P2P characterization and prefill attribution (still valid), and
@@ -96,7 +98,7 @@ Cells: mean ± stdev t/s over 3 runs (draft acceptance, decode ms per accepted d
 | prefill ubatch ≥ 26 tokens (e.g. `-ub 2048`: 10.5 M) | ≥ 133,120 | **BF16** |
 | prefill tail or short prompt ≤ 25 tokens | ≤ 128,000 | f32 |
 
-**KLD** (gate corpus `p100-handoff/ppl-orig.txt`, `-c 4096`, 8 chunks = 32,768 tokens, q4_0 KV, graphs `=3`):
+**KLD** (gate corpus `p100-handoff/ppl-orig.txt`, `-c 4096`, 8 chunks, 16,376 tokens scored (the second half of each chunk), q4_0 KV, graphs `=3`):
 
 | comparison | path exercised | PPL (test / base) | mean KLD | median | 99.9% | max KLD | same top token |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -185,6 +187,153 @@ Tensor names behind the op labels (from the GGUF): `node_` 5120×3200 / 5120×38
 - **Reading:** the loss splits into three kinds: (a) wide FFN matrices at ~65% of ceiling, a kernel-efficiency gap; (b) mid-size projections (2,000–3,800 rows or columns) at 35–55%, a geometry or occupancy gap; (c) tiny `ssm_alpha/beta` matvecs that should not be separate kernel launches at all.
 <!-- P16-LIVE-END -->
 
+
+---
+
+# Part 1b. Round 4: serving context, Q8_0, MTP under sampling, long-context KLD, agent battery
+
+Same configurations A and B as Part 1, same build, XL unless stated. Raw material: `results/round4/`.
+
+## 1.5 Context fit at `-c 262144`
+
+`llama-server` with the serving flags (MTP on, n-max 3, p-min 0.0, one slot, `-fit off -lm none`). One prompt of
+129,000 tokens (wikitext-2 raw test, sent as token ids, prompt cache off), then 64 generated tokens. One run per cell.
+
+| config | `-c` | peak MiB, GPU 0 / 1 / 2 | prompt tokens processed | prefill t/s | decode t/s (MTP) |
+|---|---:|---|---:|---:|---:|
+| A | 262144 | 11027 / 10929 / 11017 | 129,000 | 211.0 | 27.0 |
+| B | 262144 | 11125 / 11027 / 11115 | 129,000 | 315.9 | 26.6 |
+| A | 131072 | 10199 / 10137 / 10189 | 129,000 | 210.6 | 27.1 |
+| B | 131072 | 10297 / 10235 / 10287 | 129,000 | 315.7 | 26.6 |
+| A, Q8_0 | 262144 | 12123 / 12023 / 12123 | 129,000 | 211.1 | — |
+| B, Q8_0 | 262144 | 12221 / 12121 / 12221 | 129,000 | 318.1 | — |
+
+- No out-of-memory failure, truncation or context shift in any run.
+- Both configurations run `-c 262144` with more than 5 GB free per 16 GB card (XL) and more than 4 GB (Q8_0).
+- NCCL adds about 100 MiB per card. Going from `-c 131072` to `-c 262144` adds about 830 MiB per card.
+- The prompt filled half of the 262144 context. A prompt near the full context was not run.
+
+## 1.6 Q8_0 against the XL, graphs on
+
+Mean ± stdev of 3 llama-bench repetitions; MTP cells are 3 separate invocations (greedy, n-max 3, p-min 0.0, 256
+tokens). Order alternated per test.
+
+| test, t/s | A XL | A Q8_0 | B XL | B Q8_0 |
+|---|---:|---:|---:|---:|
+| tg512 | 29.81 ± 0.07 | 27.73 ± 0.15 | 31.23 ± 0.06 | 29.06 ± 0.07 |
+| pp2048 at depth 0 | 276.25 ± 0.36 | 277.14 ± 0.31 | 502.34 ± 0.55 | 508.09 ± 0.79 |
+| pp2048 at depth 16384 | 259.80 ± 0.37 | 261.13 ± 0.23 | 445.04 ± 0.74 | 449.94 ± 0.88 |
+| MTP chat | 37.62 ± 0.74 | 35.86 ± 0.04 | 40.03 ± 0.04 | 35.74 ± 0.04 |
+| MTP code | 56.09 ± 0.03 | 49.91 ± 0.05 | 55.91 ± 0.12 | 50.17 ± 0.05 |
+| MTP summ ~8k | 41.79 ± 0.07 | 39.18 ± 0.04 | 39.99 ± 0.04 | 40.13 ± 0.02 |
+
+- Q8_0 is 7.0% slower than the XL in plain decode on both configurations, and 0.3–1.1% faster in prefill.
+- With MTP, Q8_0 is 5–11% slower on five of the six cells and level on one (B, summ).
+- Round 1 measured Q8_0 as equal in decode; that was with graphs off, where decode was host-bound (section 3.7).
+- **These MTP cells are not comparable with section 1.2.** They were run with `LLAMA_SPEC_SAMPLE_TEMP=1.0
+  LLAMA_SPEC_DRAFT_TOPK=20` set in the environment (the serving configuration's draft settings), section 1.2 without.
+  The A XL cells here are 4–9% below section 1.2's n-max 3 / p-min 0.0 row.
+
+## 1.7 MTP under sampling
+
+`llama-speculative-simple`, n-max 3, 256 tokens, `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0` with
+`LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20`. Three prompts, seeds 1, 2, 3 in every cell. Cells: mean ± stdev
+t/s over the 3 seeds.
+
+| config | p-min | chat | code | summ ~8k | mean t/s | mean acceptance | ms per accepted draft token |
+|---|---|---:|---:|---:|---:|---:|---:|
+| A | 0.0 | 35.98 ± 6.05 | 49.18 ± 5.07 | 38.73 ± 2.74 | **41.3** | 50.5% | 46.7 |
+| A | 0.5 | 31.59 ± 3.00 | 48.21 ± 5.68 | 33.92 ± 1.11 | 37.9 | 63.1% | 53.2 |
+| A | 0.75 | 30.36 ± 1.30 | 43.20 ± 2.74 | 30.60 ± 0.34 | 34.7 | 76.3% | 61.2 |
+| B | 0.0 | 38.26 ± 2.96 | 54.78 ± 1.95 | 37.75 ± 2.89 | **43.6** | 54.6% | 46.2 |
+| B | 0.5 | 33.52 ± 1.56 | 48.09 ± 3.45 | 33.59 ± 1.25 | 38.4 | 63.0% | 54.1 |
+| B | 0.75 | 31.08 ± 1.49 | 45.36 ± 3.62 | 31.99 ± 1.54 | 36.1 | 76.4% | 62.6 |
+
+- p-min 0.0 is the fastest setting under sampling on both configurations and all three prompts, as it was under
+  greedy decoding (section 1.2).
+- A higher p-min raises acceptance and lowers throughput: fewer tokens are drafted.
+- The seed-to-seed standard deviation is up to 6 t/s, larger than the A-to-B difference in most cells.
+- The fork's default (n-max 4, p-min 0.2) was not in this grid either.
+
+## 1.8 NCCL KLD at `-c 16384`
+
+Stock `llama-perplexity`, wikitext-2 raw test, `-c 16384`, 4 chunks, q4_0 KV. It scores the second half of each
+chunk: positions 8192–16382, 32,764 tokens. Each run saved its logits; pairs of files were compared with
+`scripts/kldpos.cpp`.
+
+| pair | mean KLD | median | 99.9% | max | same top token |
+|---|---:|---:|---:|---:|---:|
+| NCCL against non-NCCL, both `-ub 2048` | 0.003104 | 0.000452 | 0.330 | 14.71 | 98.407% |
+| non-NCCL `-ub 5` against non-NCCL `-ub 2048` | 0.007028 | 0.000796 | 0.842 | 14.83 | 98.001% |
+
+Mean KLD per 1,024-position bucket (4,096 tokens per bucket):
+
+| positions | NCCL vs non-NCCL | `-ub 5` vs `-ub 2048` |
+|---|---:|---:|
+| 8192–9215 | 0.00229 | 0.00458 |
+| 9216–10239 | 0.00210 | 0.01112 |
+| 10240–11263 | 0.00172 | 0.00294 |
+| 11264–12287 | 0.00582 | 0.01300 |
+| 12288–13311 | 0.00339 | 0.00593 |
+| 13312–14335 | 0.00424 | 0.00703 |
+| 14336–15359 | 0.00255 | 0.00739 |
+| 15360–16382 | 0.00272 | 0.00423 |
+
+- At 16k the NCCL difference is again smaller than the difference from changing `-ub` on the non-NCCL build.
+- Both means are 2–3 times their `-c 4096` values (0.00136 and 0.00231, section 1.3). The corpus also differs
+  between the two measurements, so this is not a clean measure of growth with context.
+- Within 8192–16382 there is no steady rise with position. Bucket means are dominated by a few tokens (the maximum
+  of 14.7 falls in the 11264–12287 bucket of both pairs).
+- Perplexity: 5.5947 (A, `-ub 2048`), 5.5880 (B, `-ub 2048`), 5.6259 (A, `-ub 5`), each ± 0.076.
+- Positions 0–8191 are not scored by the tool. `-c 65536` was not run: the tool holds every scored token's logits
+  in host memory (about 32 GB there, against 16 GB installed).
+- **Correction to section 1.3:** the `-c 4096` runs scored 16,376 tokens (the second half of each of 8 chunks), not
+  32,768. The KLD values there are unaffected.
+
+## 1.9 Agent battery, A against B
+
+A tool-calling coding agent driven by an evaluation harness, pointed at `llama-server` on the test machine: nine
+error-recovery tasks, 600 s limit per task, XL, `-c 262144`, MTP n-max 3 / p-min 0.0, the serving sampler. One
+server per block; blocks alternate A B, B A, A B (one repetition of all nine tasks each), then B A, A B, B A (one
+extra repetition of the two slowest tasks each). 33 task runs per configuration. The harness and its tasks are not
+part of this repository.
+
+| | A | B |
+|---|---:|---:|
+| passed, all 33 runs | 26 (79%) | 28 (85%) |
+| passed, first 3 repetitions of each task (27 runs) | 23 (85%) | 24 (89%) |
+| passed, excluding `err_big_file_read` (27 runs) | 26 (96%) | 26 (96%) |
+| mean wall time per task, all 33 runs | 223 s | 166 s |
+| mean wall time per task, first 3 repetitions | 183 s | 124 s |
+| runs killed at the 600 s limit | 6 | 4 |
+| server prefill, all 150 requests | 242.2 t/s | 377.9 t/s |
+| server decode with MTP, all requests | 48.1 t/s | 48.9 t/s |
+| draft acceptance, all requests | 71.2% | 73.3% |
+| peak MiB, GPU 0 / 1 / 2 | 11027 / 10929 / 11017 | 11125 / 11027 / 11115 |
+
+| task | n | A passed | A mean wall | B passed | B mean wall |
+|---|---:|---:|---:|---:|---:|
+| err_python_env | 3 | 3 | 109 s | 3 | 94 s |
+| err_replay_patch | 3 | 3 | 104 s | 3 | 69 s |
+| err_ambiguous_edit | 3 | 3 | 119 s | 3 | 83 s |
+| err_case_search | 3 | 3 | 133 s | 3 | 86 s |
+| err_hidden_search | 3 | 2 | 104 s | 2 | 69 s |
+| err_big_output | 3 | 3 | 109 s | 3 | 66 s |
+| err_multi_dir | 3 | 3 | 103 s | 3 | 74 s |
+| err_inline_script | 6 | 6 | 237 s | 6 | 206 s |
+| err_big_file_read | 6 | 0 | 600 s | 2 | 433 s |
+
+- **B's prefill advantage shows up in task wall time.** Every task is faster on B (13–39%); the seven 3-repetition
+  tasks average 112 s on A and 77 s on B. Decode speed is the same on both.
+- **Every killed run is `err_big_file_read`:** 6 of 6 on A, 4 of 6 on B. With six runs per configuration the
+  difference between A and B on that task is not established.
+- **One run per configuration failed without timing out:** `err_hidden_search` (exit code 0, a wrong answer: the
+  agent listed one of the two matching files and missed the one in a hidden directory). A repetition 2, B
+  repetition 0.
+- No new warning or error appeared in the server logs of either configuration.
+- An earlier run of the same battery (3 repetitions, a different quant file, UD-Q5_K_XL, before these settings)
+  passed 24 of 27 (89%; 23 of 24 excluding `err_big_file_read`) at a mean of 187 s per task and 207.5 t/s server
+  prefill. The model file differs, so it is context, not a controlled comparison.
 
 ---
 

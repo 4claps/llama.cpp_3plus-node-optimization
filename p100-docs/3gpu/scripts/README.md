@@ -56,3 +56,16 @@ GPU + API trace), `analyze_i4.py` (per-kernel table from an op profile and an nv
 
 The queue scripts for rounds 2 and 3 are not included; their exact command lines are in `results/round2/run_log.txt` and
 `results/round3/run_log.txt`.
+
+## Round 4 tools
+
+- `kldpos.cpp`: per-position KL divergence between two files saved by `llama-perplexity --kl-divergence-base`.
+  Prints the overall mean, median, 99.9% and maximum KLD and the top-token agreement, then one CSV line per position
+  bucket. Build: `g++ -O2 -pthread -o kldpos kldpos.cpp`. Run: `kldpos base.bin test.bin [bucket=1024]`. It reads
+  both files with `pread` and needs little memory. It also accepts a second header (`_logitsA`, every position of
+  one context) that no program in this directory writes.
+- `context_fit_client.py`: sends the first N tokens of a text file to a running `llama-server` as one prompt with the
+  prompt cache off and prints the server's timings. `context_fit_client.py fit <corpus> <n_tokens>`.
+
+The round 4 queue and the agent-battery runner are not included: they hold machine-specific paths and addresses.
+Their command lines are in `results/round4/run_log.txt`, and the battery procedure is in METHODOLOGY.md.
