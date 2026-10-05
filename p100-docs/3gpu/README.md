@@ -15,7 +15,14 @@ contains measurements and the scripts that produced them. It changes no source, 
 | The NCCL prefill gain carries through to an agent workload: mean task time 124 s against 183 s | Moderate | Nine tasks, 3 repetitions, alternating blocks; every task faster. One harness, one model file |
 | Both configurations run `-c 262144` on 3 cards, with over 5 GB free per card | Moderate | One 129,000-token prompt per configuration; a full context was not run |
 | Q8_0 decodes 7% slower than the XL with graphs on, and prefills the same | High | 3 repetitions per cell on both configurations |
-| NCCL's output differs from the non-NCCL path by no more than changing `-ub` does | Moderate | Mean KLD 0.0014 against 0.0023 for `-ub 5` vs `-ub 2048` at `-c 4096`; 0.0031 against 0.0070 at `-c 16384`. Not measured beyond 16k |
+| NCCL's output differs from the non-NCCL path by no more than changing `-ub` does | Moderate to high | Mean KLD 0.0014 against 0.0023 for `-ub 5` vs `-ub 2048` at `-c 4096`; 0.0031 against 0.0070 at `-c 16384`; 0.0009 against 0.0015 over all 65,535 positions of one 65,536-token context, with no growth by position. One corpus per size |
+| No NCCL environment setting beats NCCL's defaults by 3% on this topology | High | One variable at a time and one combination, 3 tests, 6 default runs; the best (1 channel) gives +1.6% prefill |
+| The 125 W power cap limits throughput: 150 W gives +6.5% decode and +5% prefill, 175 W +7.7% and +9% | High for llama-bench | 2–3 alternated invocations per cap; decode per GPU watt falls 12% and 21% |
+| `-np 2` works with tensor split, NCCL and MTP, but a second client still waits for a long prefill to finish | Moderate | One server per arm, 3 repetitions; cause not investigated |
+| A request dropped during prefill holds the slot until the `llama_decode` call in flight ends: 72–74 s at `-b 32768`, about 4 s at `-b 2048` | High for the points measured | Server-log timestamps, 3 repetitions each; one drop point, so the worst case per `-b` is inferred |
+| Polling `/slots` 5 times a second delays the server's disconnect check to the end of prefill (about 80 s), at any `-b` | High for the effect, low for the cause | 9 runs with polling against 9 without; the explanation is from reading the code |
+| `-b 2048` costs 0.3–0.8% of 64k prefill speed and nothing in decode | Moderate | 125 W sweep and a 150 W pair; few repetitions |
+| The server ran 90 minutes of mixed requests with no failure, drift or memory growth | Moderate | One soak, one client, 349 requests |
 | NCCL decode is repeatable but not bit-identical to the non-NCCL path | High | Saved-logit hashes: 8 of 8 identical runs; 3.3% of bytes differ against the non-NCCL build |
 | The generic 3-GPU exchange takes 54–57% of prefill time | High | nvprof attribution; prefill is not host-bound |
 | Out-of-tree one-shot and ring all-reduce kernels beat the replicated generic pattern and are bit-identical across the 3 cards | Moderate | A standalone benchmark, not the fork's code path; projected savings are projections |
@@ -29,7 +36,8 @@ Full list: [LIMITATIONS.md](LIMITATIONS.md).
 
 - 3x Tesla P100-PCIE-16GB, each on a PCIe 3.0 x8 link, all behind one host bridge (no NVLink, no PCIe switch).
 - Single-socket Sandy Bridge-E host (Core i7-3930K, 6 cores), **16 GB RAM**, model on a SATA SSD.
-- 125 W power cap per card. NVIDIA driver 580.178.04, CUDA 12.9.1, NCCL 2.27.3 (in the build image).
+- 125 W power cap per card for rounds 1 to 5 and part of round 6; 150 W for the client-drop tests and the settings
+  now served. NVIDIA driver 580.178.04, CUDA 12.9.1, NCCL 2.27.3 (in the build image).
 - Build `ae35056eb`, `-DCMAKE_CUDA_ARCHITECTURES=60`, Release, native CPU flags, run in a Docker container.
 - Model: Qwen3.8-27B. "XL" = unsloth `UD-Q6_K_XL` (23.55 GiB of tensor data: 12.6 GiB Q8_0, 9.9 GiB Q6_K,
   1.0 GiB Q5_K). Also unsloth pure Q8_0 and a locally requantized pure Q6_K.
@@ -60,6 +68,24 @@ Agent battery (nine tool-calling tasks, 600 s limit, `-c 262144`, MTP on, sample
 | server decode with MTP over the battery | 48.1 t/s | 48.9 t/s |
 | peak memory per card | 11.0 GiB | 11.1 GiB |
 
+Rounds 5 and 6 (configuration B; sections 1.10 to 1.21):
+
+| | |
+|---|---|
+| NCCL tuning | no setting beats the default by 3%; 1 channel gives +1.6% prefill |
+| Power cap, tg512 / pp2048 at depth 0 | 125 W: 31.25 / 506.0 t/s; 150 W: 33.29 / 530.4; 175 W: 33.66 / 549.0 |
+| `-ub 4096` against 2048, 8,192-token prompt | +1.3% and +0.8%, for 2.4 GB more per card |
+| NCCL against non-NCCL, 65,536-token context | mean KLD 0.00089, same top token 98.62%; four identical NCCL hashes |
+| Second client arriving 5 s into a 64k prefill, time to first token | 163 s on one slot; 164–192 s on two |
+| Two short chats at once, aggregate | 37 t/s on one slot; 45–47 t/s on two |
+| Slot release after a client drops mid-prefill, nothing else calling | 72–74 s at `-b 32768`; about 4 s at `-b 2048` and `-b 4096` |
+| The same with `/slots` polled 5 times a second | about 80 s at every `-b` |
+| 64k prefill, `-b 2048` against `-b 32768`, 150 W | 403.4 against 404.8 t/s |
+| 90-minute soak | 349 requests, none failed; prefill flat; peak memory constant |
+
+Settings now served on the test machine: configuration B, `-c 262144`, `-b 2048 -ub 2048`, `-lm none -fit off`,
+one slot, MTP n-max 3 / p-min 0.0, 150 W per card (section 1.21).
+
 Other measurements in [RESULTS.md](RESULTS.md):
 
 - **Where a decode token goes** (graphs on): matvec 21.2 of 33.8 ms; 128 exchanges of 20 KB per token; exchange
@@ -81,7 +107,7 @@ Other measurements in [RESULTS.md](RESULTS.md):
 
 | | |
 |---|---|
-| [RESULTS.md](RESULTS.md) | All results; final numbers first (Parts 1 and 1b), superseded round-1 decode numbers last |
+| [RESULTS.md](RESULTS.md) | All results; final numbers first (Parts 1 to 1d), superseded round-1 decode numbers last |
 | [METHODOLOGY.md](METHODOLOGY.md) | Protocol, command lines, build, how the pure Q6_K was made |
 | [LIMITATIONS.md](LIMITATIONS.md) | What these numbers do not show |
 | [results/](results/) | Per-run output, telemetry and profiler summaries; see its README for what was left out |

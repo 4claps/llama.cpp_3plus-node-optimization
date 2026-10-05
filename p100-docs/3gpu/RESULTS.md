@@ -6,11 +6,15 @@ unsloth `UD-Q6_K_XL` quant; "Q8_0" is the unsloth pure Q8_0; "pure Q6_K" is a lo
 -b 32768 -ub 2048 -ngl 99`, `GGML_CUDA_P2P=1`, mean ± stdev of llama-bench repetitions. Read
 [LIMITATIONS.md](LIMITATIONS.md) before quoting anything.
 
-Four measurement rounds are reported. They are ordered here by how much weight the numbers deserve, not by date:
+Six measurement rounds are reported. They are ordered here by how much weight the numbers deserve, not by date:
 
 - **Part 1 (round 3, final):** graphs on (`GGML_CUDA_GRAPHS_PRE_VOLTA=3`), `-lm none`, with and without NCCL.
 - **Part 1b (round 4):** `-c 262144` fit, Q8_0 against the XL, MTP under sampling, NCCL KLD at `-c 16384`, and an
   agent battery on A and B.
+- **Part 1c (round 5):** NCCL tuning, the power cap, concurrent clients and `-np 2`, `-ub`, NCCL KLD at
+  `-c 65536`, and a 90-minute server soak.
+- **Part 1d (round 6):** `-b`, a client drop during prefill with and without `/slots` polling, and the settings
+  now served.
 - **Part 2 (round 2):** the decode budget, the AllReduce shootout, noise, layer split, MTP grid, `-ub`, the pure
   Q6_K, the thermal soak, and the first NCCL runs. Mixed settings; each table says which.
 - **Part 3 (round 1, decode numbers superseded):** P2P characterization and prefill attribution (still valid), and
@@ -334,6 +338,271 @@ part of this repository.
 - An earlier run of the same battery (3 repetitions, a different quant file, UD-Q5_K_XL, before these settings)
   passed 24 of 27 (89%; 23 of 24 excluding `err_big_file_read`) at a mean of 187 s per task and 207.5 t/s server
   prefill. The model file differs, so it is context, not a controlled comparison.
+
+---
+
+# Part 1c. Round 5: NCCL tuning, power cap, concurrent clients, `-ub`, 65k KLD, soak
+
+Configuration B (NCCL build, `NCCL_P2P_LEVEL=SYS`, graphs `=3`, `-lm none`), XL. Raw material: `results/round5/`.
+One script fault occurred in this round; it is described in section 1.11.
+
+## 1.10 NCCL tuning
+
+One variable at a time against the default, `NCCL_P2P_LEVEL=SYS` kept. llama-bench `-r 3` per cell; six default runs
+per test, spread through the sweep. Rule set before the runs: a gain counts only if it is at least 3% and more than
+2 standard deviations.
+
+**What NCCL picks by default here** (from `NCCL_DEBUG=INFO`): Ring algorithm, 2 channels, P2P direct-pointer
+transport. Decode-sized exchanges (20,480 bytes, f32) use protocol LL on 1 channel; prefill-sized exchanges (BF16)
+use protocol Simple on both channels.
+
+| setting | tg512 t/s | ratio | pp2048, depth 0, t/s | ratio | pp2048, depth 16384, t/s | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| default (6 runs) | 31.27 ± 0.06 | 1.000 | 506.63 ± 0.51 | 1.000 | 448.84 ± 0.74 | 1.000 |
+| `NCCL_ALGO=Ring` | 31.28 ± 0.05 | 1.000 | 506.78 ± 0.45 | 1.000 | 449.06 ± 1.16 | 1.000 |
+| `NCCL_ALGO=Tree` | 28.47 ± 0.05 | 0.910 | 482.05 ± 0.31 | 0.951 | 430.16 ± 0.17 | 0.958 |
+| `NCCL_PROTO=LL` | 31.24 ± 0.08 | 0.999 | 422.44 ± 0.37 | 0.834 | 380.73 ± 0.18 | 0.848 |
+| `NCCL_PROTO=LL128` | 29.68 ± 0.07 | 0.949 | 502.01 ± 0.64 | 0.991 | 444.34 ± 0.87 | 0.990 |
+| `NCCL_PROTO=Simple` | 28.98 ± 0.05 | 0.927 | 506.69 ± 0.59 | 1.000 | 448.93 ± 1.07 | 1.000 |
+| `NCCL_BUFFSIZE=4194304` (the default size) | 31.25 ± 0.06 | 0.999 | 506.74 ± 0.64 | 1.000 | 448.56 ± 0.62 | 0.999 |
+| `NCCL_BUFFSIZE=16777216` | 31.22 ± 0.07 | 0.998 | 508.81 ± 0.77 | 1.004 | 449.77 ± 0.74 | 1.002 |
+| 1 channel (`NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1`) | 31.24 ± 0.05 | 0.999 | 514.80 ± 0.63 | 1.016 | 453.46 ± 0.82 | 1.010 |
+| 2 channels | 31.26 ± 0.06 | 1.000 | 506.19 ± 0.76 | 0.999 | 448.99 ± 1.19 | 1.000 |
+| 4 channels | 31.25 ± 0.05 | 0.999 | 501.18 ± 0.71 | 0.989 | 443.87 ± 0.88 | 0.989 |
+| 1 channel + 16 MiB buffer | 31.24 ± 0.06 | 0.999 | 515.38 ± 0.25 | 1.017 | 455.18 ± 1.07 | 1.014 |
+
+- **No setting beats the default by the 3% rule.** The closest is 1 channel: +1.6% and +1.0% prefill, decode
+  unchanged. It is repeatable (run-to-run spread is 0.1–0.2%) and small.
+- Nothing was rejected or ignored. The channel count is adjustable on this topology (NCCL reported 1, 2 and 4
+  channels as requested).
+- Because no setting qualified, the bit-exactness check planned for a winner was not run.
+
+## 1.11 Power cap
+
+The cards are capped at 125 W on this machine (the cap's minimum; the default is 250 W). During configuration-B runs
+at 125 W the driver's power-cap reason was active in up to 80% of busy samples on a card in decode and 30–50% in
+prefill (1 Hz samples; busy = utilization above 50%). The cap was then swept with `nvidia-smi -pl` on all three
+cards. llama-bench `-r 3`; two invocations per raised cap and three at 125 W, alternated with 125 W.
+
+| cap | tg512 t/s | pp2048, depth 0, t/s | pp2048, depth 16384, t/s | GPU power in decode, sum of 3 | GPU + CPU package peak | hottest card | decode t/s per GPU watt |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 125 W | 31.25 ± 0.07 | 506.00 ± 0.38 | 448.28 ± 0.76 | 356 W | 454 W | 54 °C | 0.0877 |
+| 150 W | 33.29 ± 0.10 (+6.5%) | 530.42 ± 1.05 (+4.8%) | 471.27 ± 0.68 (+5.1%) | 430 W | 500 W | 58 °C | 0.0775 (−12%) |
+| 175 W | 33.66 ± 0.18 (+7.7%) | 548.98 ± 0.32 (+8.5%) | 490.52 ± 0.84 (+9.4%) | 484 W | 562 W | 60 °C | 0.0696 (−21%) |
+
+- 125 to 150 W buys 2.0 t/s of decode for 74 W of GPU power. 150 to 175 W buys 0.4 t/s of decode for 54 W; prefill
+  keeps gaining (+3.5% and +4.1%).
+- At 175 W decode is no longer power-capped (0–4% of busy samples); prefill still is on some cards (up to 40%).
+- CPU package power is from RAPL; the motherboard, memory, drives and fans are not in the telemetry.
+- **Script fault.** The run harness's cool-down function overwrote the shell variable that the sweep loop used for the
+  test name. The first attempt at the alternated second run per cap therefore ran llama-bench's default test instead
+  of the intended one. Those runs are tagged `i2__pl*` in `results/round5/runs.csv` and are excluded. The queue was
+  stopped and restarted with the variable renamed, and the proper second runs were added; the table uses those.
+  Section 1.13 would have hit the same fault and was run only with the corrected script.
+
+## 1.12 Concurrent clients, and `-np 2`
+
+`llama-server`, `-c 262144`, MTP n-max 3 / p-min 0.0, serving sampler, `-b 32768`. One server per arm; each scenario
+3 times. (a) client 1 sends a 64,000-token prompt, client 2 a short chat 5 s later. (b) two short chats at once.
+(c) the 64,000-token request is dropped by its client halfway through prefill.
+
+| | `-np 1` | `-np 2 --kv-unified` | `-np 2 --no-kv-unified` |
+|---|---:|---:|---:|
+| context per slot | 262144 | 262144 (shared) | 131072 |
+| peak MiB per card | 11173 / 11075 / 11163 | 12383 / 12285 / 12371 | 11849 / 11751 / 11837 |
+| (a) second client, time to first token | 162.5 s | 191.9 s | 163.8 s |
+| (a) first client, 64k prompt total | 166.6 s (386 t/s) | 198.6 s (325 t/s) | 170.6 s (379 t/s) |
+| (b) two chats at once, aggregate | 37.2 t/s | 45.4 t/s | 47.3 t/s |
+| (b) per-client decode | 37–50 t/s, one after the other | 23–32 t/s, together | 23–32 t/s, together |
+| single client, chat decode (2 requests) | 49.0 t/s | 41.0 t/s | 46.8 t/s |
+| single client, 20k-token prompt | 450.3 t/s | 439.4 t/s | 445.3 t/s |
+
+- **`-np 2` works with `-sm tensor`, NCCL and MTP on this build**, with and without `--kv-unified`: no flag was
+  rejected and no request failed.
+- **It does not let a second client in during a long prefill.** With two slots the second client still waited for
+  the first client's whole prefill.
+- Two simultaneous short chats get 22–27% more aggregate throughput on two slots, each at about 60% of single-client
+  speed.
+- Cost of `-np 2`: 1.2 GB more per card with `--kv-unified`, 0.7 GB without; `--kv-unified` also slowed the 64k
+  prefill by 16%.
+- **The (c) timings of this round are not reported here.** They were taken while the client polled `/slots` five
+  times a second, which itself delays the server's disconnect check (section 1.19). The raw (c) records are in
+  `results/round5/` for reference.
+
+## 1.13 `-ub` under NCCL
+
+| `-ub` | pp2048, depth 0, t/s | pp2048, depth 16384, t/s |
+|---|---:|---:|
+| 512 | 437.33 ± 1.24 (−13.5%) | 390.31 ± 0.52 (−12.9%) |
+| 1024 | 471.14 ± 0.53 (−6.8%) | 419.45 ± 0.16 (−6.4%) |
+| 2048 | 505.55 ± 0.62 | 447.99 ± 0.68 |
+| 4096 | 505.99 ± 0.28 (+0.1%) | 448.46 ± 1.00 (+0.1%) |
+
+- A 2,048-token prompt is one micro-batch at both 2048 and 4096, so this table cannot separate them; section 1.17
+  repeats the comparison with an 8,192-token prompt.
+- None of these values changes which exchanges use BF16: the switch is at 131,072 elements with 3 backends
+  (`ggml-cuda.cu`), 26 tokens of 5,120 values, and every prefill micro-batch here is far above it.
+
+## 1.14 NCCL KLD at `-c 65536`
+
+One 65,536-token context of wikitext-2 raw test (articles concatenated, unmodified), every position scored (65,535
+tokens). Stock `llama-perplexity` holds every scored token's logits in host memory (about 32 GB here, against 16 GB
+installed), so an out-of-tree tool decoded the context in 2,048-token batches and wrote each position's 16-bit
+log-probabilities to disk in `llama-perplexity`'s record format; `scripts/kldpos.cpp` compared pairs of files. The
+tool reproduces `llama-perplexity`'s saved file exactly at `-c 4096` (0 of 2,047 records differ).
+
+| positions | NCCL vs non-NCCL: mean KLD | max | same top token | non-NCCL `-ub 5` vs `-ub 2048`: mean KLD | max | same top token |
+|---|---:|---:|---:|---:|---:|---:|
+| all | 0.000891 | 1.687 | 98.622% | 0.001516 | 0.555 | 98.245% |
+| 0–4,095 | 0.000688 | 0.137 | 98.779% | 0.001287 | 0.203 | 98.511% |
+| 4,096–16,383 | 0.000873 | 0.449 | 98.649% | 0.001587 | 0.555 | 98.446% |
+| 16,384–32,767 | 0.000902 | 0.213 | 98.499% | 0.001482 | 0.188 | 98.047% |
+| 32,768–65,534 | 0.000919 | 1.687 | 98.654% | 0.001535 | 0.532 | 98.236% |
+
+- NCCL's difference is about 0.6 of the non-NCCL batch-size difference in every bucket, and does not grow with
+  position after the first 4k.
+- Repeatability: three more NCCL runs at `-c 65536` and the saved run gave the same hash of all records, 4 of 4.
+- One corpus and one context. The dump tool is not included (see `results/README.md`).
+
+## 1.15 Server soak, 90 minutes
+
+One slot, `-c 262144`, MTP on, serving sampler. One client, one request at a time: short chats and code requests
+alternating, a 20,000-token prompt every sixth step, a 64,000-token prompt about every 10 minutes, each long prompt
+preceded by a short request.
+
+| request | n | prefill t/s, first 15 min | last 15 min | decode t/s, first 15 min | last 15 min |
+|---|---:|---:|---:|---:|---:|
+| chat | 141 | — | — | 44.0 | 42.9 |
+| code | 96 | — | — | 45.0 | 43.9 |
+| 20k-token prompt | 47 | 448.3 | 447.7 | 40.3 | 38.5 |
+| 64k-token prompt | 9 | 385.2 | 384.2 | 38.9 | 40.9 |
+
+- 349 requests, none failed, no crash. Peak memory was 11173 / 11075 / 11163 MiB in every 10-minute window.
+- Prefill was flat. Decode on chat and code requests was 2.5% lower in the last 15 minutes than the first.
+- Cards peaked at 61 / 64 / 61 °C. The server log has four warning lines, all at startup.
+- 56 short-then-long request pairs ran without the second-request failure of upstream issue 29466.
+
+---
+
+# Part 1d. Round 6: `-b`, client drops during prefill, and the settings now served
+
+Configuration B, XL, `-c 262144`, MTP n-max 3 / p-min 0.0, one slot. Raw material: `results/round6/`.
+
+## 1.16 `-b` sweep (125 W)
+
+One server per value. (a) a 64,000-token prompt alone, once; (b) the same prompt with a second client's short chat
+5 s later, twice; (d) a 512-token generation, three seeds. Fewer repetitions than the other rounds, to fit a
+90-minute limit.
+
+| `-b` | (a) 64k prefill t/s | vs 32768 | (b) second client, time to first token | (b) first client total | (d) decode t/s |
+|---|---:|---:|---:|---:|---:|
+| 32768 | 388.4 | 1.000 | 162.5 s | 166.5 s | 37.8 |
+| 8192 | 386.3 | 0.995 | 163.3 s | 167.3 s | 36.4 |
+| 4096 | 387.8 | 0.998 | 163.6 s | 167.6 s | 38.2 |
+| 2048 | 385.4 | 0.992 | 164.1 s | 168.1 s | 37.1 |
+
+- A smaller `-b` costs under 1% of prefill speed and leaves decode unchanged.
+- It does not shorten a second client's wait on one slot.
+- This round also timed a dropped request at each `-b`, with `/slots` polled five times a second. Those timings
+  showed only the polling effect of section 1.19 and are superseded by sections 1.18 and 1.19.
+
+## 1.17 `-ub` with an 8,192-token prompt (125 W)
+
+| test | `-ub 2048` t/s | peak MiB per card | `-ub 4096` t/s | peak MiB per card | 4096 / 2048 |
+|---|---:|---|---:|---|---:|
+| pp8192, depth 0 | 498.25 ± 0.89 | 10565 / 10563 / 10581 | 504.63 ± 0.84 | 12971 / 12969 / 12987 | 1.013 |
+| pp8192, depth 16384 | 436.68 ± 0.88 | 10659 / 10657 / 10681 | 440.24 ± 0.86 | 13065 / 13063 / 13087 | 1.008 |
+
+- `-ub 4096` gains 1.3% and 0.8% and costs 2.4 GB more per card. `-ub 2048` was kept.
+
+## 1.18 A client drop during prefill: how long the slot stays busy
+
+A 64,000-token streaming request; the client closes the connection 78 s after sending, about half of the prefill at
+150 W. Times are differences of server-log timestamps. No other request or call reaches the server until the log
+shows the slot released (the client follows the container's log, which makes no call to the server); then one short
+chat is sent. 3 repetitions, alternating with the scenario of section 1.19.
+
+| `-b` | drop to the server's "cancel task" line | drop to slot release | drop to next request accepted | prompt tokens in the slot at release |
+|---|---|---|---|---:|
+| 32768 | 0.01, 0.01, 0.01 s | 72.3, 73.9, 74.0 s | 72.6, 74.2, 74.3 s | 61,948 |
+| 4096 | 0.02, 0.01, 0.01 s | 3.8, 4.0, 3.8 s | 4.2, 4.3, 4.2 s | 36,864 |
+| 2048 | 0.02, 0.01, 0.02 s | 3.8, 4.3, 4.0 s | 4.3, 4.8, 4.2 s | 36,864 |
+
+- The server notices the drop at once, but acts on a cancel only between `llama_decode` calls, and `-b` sets how
+  many prompt tokens go into one call. At `-b 32768` the 64,000-token prompt is four calls (32,768, 29,180, 2,048 and
+  4 tokens); the drop fell at the start of the second, which ran to its end.
+- At `-b 2048` and `-b 4096` the slot was released about 4 s after the drop. Both released at 36,864 tokens, a
+  boundary of both batch sizes, so these runs do not separate them. The expected worst case, one full batch (about
+  5 s at 2048, about 10 s at 4096), is inferred, not measured.
+- The `-b 32768` rows were taken on the serving configuration itself; the other two in a test container with the
+  same settings.
+
+Server log around the drop at `-b 2048` (drop at 2.54.87):
+
+```
+2.53.558.528 I slot print_timing: id  0 | task 9 | prompt processing, n_tokens =  34816, progress = 0.54, t =  75.07 s / 463.79 tokens per second
+2.54.890.647 W srv          stop: cancel task, id_task = 9
+2.58.686.633 I slot      release: id  0 | task 9 | stop processing: n_tokens = 36864, truncated = 0
+2.59.124.797 I slot launch_slot_: id  0 | task 29 | processing task, is_child = 0
+```
+
+## 1.19 The same drop while another client polls `/slots`
+
+As section 1.18, with a second connection requesting `/slots` five times a second throughout (about 790 answered
+requests per run), and separately with `/health` requested every 5 s.
+
+| `-b` | other traffic | drop to "cancel task" | drop to slot release |
+|---|---|---|---|
+| 32768 | `/slots`, 5 per second | 79.5, 81.2, 80.5 s | 79.6, 81.2, 80.5 s |
+| 4096 | `/slots`, 5 per second | 80.0, 79.7, 79.1 s | 80.1, 79.8, 79.2 s |
+| 2048 | `/slots`, 5 per second | 79.7, 79.3, 79.8 s | 79.8, 79.4, 79.8 s |
+| 32768 | `/health`, every 5 s | 0.01, 0.01, 0.01 s | 73.8, 74.0, 74.1 s |
+
+- **Polling `/slots` five times a second delays the server's disconnect check until prefill has finished**, at every
+  `-b`: the "cancel task" line appears only after the first generated token, about 80 s after the drop.
+- `/health` every 5 s has no effect.
+- Reading of the code (not a measurement): the handler waiting for a request's first result tests for a closed
+  connection only when a 1-second wait on a condition variable times out, and every result delivered for any request
+  wakes all waiters and restarts that wait. `/slots` requests are answered during a decode, so five a second keep the
+  wait from ever timing out. The same code is in upstream llama.cpp master as of 2026-10-05. No code was changed.
+
+## 1.20 Cost of `-b 2048` at 150 W
+
+One server per value; three 64,000-token prompts alone, then three 512-token generations.
+
+| | `-b 2048` | `-b 32768` |
+|---|---|---|
+| 64k prefill t/s, repetitions 1 / 2 / 3 | 406.7 / 402.5 / 401.0 | 406.7 / 404.4 / 403.1 |
+| 64k prefill t/s, mean | 403.4 | 404.8 |
+| 512-token decode t/s, seeds 1 / 2 / 3 | 38.3 / 38.7 / 40.1 | 38.6 / 36.1 / 39.4 |
+
+- Prefill is 0.3% lower at `-b 2048`; decode differences are within seed-to-seed spread.
+- The two values ran one after the other, and only the first prefill repetition of each followed a cool-down.
+
+## 1.21 Settings now served on the test machine
+
+```
+environment: GGML_CUDA_P2P=1  GGML_CUDA_GRAPHS_PRE_VOLTA=3  NCCL_P2P_LEVEL=SYS
+             LLAMA_SPEC_SAMPLE_TEMP=1.0  LLAMA_SPEC_DRAFT_TOPK=20
+llama-server (NCCL build) -m Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots
+    --parallel 1 -c 262144 -ngl 99 -sm tensor -ts 1/1/1 -fa 1 -ctk q4_0 -ctv q4_0 -b 2048 -ub 2048
+    -lm none -fit off --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0
+    -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0
+power cap: 150 W per card
+```
+
+Checks after starting it (single requests, from a second machine on the LAN):
+
+| request | prompt tokens | prefill t/s | generated | decode t/s |
+|---|---:|---:|---:|---:|
+| short chat | 64 | — | 53 | 40.1 |
+| second request right after | 21 | — | 200 | 49.7 |
+| 64,000-token prompt | 64,000 | 404.7 | 64 | 37.4 |
+
+- Startup: MTP draft context created, `-lm none` and `-fit off` accepted, five warning lines (no API key, CPU
+  sampler under tensor split twice, a reasoning-template note, a notice about a future default port).
+- Peak during the checks: 61 / 63 / 60 °C, 11,125 / 11,027 / 11,115 MiB.
+- With `-b 32768` at 150 W the same 64,000-token prompt ran at 406.9 t/s.
 
 ---
 

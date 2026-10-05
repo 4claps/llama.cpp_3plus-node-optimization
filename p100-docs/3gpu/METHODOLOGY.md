@@ -20,7 +20,7 @@
 - **One run = one process in a fresh container.** The model is loaded from disk every time.
 - **Cool-down before every run:** wait until every GPU is at or below the limit, with a 10-minute cap; the wait and
   the start temperatures are logged. The limit was ≤45 °C or idle baseline + 2 °C (round 1), ≤45 °C (round 2), and
-  ≤48 °C with the fans at full speed (round 3 after its first three results, and round 4).
+  ≤48 °C with the fans at full speed (round 3 after its first three results, and rounds 4 to 6).
 - **Warmup:** llama-bench's built-in warmup (discarded) on every throughput run. Server runs send a discarded warmup
   request first. Round 1's nvprof and op-profile runs used `--no-warmup`.
 - **Repetitions:** llama-bench `-r 3` per invocation unless stated; the tables give mean ± stdev of those
@@ -36,7 +36,7 @@
   while busy, no GPU memory in use for 10 minutes, a failed fan check, or a new kernel Xid. A new error in a run's
   stderr also stops the queue (round 1 only flagged it); an out-of-memory failure is recorded as "does not fit".
 - **Nothing else runs on the machine** during a measured run (no builds, quantization or large copies).
-- **Model load:** default (mmap) in round 1; `-lm none` in rounds 2, 3 and 4. On this 16 GB-RAM machine mmap adds
+- **Model load:** default (mmap) in round 1; `-lm none` from round 2 on. On this 16 GB-RAM machine mmap adds
   noise and a mean penalty to decode (RESULTS.md section 2.3) and roughly doubles load time.
 
 ## Command lines
@@ -159,6 +159,77 @@ repository.
   repetition of `err_inline_script` and `err_big_file_read`. Tasks run one at a time.
 - Prefill and decode rates are sums over every request in the server logs (`prompt eval time` and `eval time`
   lines): tokens divided by time. Pass or fail is the harness's verdict.
+
+## Rounds 5 and 6
+
+Both rounds use configuration B (the NCCL build with `NCCL_P2P_LEVEL=SYS`, graphs `=3`, `-lm none`) and the XL. The
+protocol is as before: cool-down to 48 °C or below, a discarded warmup, 1 Hz telemetry and the watchdog. From round 5
+the 1 Hz `nvidia-smi` log also records every clock-event reason as its own column (`clocks_event_reasons.*`), and CPU
+package energy is read from RAPL once a second.
+
+**NCCL tuning.** One run with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,COLL,TUNING` (pp2048 plus 32 generated tokens)
+to read the default algorithm, protocol and channels. Then one variable at a time, each as three llama-bench
+invocations (`-p 0 -n 512`, `-p 2048 -n 0`, `-p 2048 -n 0 -d 16384`, all `-r 3`), with a default run before the
+first setting, after every third setting and at the end. Every run of the sweep, default included, had
+`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT` writing to a file, which logs at initialization only. The two best single
+settings were then run together beside one more default run.
+
+**Power cap.** `nvidia-smi -pl N` on all three cards before a run, 125 W restored and read back after the sweep and
+by an exit trap. Busy sample: utilization above 50%. Power-cap fraction: share of a card's busy samples with
+`clocks_event_reasons.sw_power_cap` active. The 175 W step was conditional on three checks made on the 150 W runs:
+a gain of at least 3% on one test, every card below 75 °C, and a projected peak (3 x 175 W plus the CPU package
+peak) with 25% headroom under the 1000 W supply.
+
+**Server arms.** All server tests use these flags, with `--parallel`, `--kv-unified` and `-b` varied as stated:
+
+```
+GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=3 NCCL_P2P_LEVEL=SYS LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20 \
+build-nccl/bin/llama-server -m XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 \
+    -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none \
+    --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 \
+    --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0
+```
+
+- Long prompts are 64,000 (or 20,000) token ids from wikitext-2 raw test, sent to `/completion` with the prompt
+  cache off except in the soak; a different stretch of the corpus each time.
+- Time to first token is the first generated text on the stream, reasoning text included.
+- Concurrent clients (round 5): scenario (a) starts the second client 5 s after the first; (b) starts two chats
+  together; aggregate t/s is generated tokens of both divided by the wall time of the pair.
+- Soak: 90 minutes, one client, the request mix of RESULTS.md section 1.15; drift is the mean of the first
+  15 minutes against the last 15 minutes per request kind.
+
+**`-ub`.** Round 5: llama-bench `-p 2048 -n 0` at depth 0 and `-d 16384`, `-ub` 512, 1024, 2048 and 4096, `-b 32768`,
+`-r 3`, order reversed for the second test. Round 6: the same with `-p 8192` for 2048 against 4096; peak memory is
+the maximum of the 1 Hz log.
+
+**KLD at `-c 65536`.** An out-of-tree program links the build's `libllama`, loads the model with the settings used
+everywhere else (tensor split 1/1/1, all layers offloaded, flash attention, q4_0 KV, `-lm none`), decodes one
+65,536-token context in 2,048-token batches with logits requested at every position, and writes each position's
+log-probabilities with `llama-perplexity`'s 16-bit quantization and record layout. It keeps no more than one batch
+of logits in host memory. Three files were written (non-NCCL `-ub 2048`, NCCL `-ub 2048`, non-NCCL `-ub 5`) and
+compared with `scripts/kldpos.cpp` in 4,096-position buckets. The program was first checked against
+`llama-perplexity --kl-divergence-base` at `-c 4096` on the same build: positions 2,048–4,094 are in both files and
+all 2,047 records are byte-identical. Repeatability: three more NCCL runs without saving, comparing a 64-bit hash of
+all records.
+
+**Client drop during prefill (round 6).**
+
+1. The client sends a 64,000-token streaming request and notes the time.
+2. 78.0 s later it shuts the socket down and closes it.
+3. It then reads the server container's log through the container runtime every 0.5 s (no request to the server)
+   until the line `release: ... task N | stop processing` appears.
+4. It sends one short chat.
+
+All reported times are differences between server-log timestamps: the drop is placed on the log's clock as the
+request's `launch_slot_` line plus 78.0 s; "cancel task" and "release" are the server's own lines for that task;
+"next request accepted" is the `launch_slot_` line of the short chat. In the polling variants a second connection
+requests `/slots` every 0.2 s, or `/health` every 5 s, from before the long request until after the short chat.
+`-b 32768` was measured on the serving configuration, restarted for a clean state; `-b 2048` and `-b 4096` in a test
+container with the same flags, six servers alternating the two values, a cool-down before every scenario.
+
+Round 6's first `-b` sweep (RESULTS.md section 1.16) also dropped a request at each value, but sent the next chat at
+the moment of the drop and polled `/slots` every 0.2 s in parallel. Its drop timings are therefore measurements of
+the polling effect only.
 
 ## The pure Q6_K file
 

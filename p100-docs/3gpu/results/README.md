@@ -37,13 +37,37 @@ included (listed at the end).
 - `battery_server_blocks.csv`: per server block: requests, prompt and generated tokens, prefill and decode t/s,
   draft tokens generated and accepted, peak memory per GPU.
 
+## round5/ (NCCL tuning, power cap, concurrent clients, `-ub`, 65k KLD, soak; summaries only)
+
+- `runs.csv` and `run_log.txt`: as for the earlier rounds. Runs tagged `i2__pl*` are the faulty ones described in
+  RESULTS.md section 1.11.
+- `nccl_tuning_table.md`, `nccl_debug_excerpt.txt` (the most frequent NCCL debug lines of the default run, numbers
+  masked), `power_cap_table.md`, `power_cap_runs.csv` (per run and card: power-cap fraction, mean and peak power,
+  peak temperature, median SM clock; GPU and CPU package power), `ub_table.md`.
+- `concurrent_clients_<arm>.jsonl`: the client's record of every scenario; `..._cancel_log.txt`: server log after the
+  first dropped request of that arm. The `sc: "c"` records were taken with `/slots` polling (see section 1.19).
+- `kld_*_c65536.txt` and `kld_validation.txt`: `scripts/kldpos.cpp` output in 4,096-position buckets, and the check
+  of the dump tool against llama-perplexity.
+- `soak_requests.jsonl` (one line per request) and `soak_summary.md`.
+
+## round6/ (`-b`, `-ub` retest, client drops; summaries only)
+
+- `runs.csv`, `run_log_b_sweep.txt`, `b_sweep_and_ub_tables.md`, `b_sweep_b<N>.jsonl` and `..._cancel_log.txt`:
+  the 125 W `-b` sweep and the `-ub` retest. The `sc: "c"` records were taken with `/slots` polling.
+- `client_drop_test_b32768.jsonl` and `client_drop_test_b2048_b4096.jsonl`: one record per run of sections 1.18 and
+  1.19 (scenario 1 = no other calls, 2 = `/slots` five times a second, 3 = `/health` every 5 s), with the server
+  log lines around the drop. `run_log_client_drop_b2048_b4096.txt`: the queue's log for the test-container runs.
+- `b2048_cost_150w.jsonl`: section 1.20.
+
 ## Left out
 
 - **nvprof traces** (13–119 MB each, about 550 MB in total).
-- **Raw per-run stdout, stderr and 1 Hz telemetry for rounds 2, 3 and 4**, including the battery's server logs. Only
-  the summaries above are here.
+- **Raw per-run stdout, stderr and 1 Hz telemetry for rounds 2 to 6**, including the battery's and the soak's
+  server logs and the full NCCL debug file. Only the summaries above are here.
+- **The round 5 and 6 queue scripts, server clients and the 65k logit-dump tool.** They hold machine-specific paths
+  and addresses; the command lines are in the run logs and the procedures in METHODOLOGY.md.
 - **The agent battery's harness, task definitions and agent transcripts** (a separate private project).
 - **The round 4 queue and battery-runner scripts** (they hold machine-specific paths and addresses; their command
   lines are in `round4/run_log.txt`).
-- **Saved logits** for the KLD runs (8–16 GB per file) and the model files.
-- **Per-core CPU frequency logs** (rounds 2, 3 and 4).
+- **Saved logits** for the KLD runs (8–33 GB per file) and the model files.
+- **Per-core CPU frequency logs** (rounds 2 to 6).
